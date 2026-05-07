@@ -70,6 +70,25 @@ extern std::filesystem::path g_commonShaderHeaderPath;
 // Global custom buffer data structure instance for updating CB13
 extern GFXBoosterAccessData g_customBufferData;
 extern DrawTagData g_drawTagData;
+// Index into g_rendererData->renderTargets[] that the engine uses for the
+// G-buffer normal target. Bethesda's deferred renderer doesn't expose a
+// canonical name, and the index is not 100% stable across runtime versions,
+// so it's exposed as a config knob in ShaderEngine.ini. -1 disables the
+// `gbufferNormal` built-in (custom passes that ask for it will get nullptr
+// SRV and the consuming shader is expected to fall back).
+extern int NORMAL_BUFFER_INDEX;
+// Renderer singleton handle (owned by Plugin.cpp). Exposed here so the
+// CustomPass module can access device/context/render targets.
+extern RE::BSGraphics::RendererData* g_rendererData;
+// Main scene depth SRV bound by BindInjectedPixelShaderResources. Exposed so
+// custom passes can wire it as an input without re-fetching every fire.
+extern REX::W32::ID3D11ShaderResourceView* g_depthSRV;
+// Set during replacement-shader compilation/creation to suppress recursive
+// shader-creation hooks. Custom passes set the same flag while compiling.
+extern bool g_isCreatingReplacementShader;
+// Set while BindInjectedPixelShaderResources is mutating SRV slots, so the
+// PSSetShaderResources hook does not re-enter and create infinite recursion.
+extern bool g_bindingInjectedPixelResources;
 // Global custom resource to pass data to shaders
 extern REX::W32::ID3D11Buffer* g_customSRVBuffer;
 extern REX::W32::ID3D11ShaderResourceView* g_customSRV;

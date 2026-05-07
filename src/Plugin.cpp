@@ -1,5 +1,7 @@
 ﻿#include <Global.h>
 #include <PCH.h>
+#include <CustomPass.h>
+#include <RenderTargets.h>
 #include <d3d11.h>
 
 // --- Variables ---
@@ -41,7 +43,10 @@ int g_currentTextureDSIndices[128] = { -1 };
 bool g_isCreatingReplacementShader = false;
 // Last original (pre-replacement) pixel shader observed in MyPSSetShader.
 // Used by the actor-tag debug logger to attribute draws to a shader UID.
-static std::atomic<REX::W32::ID3D11PixelShader*> g_currentOriginalPixelShader{ nullptr };
+// Externally visible for CustomPass.cpp's BeforeDrawForMatchedDef trigger,
+// which fires from MyDraw* hooks and needs to identify the currently bound
+// original (pre-replacement) PS to look up its matched ShaderDefinition.
+std::atomic<REX::W32::ID3D11PixelShader*> g_currentOriginalPixelShader{ nullptr };
 // Global custom buffer data structure instance for updating CB13
 GFXBoosterAccessData g_customBufferData = {};
 DrawTagData g_drawTagData = {};
@@ -72,7 +77,9 @@ static constexpr UINT DEPTHSTENCIL_TARGET_COUNT = static_cast<UINT>(DepthStencil
 // Global depth buffer SRV for shaders to read depth when DEPTHBUFFER_ON is enabled
 REX::W32::ID3D11ShaderResourceView* g_depthSRV = nullptr;
 static bool g_activeReplacementPixelShader = false;
-static bool g_bindingInjectedPixelResources = false;
+// Exposed via Global.h so CustomPass.cpp can guard against recursion in
+// MyPSSetShader while the registry rebinds injected resources during a pass.
+bool g_bindingInjectedPixelResources = false;
 static thread_local std::uint32_t g_commandBufferReplayDepth = 0;
 static REX::W32::ID3D11ShaderResourceView* g_lastSceneDepthSRV = nullptr;
 struct alignas(16) ModularFloat4 {
@@ -179,6 +186,10 @@ static bool     g_inInterior = false; // value sampled 30 frames ago
 
 static REX::W32::ID3D11ShaderResourceView* UpdateDrawTagBuffer(REX::W32::ID3D11DeviceContext* context, float materialTag, float isHead);
 static void BindDrawTagForCurrentDraw(REX::W32::ID3D11DeviceContext* context, bool force = false);
+// Forward decl: HookedBSBatchRendererDraw (defined further up the file via
+// hook namespace) needs to re-publish injected resources after a customPass
+// fires, but BindInjectedPixelShaderResources is defined later.
+static void BindInjectedPixelShaderResources(REX::W32::ID3D11DeviceContext* context);
 
 namespace
 {
@@ -816,6 +827,10 @@ namespace
         // tag buffer is current for every pass that classified as actor.
         if (g_rendererData && g_rendererData->context) {
             BindDrawTagForCurrentDraw(g_rendererData->context, true);
+            if (CustomPass::g_registry.OnBeforeDraw(g_rendererData->context, "engine-BSBatch")
+                && g_activeReplacementPixelShader) {
+                BindInjectedPixelShaderResources(g_rendererData->context);
+            }
         }
 
         OriginalBSBatchRendererDraw(pass, unk2, unk3, dynamicDrawData);
@@ -1410,6 +1425,10 @@ static void BindInjectedPixelShaderResources(REX::W32::ID3D11DeviceContext* cont
         REX::WARN("BindInjectedPixelShaderResources: No depth SRV available for t{}", DEPTHBUFFER_SLOT);
     }
 
+    // Custom pass output resources that declared srvSlot get re-bound here so
+    // replacement shaders downstream (e.g. tonemap) see the latest GI texture.
+    CustomPass::g_registry.BindGlobalResourceSRVs(context, /*pixelStage=*/true);
+
     g_bindingInjectedPixelResources = false;
 }
 
@@ -1664,6 +1683,12 @@ HRESULT STDMETHODCALLTYPE MyPresent(
     if (CUSTOMBUFFER_ON) {
         UpdateCustomBuffer_Internal();
     }
+    // Custom-pass per-frame work: allocate resources, run any AtPresent passes,
+    // ping-pong, advance frame counter. Done after the booster CB update so
+    // GFXInjected[0] is fresh for any AtPresent pass.
+    if (g_rendererData && g_rendererData->context) {
+        CustomPass::g_registry.OnFramePresent(g_rendererData->context);
+    }
     // Always draw a frame if ImGui is initialized to allow hotkeys
     if (g_imguiInitialized) {
         ImGui_ImplDX11_NewFrame();
@@ -1676,6 +1701,7 @@ HRESULT STDMETHODCALLTYPE MyPresent(
     if (g_imguiInitialized && DEVGUI_ON && g_showSettings) {
         UIDrawShaderDebugOverlay();
         UIDrawCustomBufferMonitorOverlay();
+        CustomPass::g_registry.DrawDebugOverlay();
     }
     if (g_imguiInitialized) {
         ImGui::Render();
@@ -1751,6 +1777,11 @@ void STDMETHODCALLTYPE MyDrawIndexed(
     INT BaseVertexLocation)
 {
     BindDrawTagForCurrentDraw(This);
+    // BeforeDrawForMatchedDef custom passes fire here, when the engine has
+    // fully set up the pipeline for the upcoming draw. State is fresh.
+    if (CustomPass::g_registry.OnBeforeDraw(This, "d3d11-DrawIndexed") && g_activeReplacementPixelShader) {
+        BindInjectedPixelShaderResources(This);
+    }
     OriginalDrawIndexed(This, IndexCount, StartIndexLocation, BaseVertexLocation);
 }
 
@@ -1765,6 +1796,9 @@ void STDMETHODCALLTYPE MyDraw(
     UINT StartVertexLocation)
 {
     BindDrawTagForCurrentDraw(This);
+    if (CustomPass::g_registry.OnBeforeDraw(This, "d3d11-Draw") && g_activeReplacementPixelShader) {
+        BindInjectedPixelShaderResources(This);
+    }
     OriginalDraw(This, VertexCount, StartVertexLocation);
 }
 
@@ -1785,6 +1819,9 @@ void STDMETHODCALLTYPE MyDrawIndexedInstanced(
     UINT StartInstanceLocation)
 {
     BindDrawTagForCurrentDraw(This);
+    if (CustomPass::g_registry.OnBeforeDraw(This, "d3d11-DrawIndexedInstanced") && g_activeReplacementPixelShader) {
+        BindInjectedPixelShaderResources(This);
+    }
     OriginalDrawIndexedInstanced(This, IndexCountPerInstance, InstanceCount, StartIndexLocation, BaseVertexLocation, StartInstanceLocation);
 }
 
@@ -1803,6 +1840,9 @@ void STDMETHODCALLTYPE MyDrawInstanced(
     UINT StartInstanceLocation)
 {
     BindDrawTagForCurrentDraw(This);
+    if (CustomPass::g_registry.OnBeforeDraw(This, "d3d11-DrawInstanced") && g_activeReplacementPixelShader) {
+        BindInjectedPixelShaderResources(This);
+    }
     OriginalDrawInstanced(This, VertexCountPerInstance, InstanceCount, StartVertexLocation, StartInstanceLocation);
 }
 
@@ -1820,6 +1860,15 @@ void STDMETHODCALLTYPE MyPSSetShader(
     UINT NumClassInstances) {
     bool usingReplacementPixelShader = false;
     g_currentOriginalPixelShader.store(pPixelShader, std::memory_order_release);
+    // Trigger any customPass blocks attached to this original shader. The
+    // pass runs immediately *before* we forward to OriginalPSSetShader so the
+    // engine state we save/restore is the state the engine just established
+    // for the upcoming shader. If a pass fired we must re-bind injected
+    // resources for the engine shader's draw afterwards.
+    bool customPassFired = false;
+    if (pPixelShader && !g_isCreatingReplacementShader && !g_bindingInjectedPixelResources) {
+        customPassFired = CustomPass::g_registry.OnBeforeShaderBound(This, pPixelShader);
+    }
     if (pPixelShader) {
         // Check if this shader is matched with a replacement shader in our DB
         if (g_ShaderDB.IsEntryMatched(pPixelShader)) {
@@ -1860,6 +1909,13 @@ void STDMETHODCALLTYPE MyPSSetShader(
     // Call original function with either the original or replacement shader
     OriginalPSSetShader(This, pPixelShader, ppClassInstances, NumClassInstances);
     g_activeReplacementPixelShader = usingReplacementPixelShader;
+    // If a customPass fired, the engine's next draw still expects the injected
+    // resource set we publish for replacement shaders (depth, GFXInjected, etc.)
+    // to be present on its slots. The pass already re-binds them, but there is
+    // no harm in publishing them again here when running a replacement.
+    if (customPassFired && usingReplacementPixelShader) {
+        BindInjectedPixelShaderResources(This);
+    }
 }
 
 // Hook for ID3D11DeviceContext::VSSetShader to replace the Vertex shader
@@ -3090,58 +3146,64 @@ void UIDrawCustomBufferMonitorOverlay() {
     ImGui::Text("DrawTag SRV:   %p", static_cast<void*>(g_drawTagSRV));
     ImGui::Separator();
 
-    auto beginColumns = [](const char* id) {
-        ImGui::Columns(3, id);
-        ImGui::SetColumnWidth(0, 190.0f);
-        ImGui::SetColumnWidth(1, 130.0f);
-        ImGui::SetColumnWidth(2, 110.0f);
-        ImGui::Text("Name"); ImGui::NextColumn();
-        ImGui::Text("Value"); ImGui::NextColumn();
-        ImGui::Text("Delta"); ImGui::NextColumn();
-        ImGui::Separator();
+    // ImGui Columns() doesn't persist user drag-resize across frames — the
+    // SetColumnWidth calls every frame would clobber any drag anyway. Tables
+    // give proper resizable / reorderable columns.
+    constexpr ImGuiTableFlags kCBTableFlags =
+        ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerH |
+        ImGuiTableFlags_RowBg     | ImGuiTableFlags_SizingStretchProp;
+
+    auto beginColumns = [](const char* id) -> bool {
+        if (!ImGui::BeginTable(id, 3, kCBTableFlags)) return false;
+        ImGui::TableSetupColumn("Name",  ImGuiTableColumnFlags_WidthStretch, 2.0f);
+        ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch, 1.4f);
+        ImGui::TableSetupColumn("Delta", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+        ImGui::TableHeadersRow();
+        return true;
     };
 
-    auto endColumns = []() {
-        ImGui::Columns(1);
-    };
+    auto endColumns = []() { ImGui::EndTable(); };
 
     auto renderFloat = [&](const char* label, float value, float previous, float warnDelta = 0.25f) {
         const float delta = hasPreviousData ? value - previous : 0.0f;
         const bool invalid = !std::isfinite(value);
         const bool jump = hasPreviousData && std::fabs(delta) >= warnDelta;
         const ImVec4 valueColor = invalid ? ImVec4(1.0f, 0.1f, 0.1f, 1.0f) : (jump ? ImVec4(1.0f, 0.8f, 0.1f, 1.0f) : ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
-        ImGui::Text("%s", label); ImGui::NextColumn();
-        ImGui::TextColored(valueColor, "%.6f", value); ImGui::NextColumn();
+        ImGui::TableNextRow();
+        ImGui::TableNextColumn(); ImGui::TextUnformatted(label);
+        ImGui::TableNextColumn(); ImGui::TextColored(valueColor, "%.6f", value);
+        ImGui::TableNextColumn();
         if (hasPreviousData) {
             ImGui::TextColored(jump ? ImVec4(1.0f, 0.8f, 0.1f, 1.0f) : ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "%+.6f", delta);
         } else {
             ImGui::TextDisabled("-");
         }
-        ImGui::NextColumn();
     };
 
     auto renderUInt = [&](const char* label, uint32_t value, uint32_t previous) {
         const bool changed = hasPreviousData && value != previous;
-        ImGui::Text("%s", label); ImGui::NextColumn();
-        ImGui::TextColored(changed ? ImVec4(1.0f, 0.8f, 0.1f, 1.0f) : ImVec4(1.0f, 1.0f, 1.0f, 1.0f), "0x%08X", value); ImGui::NextColumn();
+        ImGui::TableNextRow();
+        ImGui::TableNextColumn(); ImGui::TextUnformatted(label);
+        ImGui::TableNextColumn(); ImGui::TextColored(changed ? ImVec4(1.0f, 0.8f, 0.1f, 1.0f) : ImVec4(1.0f, 1.0f, 1.0f, 1.0f), "0x%08X", value);
+        ImGui::TableNextColumn();
         if (hasPreviousData) {
             ImGui::Text("%+lld", static_cast<long long>(value) - static_cast<long long>(previous));
         } else {
             ImGui::TextDisabled("-");
         }
-        ImGui::NextColumn();
     };
 
     auto renderInt = [&](const char* label, int32_t value, int32_t previous) {
         const bool changed = hasPreviousData && value != previous;
-        ImGui::Text("%s", label); ImGui::NextColumn();
-        ImGui::TextColored(changed ? ImVec4(1.0f, 0.8f, 0.1f, 1.0f) : ImVec4(1.0f, 1.0f, 1.0f, 1.0f), "%d", value); ImGui::NextColumn();
+        ImGui::TableNextRow();
+        ImGui::TableNextColumn(); ImGui::TextUnformatted(label);
+        ImGui::TableNextColumn(); ImGui::TextColored(changed ? ImVec4(1.0f, 0.8f, 0.1f, 1.0f) : ImVec4(1.0f, 1.0f, 1.0f, 1.0f), "%d", value);
+        ImGui::TableNextColumn();
         if (hasPreviousData) {
             ImGui::Text("%+d", value - previous);
         } else {
             ImGui::TextDisabled("-");
         }
-        ImGui::NextColumn();
     };
 
     auto renderFloat4 = [&](const char* label, const DirectX::XMFLOAT4& value, const DirectX::XMFLOAT4& previous, float warnDelta = 0.25f) {
@@ -3152,88 +3214,99 @@ void UIDrawCustomBufferMonitorOverlay() {
     };
 
     if (ImGui::CollapsingHeader("Frame", ImGuiTreeNodeFlags_DefaultOpen)) {
-        beginColumns("custom_buffer_frame_columns");
-        renderFloat("time", data.time, previousData.time, 1.0f);
-        renderFloat("delta", data.delta, previousData.delta, 0.05f);
-        renderFloat("frame", data.frame, previousData.frame, 2.0f);
-        renderFloat("fps", data.fps, previousData.fps, 10.0f);
-        renderFloat("random", data.random, previousData.random, 0.9f);
-        endColumns();
+        if (beginColumns("custom_buffer_frame_columns")) {
+            renderFloat("time", data.time, previousData.time, 1.0f);
+            renderFloat("delta", data.delta, previousData.delta, 0.05f);
+            renderFloat("frame", data.frame, previousData.frame, 2.0f);
+            renderFloat("fps", data.fps, previousData.fps, 10.0f);
+            renderFloat("random", data.random, previousData.random, 0.9f);
+            endColumns();
+        }
     }
 
     if (ImGui::CollapsingHeader("Scene State", ImGuiTreeNodeFlags_DefaultOpen)) {
-        beginColumns("custom_buffer_scene_columns");
-        renderFloat("dayCycle", data.dayCycle, previousData.dayCycle, 0.05f);
-        renderFloat("timeOfDay", data.timeOfDay, previousData.timeOfDay, 0.25f);
-        renderFloat("weatherTransition", data.weatherTransition, previousData.weatherTransition, 0.05f);
-        renderUInt("currentWeatherID", data.currentWeatherID, previousData.currentWeatherID);
-        renderUInt("outgoingWeatherID", data.outgoingWeatherID, previousData.outgoingWeatherID);
-        renderUInt("currentLocationID", data.currentLocationID, previousData.currentLocationID);
-        renderUInt("worldSpaceID", data.worldSpaceID, previousData.worldSpaceID);
-        renderUInt("skyMode", data.skyMode, previousData.skyMode);
-        renderInt("currentWeatherClass", data.currentWeatherClass, previousData.currentWeatherClass);
-        renderInt("outgoingWeatherClass", data.outgoingWeatherClass, previousData.outgoingWeatherClass);
-        renderFloat("inInterior", data.inInterior, previousData.inInterior, 0.5f);
-        renderFloat("inCombat", data.inCombat, previousData.inCombat, 0.5f);
-        endColumns();
+        if (beginColumns("custom_buffer_scene_columns")) {
+            renderFloat("dayCycle", data.dayCycle, previousData.dayCycle, 0.05f);
+            renderFloat("timeOfDay", data.timeOfDay, previousData.timeOfDay, 0.25f);
+            renderFloat("weatherTransition", data.weatherTransition, previousData.weatherTransition, 0.05f);
+            renderUInt("currentWeatherID", data.currentWeatherID, previousData.currentWeatherID);
+            renderUInt("outgoingWeatherID", data.outgoingWeatherID, previousData.outgoingWeatherID);
+            renderUInt("currentLocationID", data.currentLocationID, previousData.currentLocationID);
+            renderUInt("worldSpaceID", data.worldSpaceID, previousData.worldSpaceID);
+            renderUInt("skyMode", data.skyMode, previousData.skyMode);
+            renderInt("currentWeatherClass", data.currentWeatherClass, previousData.currentWeatherClass);
+            renderInt("outgoingWeatherClass", data.outgoingWeatherClass, previousData.outgoingWeatherClass);
+            renderFloat("inInterior", data.inInterior, previousData.inInterior, 0.5f);
+            renderFloat("inCombat", data.inCombat, previousData.inCombat, 0.5f);
+            endColumns();
+        }
     }
 
     if (ImGui::CollapsingHeader("Camera", ImGuiTreeNodeFlags_DefaultOpen)) {
-        beginColumns("custom_buffer_camera_columns");
-        renderFloat("camX", data.camX, previousData.camX, 100.0f);
-        renderFloat("camY", data.camY, previousData.camY, 100.0f);
-        renderFloat("camZ", data.camZ, previousData.camZ, 100.0f);
-        renderFloat("viewDirX", data.viewDirX, previousData.viewDirX, 0.25f);
-        renderFloat("viewDirY", data.viewDirY, previousData.viewDirY, 0.25f);
-        renderFloat("viewDirZ", data.viewDirZ, previousData.viewDirZ, 0.25f);
-        renderFloat("vpLeft", data.vpLeft, previousData.vpLeft, 1.0f);
-        renderFloat("vpTop", data.vpTop, previousData.vpTop, 1.0f);
-        renderFloat("vpWidth", data.vpWidth, previousData.vpWidth, 1.0f);
-        renderFloat("vpHeight", data.vpHeight, previousData.vpHeight, 1.0f);
-        endColumns();
+        if (beginColumns("custom_buffer_camera_columns")) {
+            renderFloat("camX", data.camX, previousData.camX, 100.0f);
+            renderFloat("camY", data.camY, previousData.camY, 100.0f);
+            renderFloat("camZ", data.camZ, previousData.camZ, 100.0f);
+            renderFloat("viewDirX", data.viewDirX, previousData.viewDirX, 0.25f);
+            renderFloat("viewDirY", data.viewDirY, previousData.viewDirY, 0.25f);
+            renderFloat("viewDirZ", data.viewDirZ, previousData.viewDirZ, 0.25f);
+            renderFloat("vpLeft", data.vpLeft, previousData.vpLeft, 1.0f);
+            renderFloat("vpTop", data.vpTop, previousData.vpTop, 1.0f);
+            renderFloat("vpWidth", data.vpWidth, previousData.vpWidth, 1.0f);
+            renderFloat("vpHeight", data.vpHeight, previousData.vpHeight, 1.0f);
+            endColumns();
+        }
     }
 
     if (ImGui::CollapsingHeader("Fog", ImGuiTreeNodeFlags_DefaultOpen)) {
-        beginColumns("custom_buffer_fog_columns");
-        renderFloat4("g_FogDistances0", data.g_FogDistances0, previousData.g_FogDistances0, 50.0f);
-        renderFloat4("g_FogDistances1", data.g_FogDistances1, previousData.g_FogDistances1, 50.0f);
-        renderFloat4("g_FogParams", data.g_FogParams, previousData.g_FogParams, 0.25f);
-        renderFloat4("g_FogColor", data.g_FogColor, previousData.g_FogColor, 0.05f);
-        endColumns();
+        if (beginColumns("custom_buffer_fog_columns")) {
+            renderFloat4("g_FogDistances0", data.g_FogDistances0, previousData.g_FogDistances0, 50.0f);
+            renderFloat4("g_FogDistances1", data.g_FogDistances1, previousData.g_FogDistances1, 50.0f);
+            renderFloat4("g_FogParams", data.g_FogParams, previousData.g_FogParams, 0.25f);
+            renderFloat4("g_FogColor", data.g_FogColor, previousData.g_FogColor, 0.05f);
+            endColumns();
+        }
     }
 
     if (ImGui::CollapsingHeader("Matrices")) {
-        beginColumns("custom_buffer_matrix_columns");
-        renderFloat4("InvProjRow0", data.g_InvProjRow0, previousData.g_InvProjRow0, 0.05f);
-        renderFloat4("InvProjRow1", data.g_InvProjRow1, previousData.g_InvProjRow1, 0.05f);
-        renderFloat4("InvProjRow2", data.g_InvProjRow2, previousData.g_InvProjRow2, 0.05f);
-        renderFloat4("InvProjRow3", data.g_InvProjRow3, previousData.g_InvProjRow3, 0.05f);
-        renderFloat4("ViewProjRow0", data.g_ViewProjRow0, previousData.g_ViewProjRow0, 0.05f);
-        renderFloat4("ViewProjRow1", data.g_ViewProjRow1, previousData.g_ViewProjRow1, 0.05f);
-        renderFloat4("ViewProjRow2", data.g_ViewProjRow2, previousData.g_ViewProjRow2, 0.05f);
-        renderFloat4("ViewProjRow3", data.g_ViewProjRow3, previousData.g_ViewProjRow3, 0.05f);
-        endColumns();
+        if (beginColumns("custom_buffer_matrix_columns")) {
+            renderFloat4("InvProjRow0", data.g_InvProjRow0, previousData.g_InvProjRow0, 0.05f);
+            renderFloat4("InvProjRow1", data.g_InvProjRow1, previousData.g_InvProjRow1, 0.05f);
+            renderFloat4("InvProjRow2", data.g_InvProjRow2, previousData.g_InvProjRow2, 0.05f);
+            renderFloat4("InvProjRow3", data.g_InvProjRow3, previousData.g_InvProjRow3, 0.05f);
+            renderFloat4("InvViewRow0", data.g_InvViewRow0, previousData.g_InvViewRow0, 0.05f);
+            renderFloat4("InvViewRow1", data.g_InvViewRow1, previousData.g_InvViewRow1, 0.05f);
+            renderFloat4("InvViewRow2", data.g_InvViewRow2, previousData.g_InvViewRow2, 0.05f);
+            renderFloat4("InvViewRow3", data.g_InvViewRow3, previousData.g_InvViewRow3, 0.05f);
+            renderFloat4("ViewProjRow0", data.g_ViewProjRow0, previousData.g_ViewProjRow0, 0.05f);
+            renderFloat4("ViewProjRow1", data.g_ViewProjRow1, previousData.g_ViewProjRow1, 0.05f);
+            renderFloat4("ViewProjRow2", data.g_ViewProjRow2, previousData.g_ViewProjRow2, 0.05f);
+            renderFloat4("ViewProjRow3", data.g_ViewProjRow3, previousData.g_ViewProjRow3, 0.05f);
+            endColumns();
+        }
     }
 
     if (ImGui::CollapsingHeader("Player/Input")) {
-        beginColumns("custom_buffer_player_columns");
-        renderFloat("resX", data.resX, previousData.resX, 1.0f);
-        renderFloat("resY", data.resY, previousData.resY, 1.0f);
-        renderFloat("mouseX", data.mouseX, previousData.mouseX, 0.25f);
-        renderFloat("mouseY", data.mouseY, previousData.mouseY, 0.25f);
-        renderFloat("pHealthPerc", data.pHealthPerc, previousData.pHealthPerc, 0.05f);
-        renderFloat("pRadDmg", data.pRadDmg, previousData.pRadDmg, 0.25f);
-        renderFloat("windSpeed", data.windSpeed, previousData.windSpeed, 0.25f);
-        renderFloat("windAngle", data.windAngle, previousData.windAngle, 0.25f);
-        renderFloat("windTurb", data.windTurb, previousData.windTurb, 0.25f);
-        endColumns();
+        if (beginColumns("custom_buffer_player_columns")) {
+            renderFloat("resX", data.resX, previousData.resX, 1.0f);
+            renderFloat("resY", data.resY, previousData.resY, 1.0f);
+            renderFloat("mouseX", data.mouseX, previousData.mouseX, 0.25f);
+            renderFloat("mouseY", data.mouseY, previousData.mouseY, 0.25f);
+            renderFloat("pHealthPerc", data.pHealthPerc, previousData.pHealthPerc, 0.05f);
+            renderFloat("pRadDmg", data.pRadDmg, previousData.pRadDmg, 0.25f);
+            renderFloat("windSpeed", data.windSpeed, previousData.windSpeed, 0.25f);
+            renderFloat("windAngle", data.windAngle, previousData.windAngle, 0.25f);
+            renderFloat("windTurb", data.windTurb, previousData.windTurb, 0.25f);
+            endColumns();
+        }
     }
 
     if (ImGui::CollapsingHeader("Draw Tag", ImGuiTreeNodeFlags_DefaultOpen)) {
-        beginColumns("custom_buffer_drawtag_columns");
-        renderFloat("materialTag", drawTag.materialTag, previousDrawTag.materialTag, 0.5f);
-        renderFloat("isHead",      drawTag.isHead,      previousDrawTag.isHead,      0.5f);
-        endColumns();
+        if (beginColumns("custom_buffer_drawtag_columns")) {
+            renderFloat("materialTag", drawTag.materialTag, previousDrawTag.materialTag, 0.5f);
+            renderFloat("isHead",      drawTag.isHead,      previousDrawTag.isHead,      0.5f);
+            endColumns();
+        }
     }
 
     previousData = data;
@@ -3297,11 +3370,11 @@ void UpdateCustomBuffer_Internal() {
         // Standard exponential moving average for all subsequent frames
         smoothedFPS = smoothedFPS * 0.95f + instantFPS * 0.05f;
     }
-    // Get screen resolution from the main render target
+    // Get screen resolution from the main render target (kMain = 3).
     float resX = 1920.0f, resY = 1080.0f;
-    if (g_rendererData->renderTargets[3].texture) {
+    if (g_rendererData->renderTargets[RT::idx(RT::Color::kMain)].texture) {
         REX::W32::D3D11_TEXTURE2D_DESC desc{};
-        g_rendererData->renderTargets[3].texture->GetDesc(&desc);
+        g_rendererData->renderTargets[RT::idx(RT::Color::kMain)].texture->GetDesc(&desc);
         resX = static_cast<float>(desc.width);
         resY = static_cast<float>(desc.height);
     }
@@ -3451,10 +3524,21 @@ void UpdateCustomBuffer_Internal() {
     DirectX::XMStoreFloat4(&g_customBufferData.g_InvProjRow1, invProj.r[1]);
     DirectX::XMStoreFloat4(&g_customBufferData.g_InvProjRow2, invProj.r[2]);
     DirectX::XMStoreFloat4(&g_customBufferData.g_InvProjRow3, invProj.r[3]);
+    DirectX::XMStoreFloat4(&g_customBufferData.g_InvViewRow0, invView.r[0]);
+    DirectX::XMStoreFloat4(&g_customBufferData.g_InvViewRow1, invView.r[1]);
+    DirectX::XMStoreFloat4(&g_customBufferData.g_InvViewRow2, invView.r[2]);
+    DirectX::XMStoreFloat4(&g_customBufferData.g_InvViewRow3, invView.r[3]);
     g_customBufferData.random  = randomValue;
     g_customBufferData.inCombat = g_inCombat ? 1.0f : 0.0f;
     g_customBufferData.inInterior = g_inInterior ? 1.0f : 0.0f;
     g_customBufferData._padding = 0.0f; // just in case, to avoid any potential uninitialized data issues in shaders
+    // Snapshot the previous frame's ViewProj BEFORE writing the new one. The
+    // very first frame snapshots zeros (CB is zero-initialized), which the
+    // shader detects via the all-zero matrix and falls back to non-temporal.
+    g_customBufferData.g_PrevViewProjRow0 = g_customBufferData.g_ViewProjRow0;
+    g_customBufferData.g_PrevViewProjRow1 = g_customBufferData.g_ViewProjRow1;
+    g_customBufferData.g_PrevViewProjRow2 = g_customBufferData.g_ViewProjRow2;
+    g_customBufferData.g_PrevViewProjRow3 = g_customBufferData.g_ViewProjRow3;
     DirectX::XMStoreFloat4(&g_customBufferData.g_ViewProjRow0, viewProj.r[0]);
     DirectX::XMStoreFloat4(&g_customBufferData.g_ViewProjRow1, viewProj.r[1]);
     DirectX::XMStoreFloat4(&g_customBufferData.g_ViewProjRow2, viewProj.r[2]);
@@ -3863,7 +3947,7 @@ bool InstallShaderCreationHooks_Internal() {
     REX::INFO("Hooking D3D11CreateDeviceAndSwapChain");
     auto* trampoline = F4SE::GetTrampolineInterface();
     std::uintptr_t d3d11Addr = ptr_D3D11CreateDeviceAndSwapChainCall.address();
-    if (REL::Module::GetRuntimeIndex() == REL::Module::Runtime::kOG)
+    if (REX::FModule::GetRuntimeIndex() == REX::FModule::Runtime::kOG)
     {
         d3d11Addr += kCallOffsetOG;
     }
@@ -3881,7 +3965,6 @@ bool InstallShaderCreationHooks_Internal() {
 
 bool InstallDrawTaggingHooks_Internal()
 {
-    const bool runtimeOG = REL::Module::IsRuntimeOG();
     if (OriginalBSLightingShaderSetupGeometry &&
         OriginalBSLightingShaderRestoreGeometry &&
         OriginalBSEffectShaderSetupGeometry &&
@@ -3899,7 +3982,9 @@ bool InstallDrawTaggingHooks_Internal()
         OriginalPlayerCharacterOnHeadInitialized &&
         OriginalUpdate3DModel &&
         OriginalReset3D &&
-        (!runtimeOG || (OriginalRenderCommandBufferPassesImpl && OriginalBuildCommandBuffer && OriginalReplaceHeadTaskRun))) {
+        OriginalRenderCommandBufferPassesImpl &&
+        OriginalBuildCommandBuffer &&
+        OriginalReplaceHeadTaskRun) {
         return true;
     }
 
@@ -3969,7 +4054,7 @@ bool InstallDrawTaggingHooks_Internal()
         REX::INFO("InstallDrawTaggingHooks_Internal: BSBatchRenderer::Draw hook installed");
     }
 
-    if (!OriginalRenderCommandBufferPassesImpl && runtimeOG) {
+    if (!OriginalRenderCommandBufferPassesImpl) {
         constexpr std::size_t kRenderCmdBufPrologueSize = 15;
         OriginalRenderCommandBufferPassesImpl = CreateBranchGateway<RenderCommandBufferPassesImpl_t>(ptr_RenderCommandBufferPassesImpl, kRenderCmdBufPrologueSize, reinterpret_cast<void*>(&HookedRenderCommandBufferPassesImpl));
 
@@ -3981,7 +4066,7 @@ bool InstallDrawTaggingHooks_Internal()
         REX::INFO("InstallDrawTaggingHooks_Internal: BSBatchRenderer::RenderCommandBufferPassesImpl hook installed");
     }
 
-    if (!OriginalBuildCommandBuffer && runtimeOG) {
+    if (!OriginalBuildCommandBuffer) {
         // Prologue: mov [rsp+arg_0], rbx; push rbp/rsi/rdi/r12/r13/r14/r15
         // 5 + 1 + 1 + 1 + 2 + 2 + 2 + 2 = 16 bytes (clean instruction boundary).
         constexpr std::size_t kBuildCommandBufferPrologueSize = 16;
@@ -4165,7 +4250,7 @@ bool InstallDrawTaggingHooks_Internal()
         REX::INFO("InstallDrawTaggingHooks_Internal: Actor::Reset3D hook installed");
     }
 
-    if (!OriginalReplaceHeadTaskRun && runtimeOG) {
+    if (!OriginalReplaceHeadTaskRun) {
         // VTABLE::Script__ModifyFaceGen__29__ReplaceHeadTask only has an OG
         // entry in the bundled commonlibf4. AE install is intentionally
         // skipped until we find the AE vtable address.

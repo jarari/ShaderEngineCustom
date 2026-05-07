@@ -1,4 +1,5 @@
 ﻿#include <Global.h>
+#include <CustomPass.h>
 
 // Global logger pointer
 std::shared_ptr<spdlog::logger> gLog;
@@ -82,6 +83,10 @@ UINT DRAWTAG_SLOT = 26;
 UINT MODULAR_FLOATS_SLOT = 29;
 UINT MODULAR_INTS_SLOT = 28;
 UINT MODULAR_BOOLS_SLOT = 27;
+// G-buffer normal target index (renderTargets[]). Default is 20 = kGbufferNormal
+// for the OG runtime; override in ShaderEngine.ini for other layouts. -1
+// disables the `gbufferNormal` built-in input source for customPass blocks.
+int NORMAL_BUFFER_INDEX = 20;
 // Shader settings menu flag
 bool SHADERSETTINGS_ON = false;
 // Shader settings menu hotkey (default END key)
@@ -241,6 +246,13 @@ int LoadShaderDefinitionsFromFile(const std::filesystem::path& shaderFolderPath,
             std::string shaderId = clean.substr(1, clean.length() - 2);
             if (shaderId.empty()) {
                 REX::WARN("LoadShaderDefinitionsFromFile: Empty section name in {}", iniShaderPath.string());
+                continue;
+            }
+            // Custom passes / resources are routed to the CustomPass module.
+            // They share Shader.ini files but have their own schema (see CustomPass.md).
+            if (CustomPass::Registry::IsCustomSection(shaderId)) {
+                std::string endTag = "[/" + shaderId + "]";
+                CustomPass::g_registry.ParseSection(shaderId, file, endTag, shaderFolderPath, folderName);
                 continue;
             }
             // Create new shader definition
@@ -758,6 +770,15 @@ void LoadConfig(HMODULE hModule) {
             }
             continue;
         }
+        else if (lowerKey == "normal_buffer_index") {
+            try {
+                NORMAL_BUFFER_INDEX = std::stoi(value);
+                REX::INFO("LoadConfig: NORMAL_BUFFER_INDEX set to {}", NORMAL_BUFFER_INDEX);
+            } catch (...) {
+                REX::WARN("LoadConfig: Invalid NORMAL_BUFFER_INDEX value: {}. Using default: {}", value, NORMAL_BUFFER_INDEX);
+            }
+            continue;
+        }
         else if (lowerKey == "drawtag_slot") {
             try {
                 DRAWTAG_SLOT = static_cast<UINT>(std::stoi(value));
@@ -909,6 +930,9 @@ void LoadConfig(HMODULE hModule) {
             REX::INFO("LoadConfig: Loaded {} definition(s) from {}", count, folderName);
         }
     }
+    // Resolve `triggerHookId=...` references on customPass blocks now that all
+    // [shaderId] definitions are known.
+    CustomPass::g_registry.ResolveHookIdTriggers();
     // Load stored shader settings values from disk
     g_shaderSettings.LoadSettings();
     REX::INFO("LoadConfig: Completed. Loaded {} shader definition(s) total", totalDefinitions);
@@ -921,6 +945,10 @@ void LoadConfig(HMODULE hModule) {
                 def->hlslFileWatcher->Start();
             }
         }
+        // CustomPass shaders get their own per-pass watchers — without these
+        // the SSRTGI / denoise / composite shaders would only recompile on a
+        // full Shader.ini reload, which is painful for iteration.
+        CustomPass::g_registry.StartFileWatchers();
     }
     // Set global shader include path for D3DCompile calls
     try {
@@ -951,6 +979,7 @@ void ReloadAllShaderDefinitions_Internal() {
     g_iniWatchers.clear();  // Stop INI file watchers
     // At this point we have no active watchers and no connections between ShaderDB and ShaderDefDB
     g_shaderDefinitions.Clear();  // Deletes old definitions
+    CustomPass::g_registry.Reset();  // Wipe customPass / customResource state for re-parse
     // Build a new ShaderDefDB from the INI files on disk
     if (g_shaderFolderPath.empty()) {
         g_shaderFolderPath = g_pluginPath / "ShaderEngine";
@@ -971,7 +1000,13 @@ void ReloadAllShaderDefinitions_Internal() {
                 def->hlslFileWatcher->Start();
             }
         }
+        // CustomPass watchers are recreated alongside, since the previous
+        // batch was torn down by Reset().
+        CustomPass::g_registry.StartFileWatchers();
     }
+    // Resolve hook-id triggers on the new customPass blocks now that all
+    // shader definitions are known.
+    CustomPass::g_registry.ResolveHookIdTriggers();
     // Reconnect ShaderDB <> ShaderDefDB based on new definitions
     RematchAllShaders_Internal();
     if (DEBUGGING) {
@@ -1078,22 +1113,10 @@ F4SE_PLUGIN_LOAD(const F4SE::LoadInterface* a_f4se)
     return true;
 }
 
-F4SE_PLUGIN_VERSION = []() noexcept {
-    F4SE::PluginVersionData v{};
-    v.PluginVersion({ 0, 2, 0, 0 });
-    v.PluginName("ShaderEngineCL");
-    v.AuthorName("disi");
-    v.UsesAddressLibrary(true);
-    v.UsesSigScanning(false);
-    v.IsLayoutDependent(true);
-    v.HasNoStructUse(false);
-    v.CompatibleVersions({
-        F4SE::RUNTIME_1_10_163,
-        F4SE::RUNTIME_1_10_984,
-        F4SE::RUNTIME_1_11_191
-    });
-    return v;
-}();
+// F4SE_PLUGIN_VERSION is defined by the auto-generated commonlibf4-plugin.cpp
+// (see lib/commonlibf4/res/commonlibf4-plugin.cpp.in). The xmake.lua
+// `commonlibf4.plugin` rule fills name/author/version from set_version().
+// Keeping a duplicate here triggered an LNK2005 with current commonlibf4.
 
 // --- F4SE Entry Points - MUST have C linkage for F4SE to find them ---
 extern "C"

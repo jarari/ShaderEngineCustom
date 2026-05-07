@@ -50,6 +50,13 @@ struct alignas(16) GFXBoosterAccessData
     DirectX::XMFLOAT4 g_InvProjRow2; // 26
     DirectX::XMFLOAT4 g_InvProjRow3; // 27
 
+    // Inverse view rows. ReconstructWorldPos needs these to lift
+    // projection-space positions into world space instead of view space.
+    DirectX::XMFLOAT4 g_InvViewRow0;
+    DirectX::XMFLOAT4 g_InvViewRow1;
+    DirectX::XMFLOAT4 g_InvViewRow2;
+    DirectX::XMFLOAT4 g_InvViewRow3;
+
     float random;    // 28
     float  inCombat;     // 29
     float  inInterior;   // 30
@@ -60,6 +67,16 @@ struct alignas(16) GFXBoosterAccessData
     DirectX::XMFLOAT4 g_ViewProjRow1; // 33
     DirectX::XMFLOAT4 g_ViewProjRow2; // 34
     DirectX::XMFLOAT4 g_ViewProjRow3; // 35
+
+    // Previous-frame view-projection rows. Snapshot of g_ViewProjRow* taken
+    // at the START of UpdateCustomBuffer_Internal each frame, *before* the
+    // current-frame matrices are written. Lets temporal effects (SSRTGI,
+    // motion vectors, TAA) reproject this-frame world position into the
+    // previous-frame screen, which is the basis for accurate history reuse.
+    DirectX::XMFLOAT4 g_PrevViewProjRow0;
+    DirectX::XMFLOAT4 g_PrevViewProjRow1;
+    DirectX::XMFLOAT4 g_PrevViewProjRow2;
+    DirectX::XMFLOAT4 g_PrevViewProjRow3;
 
     float    timeOfDay;          // Game time in 24-hour format
     float    weatherTransition;  // Current weather transition percentage

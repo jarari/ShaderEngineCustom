@@ -12,6 +12,8 @@ set_warnings("allextra")
 add_rules("mode.debug", "mode.releasedbg")
 add_rules("plugin.vsxmake.autoupdate")
 
+add_defines("COMMONLIB_RUNTIMECOUNT=3")
+
 add_requires("imgui", { configs = { dx11 = true, win32 = true } })
 
 -- define targets
@@ -20,9 +22,10 @@ target("ShaderEngineCL")
         name = "ShaderEngineCL",
         author = "disi",
         description = "Fallout 4 shader engine F4SE plugin",
-        plugin_file_data = [[
-/* F4SE plugin metadata is defined manually in src/main.cpp. */
-]]
+        -- Custom template lists all three F4 runtime versions in
+        -- CompatibleVersions() instead of the default RUNTIME_LATEST.
+        -- See res/plugin.cpp.in for the source.
+        plugin_template = path.join(os.projectdir(), "res/commonlibf4-plugin.cpp.in"),
     })
 
     -- add src files

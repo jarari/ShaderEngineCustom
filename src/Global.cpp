@@ -13,6 +13,11 @@ CUSTOMBUFFER_ON=true
 CUSTOMBUFFER_SLOT=31
 ; Per-draw classification tag resource view slot
 DRAWTAG_SLOT=26
+; G-buffer normal target index (into RendererData.renderTargets[]).
+; Default 20 = kGbufferNormal for the OG runtime; override only if the
+; deferred renderer layout differs on your runtime. -1 disables the
+; `gbufferNormal` built-in input for customPass blocks.
+NORMAL_BUFFER_INDEX=20
 ; Packed shader settings resource view slots
 MODULAR_FLOATS_SLOT=29
 MODULAR_INTS_SLOT=28
@@ -112,6 +117,10 @@ DEVGUI_OPACITY=0.75
 ;    float4   GFXInjected[0].g_InvProjRow1;
 ;    float4   GFXInjected[0].g_InvProjRow2;
 ;    float4   GFXInjected[0].g_InvProjRow3;
+;    float4   GFXInjected[0].g_InvViewRow0;
+;    float4   GFXInjected[0].g_InvViewRow1;
+;    float4   GFXInjected[0].g_InvViewRow2;
+;    float4   GFXInjected[0].g_InvViewRow3;
 ;    float    GFXInjected[0].g_Random; // random value updated every frame
 ;    float    GFXInjected[0].g_Combat; // updated every 30 frames
 ;    float    GFXInjected[0].g_Interior; // updated every 30 frames
@@ -119,6 +128,10 @@ DEVGUI_OPACITY=0.75
 ;    float4   GFXInjected[0].g_ViewProjRow1;
 ;    float4   GFXInjected[0].g_ViewProjRow2;
 ;    float4   GFXInjected[0].g_ViewProjRow3;
+;    float4   GFXInjected[0].g_PrevViewProjRow0; // previous frame's VP rows
+;    float4   GFXInjected[0].g_PrevViewProjRow1; // (zero on the very first frame —
+;    float4   GFXInjected[0].g_PrevViewProjRow2; //  shaders should detect this and
+;    float4   GFXInjected[0].g_PrevViewProjRow3; //  skip temporal reuse for one frame)
 
 ; Settings for shaders can be defined in the Values.ini file in the shader definition folder
 ; Globals are at the top of the menu, while locals are grouped with other values of the shader definition
@@ -208,7 +221,12 @@ std::string GetCommonShaderHeaderHLSLTop()
             float4   g_InvProjRow2;
             float4   g_InvProjRow3;
 
-            // Block 7 (Bytes 160-175)
+            float4   g_InvViewRow0;
+            float4   g_InvViewRow1;
+            float4   g_InvViewRow2;
+            float4   g_InvViewRow3;
+
+            // Block 7
             float    g_Random;
             float    g_Combat;
             float    g_Interior;
@@ -219,6 +237,12 @@ std::string GetCommonShaderHeaderHLSLTop()
             float4   g_ViewProjRow1;
             float4   g_ViewProjRow2;
             float4   g_ViewProjRow3;
+
+            // Block 8b: Previous-frame view-projection (for temporal reprojection).
+            float4   g_PrevViewProjRow0;
+            float4   g_PrevViewProjRow1;
+            float4   g_PrevViewProjRow2;
+            float4   g_PrevViewProjRow3;
 
             // ENB Helper style game state
             float g_TimeOfDay;
@@ -293,7 +317,7 @@ std::string GetCommonShaderHeaderHLSLBottom()
 
         // --- Coordinate Space Helpers ---
 
-        // Transforms screen UV and raw depth into world-space coordinates using the inverse projection matrix.
+        // Transforms screen UV and raw depth into world-space coordinates.
         float3 ReconstructWorldPos(float2 uv, float rawDepth)
         {
             float4 clipPos;
@@ -307,8 +331,18 @@ std::string GetCommonShaderHeaderHLSLBottom()
                 GFXInjected[0].g_InvProjRow2,
                 GFXInjected[0].g_InvProjRow3
             );
-            float4 worldPos = mul(clipPos, invProj);
-            return worldPos.xyz / worldPos.w;
+            float4 viewPos = mul(clipPos, invProj);
+            viewPos.xyz *= (abs(viewPos.w) > 1e-6) ? rcp(viewPos.w) : 1.0;
+            viewPos.w = 1.0;
+
+            float4x4 invView = float4x4(
+                GFXInjected[0].g_InvViewRow0,
+                GFXInjected[0].g_InvViewRow1,
+                GFXInjected[0].g_InvViewRow2,
+                GFXInjected[0].g_InvViewRow3
+            );
+            float4 worldPos = mul(viewPos, invView);
+            return worldPos.xyz * ((abs(worldPos.w) > 1e-6) ? rcp(worldPos.w) : 1.0);
         }
 
         // --- Color Conversion Helpers ---
@@ -389,7 +423,7 @@ std::string GetCommonShaderHeaderHLSLBottom()
             return min2 + (value - min1) * (max2 - min2) / (max1 - min1);
         }
 
-        // Converts a non-linear raw depth buffer value into a linear 0.0 to 1.0 distance.
+        // Converts a non-linear raw depth buffer value into linear eye depth in game units.
         float GetLinearDepth(float rawDepth) {
             // We reconstruct a point at the center of the screen at the given depth
             float4 clipPos = float4(0, 0, rawDepth, 1.0);
@@ -400,8 +434,8 @@ std::string GetCommonShaderHeaderHLSLBottom()
                 GFXInjected[0].g_InvProjRow3
             );
             float4 viewPos = mul(clipPos, invProj);
-            // The W component after inverse projection is actually the Linear Eye Depth!
-            return viewPos.w; 
+            viewPos.xyz *= (abs(viewPos.w) > 1e-6) ? rcp(viewPos.w) : 1.0;
+            return abs(viewPos.z); 
         }
 
         // Calculates UV offsets to simulate surface depth/relief without requiring extra geometry.
