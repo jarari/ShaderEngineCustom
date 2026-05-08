@@ -106,7 +106,12 @@ enum class TriggerKind : uint8_t {
                               // shader is about to consume.
     AtPresent
 };
-enum class BlendMode : uint8_t { Opaque, Additive, PremulAlpha };
+enum class BlendMode : uint8_t {
+    Opaque,        // dst = src                               (writeMask = 0x0F)
+    Additive,      // dst = src + dst                         (HDR add: e.g. SSRTGI composite)
+    PremulAlpha,   // dst = src.rgb + dst.rgb * (1 - src.a)   (src is premultiplied)
+    Multiply,      // dst = src.rgb * dst.rgb                 (e.g. SSAO darkening)
+};
 
 enum class InputKind : uint8_t {
     None,

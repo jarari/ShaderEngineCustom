@@ -497,8 +497,10 @@ bool Registry::ParsePassSection(const std::string& name,
         else if (lk == "depthtest")    pass->spec.depthTest = (ToLower(value) == "true" || value == "1");
         else if (lk == "blend") {
             std::string v = ToLower(value);
-            pass->spec.blend = (v == "additive") ? BlendMode::Additive
-                              : (v == "premulalpha") ? BlendMode::PremulAlpha : BlendMode::Opaque;
+            pass->spec.blend = (v == "additive")    ? BlendMode::Additive
+                             : (v == "premulalpha") ? BlendMode::PremulAlpha
+                             : (v == "multiply")    ? BlendMode::Multiply
+                             :                        BlendMode::Opaque;
         }
         else if (lk == "log")          pass->spec.log = (ToLower(value) == "true" || value == "1");
         else if (lk == "threadgroups") {
@@ -822,6 +824,8 @@ struct SavedState {
 struct PassStateCache {
     REX::W32::ID3D11BlendState*             opaqueBlend = nullptr;
     REX::W32::ID3D11BlendState*             additiveBlend = nullptr;
+    REX::W32::ID3D11BlendState*             premulAlphaBlend = nullptr;
+    REX::W32::ID3D11BlendState*             multiplyBlend = nullptr;
     REX::W32::ID3D11DepthStencilState*      noDepth = nullptr;
     REX::W32::ID3D11RasterizerState*        passRaster = nullptr;
 
@@ -840,6 +844,42 @@ struct PassStateCache {
                 dev->CreateBlendState(&d, &additiveBlend);
             }
             return additiveBlend;
+        }
+        if (mode == BlendMode::PremulAlpha) {
+            if (!premulAlphaBlend) {
+                REX::W32::D3D11_BLEND_DESC d{};
+                d.renderTarget[0].blendEnable = true;
+                // dst = src.rgb + dst.rgb * (1 - src.a)
+                // Shader emits premultiplied src; useful for compositing where
+                // src.a is the coverage/strength of the overlay.
+                d.renderTarget[0].srcBlend       = REX::W32::D3D11_BLEND_ONE;
+                d.renderTarget[0].destBlend      = REX::W32::D3D11_BLEND_INV_SRC_ALPHA;
+                d.renderTarget[0].blendOp        = REX::W32::D3D11_BLEND_OP_ADD;
+                d.renderTarget[0].srcBlendAlpha  = REX::W32::D3D11_BLEND_ONE;
+                d.renderTarget[0].destBlendAlpha = REX::W32::D3D11_BLEND_INV_SRC_ALPHA;
+                d.renderTarget[0].blendOpAlpha   = REX::W32::D3D11_BLEND_OP_ADD;
+                d.renderTarget[0].renderTargetWriteMask = 0x0F;
+                dev->CreateBlendState(&d, &premulAlphaBlend);
+            }
+            return premulAlphaBlend;
+        }
+        if (mode == BlendMode::Multiply) {
+            if (!multiplyBlend) {
+                REX::W32::D3D11_BLEND_DESC d{};
+                d.renderTarget[0].blendEnable = true;
+                // dst = src.rgb * dst.rgb. D3D11 has no MUL blend op; encode
+                // it as ADD with srcBlend=DEST_COLOR and destBlend=ZERO so the
+                // result becomes src*dst + dst*0.
+                d.renderTarget[0].srcBlend       = REX::W32::D3D11_BLEND_DEST_COLOR;
+                d.renderTarget[0].destBlend      = REX::W32::D3D11_BLEND_ZERO;
+                d.renderTarget[0].blendOp        = REX::W32::D3D11_BLEND_OP_ADD;
+                d.renderTarget[0].srcBlendAlpha  = REX::W32::D3D11_BLEND_ONE;
+                d.renderTarget[0].destBlendAlpha = REX::W32::D3D11_BLEND_ZERO;
+                d.renderTarget[0].blendOpAlpha   = REX::W32::D3D11_BLEND_OP_ADD;
+                d.renderTarget[0].renderTargetWriteMask = 0x0F;
+                dev->CreateBlendState(&d, &multiplyBlend);
+            }
+            return multiplyBlend;
         }
         if (!opaqueBlend) {
             REX::W32::D3D11_BLEND_DESC d{};

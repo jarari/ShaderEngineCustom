@@ -121,7 +121,7 @@ output=0:customResource:giCurrent
 ; --- Render state (PS only) ---
 viewport=screen/2            ; matches the output's scale by default
 clearOnFire=false
-blend=opaque                 ; opaque | additive | premulalpha
+blend=opaque                 ; opaque | additive | premulalpha | multiply
 depthTest=false
 
 ; --- Logging ---
