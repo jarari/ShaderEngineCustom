@@ -30,8 +30,9 @@ format=R11G11B10_FLOAT      ; DXGI_FORMAT_*; R11G11B10_FLOAT, R16G16B16A16_FLOAT
 scale=screen/2              ; "screen" | "screen/N" | "WxH"   (relative to renderTargets[3])
 mipLevels=1                 ; default 1
 ; --- Bindings ---
-srvSlot=24                  ; t-slot bound globally to PS (and VS) for the lifetime of the
-                            ; renderer. -1 disables global binding (still usable by name).
+srvSlot=40                  ; t-slot bound globally to replacement PS/VS shaders.
+                            ; Prefer t40+ for custom resources.
+                            ; -1 disables global binding (still usable by name).
 uav=true                    ; allocate a UAV (required for compute writes)
 rtv=true                    ; allocate an RTV (required for PS writes)
 ; --- Per-frame behavior ---
@@ -51,7 +52,7 @@ Two resources can be declared as a ping-pong pair so reads/writes flip every fra
 [customResource:giHistory]
 format=R11G11B10_FLOAT
 scale=screen/2
-srvSlot=23
+srvSlot=41
 uav=true
 rtv=true
 pingpongWith=giCurrent      ; symmetric — declare on either side
@@ -166,11 +167,14 @@ After the schema lands the plugin reserves the following slots by default
 | t29  | `GFXModularFloats`                    | unchanged                              |
 | t30  | `g_DepthSRV`                          | unchanged (main scene depth)           |
 | t31  | `GFXInjected` (booster CB)            | unchanged                              |
-| t22-t25 | reserved for `customResource` SRVs | tunable, declarable per-resource       |
+| t40+    | preferred `customResource` SRVs     | configurable via `srvSlot`; keep package-wide |
 
-`customResource` blocks with `srvSlot >= 0` cause the plugin to add a global PS+VS bind for
-that SRV inside `BindInjectedPixelShaderResources`. Existing replacement shaders can sample
-them by name once the slot is declared in the package's HLSL.
+`customResource` blocks with `srvSlot >= 0` cause the plugin to publish that SRV to
+replacement pixel and vertex shaders on the declared slot. The implementation does not
+clamp this to a fixed range. Prefer `t40+` for new resources because it avoids the
+plugin's built-in injected SRVs (`t26-t31`) and leaves room for package-defined
+resources. Existing replacement shaders can sample them by name once the slot is declared
+in the package's HLSL.
 
 ---
 
@@ -182,7 +186,7 @@ them by name once the slot is declared in the package's HLSL.
 [customResource:giCurrent]
 format=R11G11B10_FLOAT
 scale=screen/2
-srvSlot=24
+srvSlot=40
 rtv=true
 pingpongWith=giHistory
 [/customResource:giCurrent]
@@ -190,7 +194,7 @@ pingpongWith=giHistory
 [customResource:giHistory]
 format=R11G11B10_FLOAT
 scale=screen/2
-srvSlot=23
+srvSlot=41
 rtv=true
 pingpongWith=giCurrent
 [/customResource:giHistory]
@@ -206,7 +210,7 @@ viewport=screen/2
 [/customPass:hachiSSRTGI]
 ```
 
-The existing `visualTonemap.hlsl` then samples `giCurrent` from t24 and adds it before
+The existing `visualTonemap.hlsl` then samples `giCurrent` from t40 and adds it before
 tonemap.
 
 ### Two-pass denoise (sketch)
@@ -215,7 +219,7 @@ tonemap.
 [customResource:giDenoised]
 format=R11G11B10_FLOAT
 scale=screen/2
-srvSlot=22
+srvSlot=42
 rtv=true
 [/customResource:giDenoised]
 
@@ -229,4 +233,4 @@ output=0:customResource:giDenoised
 [/customPass:hachiSSRTGIDenoise]
 ```
 
-`visualTonemap.hlsl` then samples `giDenoised` (t22) instead of `giCurrent`.
+`visualTonemap.hlsl` then samples `giDenoised` (t42) instead of `giCurrent`.
