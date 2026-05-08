@@ -1432,6 +1432,16 @@ static void BindInjectedPixelShaderResources(REX::W32::ID3D11DeviceContext* cont
     g_bindingInjectedPixelResources = false;
 }
 
+static void BindInjectedVertexShaderResources(REX::W32::ID3D11DeviceContext* context)
+{
+    if (!context) {
+        return;
+    }
+
+    BindCustomShaderResources(context, false);
+    CustomPass::g_registry.BindGlobalResourceSRVs(context, /*pixelStage=*/false);
+}
+
 static void BindDrawTagForCurrentDraw(REX::W32::ID3D11DeviceContext* context, bool force)
 {
     if (!context) {
@@ -1944,7 +1954,7 @@ void STDMETHODCALLTYPE MyVSSetShader(
                 }
                 pVertexShader = replacementVertexShader;
                 // Set our custom SRVs for replacement shaders to use in their shader code
-                BindCustomShaderResources(This, false);
+                BindInjectedVertexShaderResources(This);
             } else {
                 auto* matchedDefinition = g_ShaderDB.GetMatchedDefinition(pVertexShader);
                 if (matchedDefinition && !matchedDefinition->buggy) {
@@ -1960,7 +1970,7 @@ void STDMETHODCALLTYPE MyVSSetShader(
                         }
                         pVertexShader = g_ShaderDB.GetReplacementShader(pVertexShader);
                         // Set our custom SRVs for replacement shaders to use in their shader code
-                        BindCustomShaderResources(This, false);
+                        BindInjectedVertexShaderResources(This);
                     } else {
                         REX::WARN("MyVSSetShader: Failed to compile replacement shader for definition '{}'", matchedDefinition->id);
                         matchedDefinition->buggy = true; // Mark as failed to compile
