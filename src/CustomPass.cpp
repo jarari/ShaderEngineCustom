@@ -561,13 +561,26 @@ void Registry::ResolveHookIdTriggers() {
 }
 
 bool Registry::EnsureCompiled(Pass& pass) {
-    if (pass.compileFailed) return false;
+    // Cheap pre-check off the lock so the render-thread fast path doesn't
+    // touch the mutex when the pass is already compiled.
     if (pass.psShader || pass.csShader) return true;
+    if (pass.compileFailed) return false;
+
+    if (!pass.compileMutex) pass.compileMutex = std::make_unique<std::mutex>();
+    std::lock_guard compileLock(*pass.compileMutex);
+    // Re-test under the lock — a concurrent compile may have just finished.
+    if (pass.psShader || pass.csShader) return true;
+    if (pass.compileFailed) return false;
     if (pass.compileTried) return false;
     pass.compileTried = true;
 
     if (pass.spec.shaderFile.empty()) { pass.compileFailed = true; return false; }
-    if (!g_rendererData || !g_rendererData->device) { pass.compileFailed = true; return false; }
+    if (!g_rendererData || !g_rendererData->device) {
+        // Don't latch compileFailed for "device not ready" — the worker may
+        // be the one calling, and the render thread will retry.
+        pass.compileTried = false;
+        return false;
+    }
 
     std::ifstream f(pass.spec.shaderFile, std::ios::binary);
     if (!f.good()) { pass.compileFailed = true; return false; }
@@ -593,21 +606,35 @@ bool Registry::EnsureCompiled(Pass& pass) {
     source += body;
 
     const char* profile = (pass.spec.type == PassType::Compute) ? "cs_5_0" : "ps_5_0";
-    ID3DBlob* errBlob = nullptr;
-    auto* includer = new ShaderIncludeHandler();
-    HRESULT hr = D3DCompile(source.c_str(), source.size(), pass.spec.name.c_str(),
-                            nullptr, includer, pass.spec.entry.c_str(), profile,
-                            D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &pass.compiledBlob, &errBlob);
-    delete includer;
-    if (!REX::W32::SUCCESS(hr)) {
-        if (errBlob) {
-            REX::WARN("CustomPass[{}]: compile failed: {}", pass.spec.name, static_cast<const char*>(errBlob->GetBufferPointer()));
-            errBlob->Release();
+    constexpr uint32_t kCompileFlags = D3DCOMPILE_OPTIMIZATION_LEVEL3;
+    const std::string cacheKey = ShaderCache::ComputeKey({
+        .assembledSource = source,
+        .profile         = profile,
+        .entry           = pass.spec.entry,
+        .flags           = kCompileFlags,
+    });
+    if (ShaderCache::TryLoad(cacheKey, &pass.compiledBlob)) {
+        REX::INFO("CustomPass[{}]: cache HIT ({} bytes)", pass.spec.name, pass.compiledBlob->GetBufferSize());
+    } else {
+        ID3DBlob* errBlob = nullptr;
+        auto* includer = new ShaderIncludeHandler();
+        HRESULT hr = D3DCompile(source.c_str(), source.size(), pass.spec.name.c_str(),
+                                nullptr, includer, pass.spec.entry.c_str(), profile,
+                                kCompileFlags, 0, &pass.compiledBlob, &errBlob);
+        delete includer;
+        if (!REX::W32::SUCCESS(hr)) {
+            if (errBlob) {
+                REX::WARN("CustomPass[{}]: compile failed: {}", pass.spec.name, static_cast<const char*>(errBlob->GetBufferPointer()));
+                errBlob->Release();
+            }
+            pass.compileFailed = true;
+            return false;
         }
-        pass.compileFailed = true;
-        return false;
+        if (errBlob) errBlob->Release();
+        ShaderCache::Store(cacheKey, pass.compiledBlob);
+        REX::INFO("CustomPass[{}]: compiled successfully ({} bytes)", pass.spec.name, pass.compiledBlob->GetBufferSize());
     }
-    if (errBlob) errBlob->Release();
+    HRESULT hr = S_OK;
 
     ::g_isCreatingReplacementShader = true;
     if (pass.spec.type == PassType::Compute) {
@@ -627,7 +654,6 @@ bool Registry::EnsureCompiled(Pass& pass) {
         pass.compileFailed = true;
         return false;
     }
-    REX::INFO("CustomPass[{}]: compiled successfully ({} bytes)", pass.spec.name, pass.compiledBlob->GetBufferSize());
     return true;
 }
 
@@ -1393,6 +1419,29 @@ void Registry::BindGlobalResourceSRVs(REX::W32::ID3D11DeviceContext* context, bo
         if (res->spec.srvSlot < 0 || !res->srv) continue;
         if (pixelStage) context->PSSetShaderResources((UINT)res->spec.srvSlot, 1, &res->srv);
         else            context->VSSetShaderResources((UINT)res->spec.srvSlot, 1, &res->srv);
+    }
+}
+
+void Registry::EnqueuePrecompileJobs() {
+    if (!g_precompileWorker) return;
+    // Snapshot pass pointers under the lock, release the lock, then enqueue.
+    // The worker is stopped before any pass deletion (see
+    // ReloadAllShaderDefinitions_Internal) so the captured pointers stay
+    // valid for the duration of the queue.
+    std::vector<Pass*> snapshot;
+    {
+        std::lock_guard lk(mutex);
+        snapshot.reserve(passes.size());
+        for (auto& p : passes) {
+            if (p && p->spec.active && !p->spec.shaderFile.empty()) {
+                snapshot.push_back(p.get());
+            }
+        }
+    }
+    auto* self = this;
+    for (Pass* p : snapshot) {
+        g_precompileWorker->Enqueue("customPass:" + p->spec.name,
+                                     [self, p]{ self->EnsureCompiled(*p); });
     }
 }
 

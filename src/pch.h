@@ -56,6 +56,7 @@ using namespace std::literals;
 
 // threads and synchronization
 #include <condition_variable>
+#include <cmath>
 #include <mutex>
 #include <shared_mutex>
 

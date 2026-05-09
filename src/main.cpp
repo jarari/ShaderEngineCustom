@@ -941,7 +941,7 @@ void LoadConfig(HMODULE hModule) {
         REX::INFO("LoadConfig: Setting up development file watcher for shader definitions in: {}", g_shaderFolderPath.string());
         for (auto* def : g_shaderDefinitions.definitions) {
             if (def->active && !def->shaderFile.empty()) {
-                def->hlslFileWatcher = std::make_unique<HlslFileWatcher>(def->shaderFile, def);
+                def->hlslFileWatcher = std::make_unique<HlslFileWatcher>(def->shaderFile);
                 def->hlslFileWatcher->Start();
             }
         }
@@ -960,6 +960,34 @@ void LoadConfig(HMODULE hModule) {
     if (DEBUGGING) {
         REX::INFO("LoadConfig: Setting global shader include path for D3DCompile to: {}", g_commonShaderHeaderPath.string());
     }
+    // Watch the common include dir so an edit to any file under Include/
+    // invalidates the ShaderCache include memo before the next compile reads
+    // it. Without this, editing only an include leaves running shaders on
+    // stale bytecode AND poisons the on-disk cache the next time any
+    // dependent shader is recompiled. Only spun up in DEVELOPMENT mode —
+    // the include dir is immutable in production.
+    if (DEVELOPMENT && !g_includeDirWatcher) {
+        g_includeDirWatcher = std::make_unique<IncludeDirWatcher>(g_commonShaderHeaderPath);
+        g_includeDirWatcher->Start();
+    }
+    // Spin up the background precompile worker and queue every active def
+    // and every customPass. The worker waits for the renderer device before
+    // doing real work, so it's safe to enqueue here even though D3D isn't
+    // ready yet at plugin load. By the time the engine starts binding
+    // shaders, most replacement bytecode is either cache-loaded or freshly
+    // compiled and waiting in def->loadedPixelShader / loadedVertexShader,
+    // and customPass psShader/csShader are already populated for FirePass.
+    if (!g_precompileWorker) g_precompileWorker = std::make_unique<PrecompileWorker>();
+    g_precompileWorker->Start();
+    {
+        std::shared_lock lk(g_shaderDefinitions.mutex);
+        for (auto* def : g_shaderDefinitions.definitions) {
+            if (def && def->active && !def->shaderFile.empty()) {
+                g_precompileWorker->Enqueue(def->id, [def]{ CompileShader_Internal(def); });
+            }
+        }
+    }
+    CustomPass::g_registry.EnqueuePrecompileJobs();
 }
 
 // Hot-reload all shader definitions and rematch shaders in ShaderDB
@@ -967,6 +995,15 @@ void ReloadAllShaderDefinitions_Internal() {
     if (DEBUGGING) {
         REX::INFO("ReloadAllShaderDefinitions_Internal: Starting hot reload of shader definitions...");
     }
+    // Stop the precompile worker before we touch any def: queue is drained
+    // and the worker thread is joined, so by the time we hit Clear() below
+    // there's no chance of a worker-thread CompileShader_Internal touching
+    // a deleted ShaderDefinition*.
+    if (g_precompileWorker) g_precompileWorker->Stop();
+    // Drop the include-dir hash and include-file content memo so the next
+    // ComputeKey / D3DCompile picks up any include edits the user made
+    // alongside their Shader.ini change.
+    ShaderCache::InvalidateIncludeMemo();
     // Remove all connections ShaderDB <> ShaderDefDB
     g_ShaderDB.UnmatchAll();
     // STOP and destroy all file watchers BEFORE processing new INI files
@@ -996,7 +1033,7 @@ void ReloadAllShaderDefinitions_Internal() {
         REX::INFO("ReloadAllShaderDefinitions_Internal: Setting up development file watchers for shader definitions...");
         for (auto* def : g_shaderDefinitions.definitions) {
             if (def->active && !def->shaderFile.empty()) {
-                def->hlslFileWatcher = std::make_unique<HlslFileWatcher>(def->shaderFile, def);
+                def->hlslFileWatcher = std::make_unique<HlslFileWatcher>(def->shaderFile);
                 def->hlslFileWatcher->Start();
             }
         }
@@ -1009,6 +1046,22 @@ void ReloadAllShaderDefinitions_Internal() {
     CustomPass::g_registry.ResolveHookIdTriggers();
     // Reconnect ShaderDB <> ShaderDefDB based on new definitions
     RematchAllShaders_Internal();
+    // Restart the precompile worker and re-queue every active def and
+    // customPass. The device is already up at this point (we got here via
+    // a render-thread task), so the worker pops jobs immediately without
+    // the startup wait.
+    if (g_precompileWorker) {
+        g_precompileWorker->Start();
+        {
+            std::shared_lock lk(g_shaderDefinitions.mutex);
+            for (auto* def : g_shaderDefinitions.definitions) {
+                if (def && def->active && !def->shaderFile.empty()) {
+                    g_precompileWorker->Enqueue(def->id, [def]{ CompileShader_Internal(def); });
+                }
+            }
+        }
+        CustomPass::g_registry.EnqueuePrecompileJobs();
+    }
     if (DEBUGGING) {
         REX::INFO("ReloadAllShaderDefinitions_Internal: Completed hot reload of shader definitions.");
     }
@@ -1148,6 +1201,18 @@ extern "C"
                 watcher->Stop();
                 watcher.reset();
             }
+        }
+        // Stop the include-dir watcher (if running).
+        if (g_includeDirWatcher) {
+            g_includeDirWatcher->Stop();
+            g_includeDirWatcher.reset();
+        }
+        // Stop the background precompile worker BEFORE we release any D3D11
+        // resources — a worker mid-CompileShader_Internal could otherwise
+        // call CreatePixelShader on a torn-down device.
+        if (g_precompileWorker) {
+            g_precompileWorker->Stop();
+            g_precompileWorker.reset();
         }
         // Clear Shader resources
         if (g_customSRV)       { g_customSRV->Release();       g_customSRV = nullptr; }

@@ -51,7 +51,7 @@ DEVGUI_OPACITY=0.75
 
 ; Folder structure
 ; /F4SE/Plugins/ShaderEngine.ini - main configuration file for shader replacement rules
-; /F4SE/Plugins/GFXBoosterDumps/<ShaderDefinition ID>/ - folder with dumped original shaders for analysis
+; /F4SE/Plugins/ShaderEngineDumps/<ShaderDefinition ID>/ - folder with dumped original shaders for analysis
 ; /F4SE/Plugins/ShaderEngine/<ShaderDefinition>/ - folder for replacement shaders
 ; /F4SE/Plugins/ShaderEngine/<ShaderDefinition>/Shader.ini - settings for the replacement shader, see below for example format
 ; /F4SE/Plugins/ShaderEngine/<ShaderDefinition>/Values.ini - settings for shader values, see below for example format
@@ -87,9 +87,9 @@ DEVGUI_OPACITY=0.75
 ;inputMask=0x0               ; match of the bitmask for required input registers (bit i is 1 if input register i is required)
 ;outputcount=(1)             ; outputcount definitions for the shader, can specify multiple separated by commas (e.g. (1), (>0), (<4)), or leave empty to ignore output count check
 ;outputMask=0x1              ; match of the bitmask for required output registers (bit i is 1 if output register o[i] is required)
-;shader=GFXBoosterLS.hlsl    ; the replacement shader file name in the shader definition folder, CANNOT have white spaces in the filename and must be a .hlsl file
+;shader=ShaderEngineLS.hlsl    ; the replacement shader file name in the shader definition folder, CANNOT have white spaces in the filename and must be a .hlsl file
 ;log=true                    ; whether to log shader detection and reflection details to the F4SE logs for this shader replacement rule
-;dump=true                   ; whether to dump the original shader for analysis to the GFXBoosterDumps folder for this shader replacement rule (existing dumps files will not be overwritten, but skipped)
+;dump=true                   ; whether to dump the original shader for analysis to the ShaderEngineDumps folder for this shader replacement rule (existing dumps files will not be overwritten, but skipped)
 ;[/loadingScreen]
 
 ; Adding #include "common.inc" to the replacement shader gives access to:
@@ -129,9 +129,41 @@ DEVGUI_OPACITY=0.75
 ;    float4   GFXInjected[0].g_ViewProjRow2;
 ;    float4   GFXInjected[0].g_ViewProjRow3;
 ;    float4   GFXInjected[0].g_PrevViewProjRow0; // previous frame's VP rows
-;    float4   GFXInjected[0].g_PrevViewProjRow1; // (zero on the very first frame —
+;    float4   GFXInjected[0].g_PrevViewProjRow1; // (zero on the very first frame;
 ;    float4   GFXInjected[0].g_PrevViewProjRow2; //  shaders should detect this and
 ;    float4   GFXInjected[0].g_PrevViewProjRow3; //  skip temporal reuse for one frame)
+;    float    GFXInjected[0].g_TimeOfDay; // game time in 24-hour format
+;    float    GFXInjected[0].g_WeatherTransition;
+;    uint     GFXInjected[0].g_CurrentWeatherID;
+;    uint     GFXInjected[0].g_OutgoingWeatherID;
+;    uint     GFXInjected[0].g_CurrentLocationID;
+;    uint     GFXInjected[0].g_WorldSpaceID;
+;    uint     GFXInjected[0].g_SkyMode;
+;    int      GFXInjected[0].g_CurrentWeatherClass;
+;    int      GFXInjected[0].g_OutgoingWeatherClass;
+;    float4   GFXInjected[0].g_CameraLocalRow0;
+;    float4   GFXInjected[0].g_CameraLocalRow1;
+;    float4   GFXInjected[0].g_CameraLocalRow2;
+;    float4   GFXInjected[0].g_CameraLocalRow3;
+;    float4   GFXInjected[0].g_CameraWorldRow0;
+;    float4   GFXInjected[0].g_CameraWorldRow1;
+;    float4   GFXInjected[0].g_CameraWorldRow2;
+;    float4   GFXInjected[0].g_CameraWorldRow3;
+;    float4   GFXInjected[0].g_CameraPreviousWorldRow0;
+;    float4   GFXInjected[0].g_CameraPreviousWorldRow1;
+;    float4   GFXInjected[0].g_CameraPreviousWorldRow2;
+;    float4   GFXInjected[0].g_CameraPreviousWorldRow3;
+;    float4   GFXInjected[0].g_FogDistances0; // x=near, y=far, z=waterNear, w=waterFar
+;    float4   GFXInjected[0].g_FogDistances1; // x=heightMid, y=heightRange, z=farHeightMid, w=farHeightRange
+;    float4   GFXInjected[0].g_FogParams; // x=fogHeight, y=fogPower, z=fogClamp, w=fogHighDensityScale
+;    float4   GFXInjected[0].g_FogColor; // xyz=reserved fog RGB, currently zero; w=reserved
+;    float    GFXInjected[0].g_SunR; // dominant stylized light red
+;    float    GFXInjected[0].g_SunG; // dominant stylized light green
+;    float    GFXInjected[0].g_SunB; // dominant stylized light blue
+;    float    GFXInjected[0].g_SunDirX; // dominant stylized light direction X
+;    float    GFXInjected[0].g_SunDirY; // dominant stylized light direction Y
+;    float    GFXInjected[0].g_SunDirZ; // dominant stylized light direction Z
+;    float    GFXInjected[0].g_SunValid; // 0=no dominant light, exterior=1, interior=directional fade
 
 ; Settings for shaders can be defined in the Values.ini file in the shader definition folder
 ; Globals are at the top of the menu, while locals are grouped with other values of the shader definition
@@ -280,6 +312,16 @@ std::string GetCommonShaderHeaderHLSLTop()
             float4 g_FogDistances1;  // x=heightMid, y=heightRange, z=farHeightMid, w=farHeightRange
             float4 g_FogParams;      // x=fogHeight, y=fogPower, z=fogClamp, w=fogHighDensityScale
             float4 g_FogColor;       // xyz=blended RGB (0 until per-weather blend lands), w=reserved
+
+            float  g_SunR;
+            float  g_SunG;
+            float  g_SunB;
+            float  g_SunDirX;
+
+            float  g_SunDirY;
+            float  g_SunDirZ;
+            float  g_SunValid;
+            float  _sunPadding;
         };
 
         struct DrawTagData
@@ -484,4 +526,368 @@ std::string GetCommonShaderHeaderHLSLBottom()
             return currentUV;
         }
         )");
+}
+
+// --- Compiled-shader cache implementation -------------------------------
+
+extern std::filesystem::path g_shaderFolderPath;  // defined in main.cpp
+
+namespace {
+
+constexpr uint64_t kFnvOffset = 0xcbf29ce484222325ULL;
+constexpr uint64_t kFnvPrime  = 0x100000001b3ULL;
+
+inline uint64_t FnvUpdate(uint64_t h, const void* data, size_t len) {
+    const auto* p = static_cast<const uint8_t*>(data);
+    for (size_t i = 0; i < len; ++i) { h ^= p[i]; h *= kFnvPrime; }
+    return h;
+}
+
+std::filesystem::path GetCacheDir() {
+    // Lives next to the per-shader folders, hidden via the leading dot so it
+    // doesn't get mistaken for a definition folder by GetSubdirectories.
+    std::filesystem::path d = g_shaderFolderPath / ".cache";
+    std::error_code ec;
+    std::filesystem::create_directories(d, ec);
+    return d;
+}
+
+// --- Memoized include state ---------------------------------------------
+//
+// Both the include-dir hash (one FNV pass over every file in the include dir,
+// done once per ComputeKey) and the include-file contents (read via ifstream
+// on every #include from D3DCompile) used to be recomputed on every shader
+// compile. With N matched shaders bound back-to-back at world load that's
+// N copies of the same disk traffic. Memoize both, drop the memo on Shader.ini
+// reload (where the include-dir contents may have changed).
+
+std::mutex                                            g_includeMemoMutex;
+bool                                                  g_includeHashCached = false;
+uint64_t                                              g_includeHashValue  = 0;
+std::unordered_map<std::string, std::vector<char>>    g_includeContentCache;
+
+// Hash every regular file inside g_commonShaderHeaderPath (filename + body)
+// in sorted order so any change to a shared include invalidates dependent
+// caches without us needing to track per-shader include graphs.
+uint64_t HashCommonIncludeDir() {
+    {
+        std::lock_guard lk(g_includeMemoMutex);
+        if (g_includeHashCached) return g_includeHashValue;
+    }
+    if (g_commonShaderHeaderPath.empty()) return 0;
+    std::error_code ec;
+    if (!std::filesystem::exists(g_commonShaderHeaderPath, ec)) return 0;
+    std::vector<std::filesystem::path> files;
+    for (auto& e : std::filesystem::directory_iterator(g_commonShaderHeaderPath, ec)) {
+        if (e.is_regular_file(ec)) files.push_back(e.path());
+    }
+    std::sort(files.begin(), files.end());
+    uint64_t h = kFnvOffset;
+    for (auto& f : files) {
+        auto name = f.filename().string();
+        h = FnvUpdate(h, name.data(), name.size());
+        std::ifstream ifs(f, std::ios::binary);
+        if (!ifs) continue;
+        std::string body((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+        h = FnvUpdate(h, body.data(), body.size());
+    }
+    {
+        std::lock_guard lk(g_includeMemoMutex);
+        g_includeHashValue  = h;
+        g_includeHashCached = true;
+    }
+    return h;
+}
+
+}  // namespace
+
+namespace ShaderCache {
+
+std::string ComputeKey(const CompileInputs& inputs) {
+    uint64_t h = kFnvOffset;
+    h = FnvUpdate(h, inputs.assembledSource.data(), inputs.assembledSource.size());
+    h = FnvUpdate(h, inputs.profile.data(),         inputs.profile.size());
+    h = FnvUpdate(h, inputs.entry.data(),           inputs.entry.size());
+    h = FnvUpdate(h, &inputs.flags,                 sizeof(inputs.flags));
+    const uint64_t inc = HashCommonIncludeDir();
+    h = FnvUpdate(h, &inc, sizeof(inc));
+    return std::format("{:016x}", h);
+}
+
+bool TryLoad(const std::string& key, ID3DBlob** outBlob) {
+    if (!outBlob) return false;
+    *outBlob = nullptr;
+
+    const auto path = GetCacheDir() / (key + ".bin");
+    std::ifstream f(path, std::ios::binary);
+    if (!f.good()) return false;
+
+    char magic[4]{};
+    f.read(magic, 4);
+    if (!f.good() || std::memcmp(magic, "SHC1", 4) != 0) return false;
+
+    uint32_t version = 0;
+    f.read(reinterpret_cast<char*>(&version), sizeof(version));
+    if (!f.good() || version != kFileFormatVersion) return false;
+
+    uint64_t storedKey = 0;
+    f.read(reinterpret_cast<char*>(&storedKey), sizeof(storedKey));
+    if (!f.good()) return false;
+    // Cross-check filename-encoded key vs in-header copy: catches accidental
+    // file copies/renames between cache slots.
+    uint64_t expectedKey = 0;
+    try { expectedKey = std::stoull(key, nullptr, 16); } catch (...) { return false; }
+    if (storedKey != expectedKey) {
+        REX::WARN("ShaderCache::TryLoad: header/key mismatch in {}, ignoring", path.string());
+        return false;
+    }
+
+    uint64_t blobSize = 0;
+    f.read(reinterpret_cast<char*>(&blobSize), sizeof(blobSize));
+    // Sanity cap: any compiled blob over 64 MiB is almost certainly corrupt.
+    if (!f.good() || blobSize == 0 || blobSize > (64ull << 20)) return false;
+
+    ID3DBlob* blob = nullptr;
+    if (FAILED(D3DCreateBlob(static_cast<SIZE_T>(blobSize), &blob)) || !blob) return false;
+    f.read(reinterpret_cast<char*>(blob->GetBufferPointer()), static_cast<std::streamsize>(blobSize));
+    if (static_cast<uint64_t>(f.gcount()) != blobSize) {
+        blob->Release();
+        return false;
+    }
+    *outBlob = blob;
+    return true;
+}
+
+void Store(const std::string& key, ID3DBlob* blob) {
+    if (!blob) return;
+    const auto dir = GetCacheDir();
+    const auto tmp = dir / (key + ".bin.tmp");
+    const auto fin = dir / (key + ".bin");
+
+    {
+        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+        if (!f.good()) {
+            REX::WARN("ShaderCache::Store: cannot open {} for write", tmp.string());
+            return;
+        }
+        f.write("SHC1", 4);
+        const uint32_t version = kFileFormatVersion;
+        f.write(reinterpret_cast<const char*>(&version), sizeof(version));
+        uint64_t storedKey = 0;
+        try { storedKey = std::stoull(key, nullptr, 16); } catch (...) { return; }
+        f.write(reinterpret_cast<const char*>(&storedKey), sizeof(storedKey));
+        const uint64_t blobSize = static_cast<uint64_t>(blob->GetBufferSize());
+        f.write(reinterpret_cast<const char*>(&blobSize), sizeof(blobSize));
+        f.write(reinterpret_cast<const char*>(blob->GetBufferPointer()),
+                static_cast<std::streamsize>(blobSize));
+        if (!f.good()) {
+            REX::WARN("ShaderCache::Store: write failed for {}", tmp.string());
+            std::error_code ec; std::filesystem::remove(tmp, ec);
+            return;
+        }
+    }
+    // Atomic publish via rename. If the target already exists (e.g. a parallel
+    // miss raced and wrote first) replace it — both blobs are equally valid.
+    std::error_code ec;
+    std::filesystem::rename(tmp, fin, ec);
+    if (ec) {
+        std::filesystem::remove(fin, ec);
+        std::filesystem::rename(tmp, fin, ec);
+        if (ec) {
+            REX::WARN("ShaderCache::Store: rename failed for {}: {}",
+                      fin.string(), ec.message());
+            std::filesystem::remove(tmp, ec);
+        }
+    }
+}
+
+void InvalidateIncludeMemo() {
+    std::lock_guard lk(g_includeMemoMutex);
+    g_includeHashCached = false;
+    g_includeHashValue  = 0;
+    g_includeContentCache.clear();
+}
+
+}  // namespace ShaderCache
+
+// --- ShaderIncludeHandler implementation --------------------------------
+//
+// Reads each include file once into g_includeContentCache; subsequent
+// resolutions of the same `#include` line (across shaders, across compile
+// invocations) hand back a copy of the cached bytes instead of hitting disk.
+// Cache is flushed by ShaderCache::InvalidateIncludeMemo on Shader.ini reload.
+
+HRESULT __stdcall ShaderIncludeHandler::Open(D3D_INCLUDE_TYPE /*IncludeType*/,
+                                             LPCSTR pFileName,
+                                             LPCVOID /*pParentData*/,
+                                             LPCVOID* ppData,
+                                             UINT* pBytes) {
+    if (!ppData || !pBytes || !pFileName) return E_FAIL;
+    const std::string key = pFileName;
+
+    // Hot path: serve a copy from the in-memory cache.
+    {
+        std::lock_guard lk(g_includeMemoMutex);
+        auto it = g_includeContentCache.find(key);
+        if (it != g_includeContentCache.end()) {
+            const auto& src = it->second;
+            char* out = new char[src.size()];
+            std::memcpy(out, src.data(), src.size());
+            *ppData = out;
+            *pBytes = static_cast<UINT>(src.size());
+            return S_OK;
+        }
+    }
+
+    // Cold path: read from disk and populate the cache.
+    const std::filesystem::path includePath = g_commonShaderHeaderPath / pFileName;
+    std::ifstream file(includePath, std::ios::binary);
+    if (!file.good()) {
+        REX::WARN("ShaderIncludeHandler: Failed to open include file: {}", includePath.string());
+        return E_FAIL;
+    }
+    file.seekg(0, std::ios::end);
+    const size_t size = static_cast<size_t>(file.tellg());
+    file.seekg(0, std::ios::beg);
+    std::vector<char> body(size);
+    if (size > 0) file.read(body.data(), static_cast<std::streamsize>(size));
+    file.close();
+
+    // Hand caller a fresh allocation (they own it; Close will delete[] it).
+    char* out = new char[size];
+    std::memcpy(out, body.data(), size);
+    *ppData = out;
+    *pBytes = static_cast<UINT>(size);
+
+    {
+        std::lock_guard lk(g_includeMemoMutex);
+        // Insert if still absent (another thread may have populated meanwhile).
+        g_includeContentCache.try_emplace(key, std::move(body));
+    }
+    return S_OK;
+}
+
+HRESULT __stdcall ShaderIncludeHandler::Close(LPCVOID pData) {
+    delete[] static_cast<const char*>(pData);
+    return S_OK;
+}
+
+// --- IncludeDirWatcher implementation -----------------------------------
+
+std::unique_ptr<IncludeDirWatcher> g_includeDirWatcher;
+
+namespace {
+
+std::unordered_map<std::string, std::filesystem::file_time_type>
+SnapshotIncludeDir(const std::filesystem::path& dir) {
+    std::unordered_map<std::string, std::filesystem::file_time_type> out;
+    std::error_code ec;
+    if (!std::filesystem::exists(dir, ec)) return out;
+    for (auto& e : std::filesystem::directory_iterator(dir, ec)) {
+        if (e.is_regular_file(ec)) {
+            out.emplace(e.path().filename().string(), e.last_write_time(ec));
+        }
+    }
+    return out;
+}
+
+}  // namespace
+
+IncludeDirWatcher::IncludeDirWatcher(std::filesystem::path d) : dir(std::move(d)) {
+    snapshot = SnapshotIncludeDir(dir);
+}
+
+IncludeDirWatcher::~IncludeDirWatcher() {
+    Stop();
+}
+
+void IncludeDirWatcher::Start() {
+    running = true;
+    worker = std::thread([this]() {
+        std::unique_lock lock(stopMutex);
+        while (running) {
+            lock.unlock();
+            try { Check(); } catch (...) {}
+            lock.lock();
+            stopCv.wait_for(lock, std::chrono::seconds(1), [this]{ return !running; });
+        }
+    });
+}
+
+void IncludeDirWatcher::Stop() {
+    {
+        std::lock_guard lock(stopMutex);
+        running = false;
+    }
+    stopCv.notify_all();
+    if (worker.joinable()) worker.join();
+}
+
+void IncludeDirWatcher::Check() {
+    auto now = SnapshotIncludeDir(dir);
+    if (now == snapshot) return;
+    snapshot = std::move(now);
+    ShaderCache::InvalidateIncludeMemo();
+    REX::INFO("IncludeDirWatcher: detected change under '{}', invalidated include memo", dir.string());
+}
+
+// --- PrecompileWorker implementation ------------------------------------
+
+std::unique_ptr<PrecompileWorker> g_precompileWorker;
+
+void PrecompileWorker::Start() {
+    if (running.load(std::memory_order_acquire)) return;
+    running.store(true, std::memory_order_release);
+    worker = std::thread([this]() {
+        // Don't pop jobs until the renderer device exists — compile work
+        // would just fail without it, and we'd waste the queue. Re-check
+        // periodically; this loop only runs at startup before the engine
+        // has initialized D3D, typically <1s.
+        while (running.load(std::memory_order_acquire) &&
+               (!g_rendererData || !g_rendererData->device)) {
+            std::unique_lock lk(mutex);
+            cv.wait_for(lk, std::chrono::milliseconds(100),
+                        [this]{ return !running.load(std::memory_order_acquire); });
+        }
+
+        while (true) {
+            NamedJob nj;
+            {
+                std::unique_lock lk(mutex);
+                cv.wait(lk, [this]{
+                    return !running.load(std::memory_order_acquire) || !jobs.empty();
+                });
+                if (!running.load(std::memory_order_acquire)) return;
+                nj = std::move(jobs.front());
+                jobs.pop_front();
+            }
+            if (!nj.job) continue;
+            REX::INFO("PrecompileWorker: compiling '{}'...", nj.name);
+            // Exceptions are swallowed: we don't want one bad shader/pass
+            // to kill the whole worker mid-queue.
+            try { nj.job(); }
+            catch (...) {
+                REX::WARN("PrecompileWorker: job '{}' threw an exception", nj.name);
+            }
+        }
+    });
+}
+
+void PrecompileWorker::Stop() {
+    {
+        std::lock_guard lk(mutex);
+        running.store(false, std::memory_order_release);
+        jobs.clear();
+    }
+    cv.notify_all();
+    if (worker.joinable()) worker.join();
+}
+
+void PrecompileWorker::Enqueue(std::string name, Job job) {
+    if (!job) return;
+    {
+        std::lock_guard lk(mutex);
+        jobs.push_back({ std::move(name), std::move(job) });
+    }
+    cv.notify_one();
 }

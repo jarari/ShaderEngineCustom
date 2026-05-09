@@ -40,7 +40,7 @@ ShaderDB g_ShaderDB = {};
 // Global trackers of current shader
 int g_currentTextureDSIndices[128] = { -1 }; 
 // Tell MyCreatePixelShader to skip analysing the shader when creating replacement shaders to avoid infinite recursion
-bool g_isCreatingReplacementShader = false;
+thread_local bool g_isCreatingReplacementShader = false;
 // Last original (pre-replacement) pixel shader observed in MyPSSetShader.
 // Used by the actor-tag debug logger to attribute draws to a shader UID.
 // Externally visible for CustomPass.cpp's BeforeDrawForMatchedDef trigger,
@@ -79,7 +79,7 @@ REX::W32::ID3D11ShaderResourceView* g_depthSRV = nullptr;
 static bool g_activeReplacementPixelShader = false;
 // Exposed via Global.h so CustomPass.cpp can guard against recursion in
 // MyPSSetShader while the registry rebinds injected resources during a pass.
-bool g_bindingInjectedPixelResources = false;
+thread_local bool g_bindingInjectedPixelResources = false;
 static thread_local std::uint32_t g_commandBufferReplayDepth = 0;
 static REX::W32::ID3D11ShaderResourceView* g_lastSceneDepthSRV = nullptr;
 struct alignas(16) ModularFloat4 {
@@ -106,6 +106,57 @@ static std::vector<ModularUInt4> g_modularBoolData(1);
 static UINT g_modularFloatElementCount = 0;
 static UINT g_modularIntElementCount = 0;
 static UINT g_modularBoolElementCount = 0;
+
+static DirectX::XMFLOAT3 ColorFromPackedRGB(std::uint32_t color)
+{
+    const float inv255 = 1.0f / 255.0f;
+    return DirectX::XMFLOAT3(
+        static_cast<float>((color >> 16) & 0xFF) * inv255,
+        static_cast<float>((color >> 8) & 0xFF) * inv255,
+        static_cast<float>(color & 0xFF) * inv255);
+}
+
+static const RE::INTERIOR_DATA* GetInteriorDataForDominantLight(RE::TESObjectCELL* cell)
+{
+    if (!cell || !cell->IsInterior()) {
+        return nullptr;
+    }
+
+    if (cell->cellDataInterior) {
+        return cell->cellDataInterior;
+    }
+
+    return cell->lightingTemplate ? std::addressof(cell->lightingTemplate->data) : nullptr;
+}
+
+static DirectX::XMFLOAT3 DirectionFromInteriorAngles(std::uint32_t directionalXY, std::uint32_t directionalZ)
+{
+    const float yaw = static_cast<float>(directionalXY & 0xFF) * (DirectX::XM_2PI / 255.0f);
+    const float pitch = (static_cast<float>(directionalZ & 0xFF) / 255.0f - 0.5f) * DirectX::XM_PI;
+    const float cosPitch = std::cos(pitch);
+
+    return DirectX::XMFLOAT3(
+        std::cos(yaw) * cosPitch,
+        std::sin(yaw) * cosPitch,
+        std::sin(pitch));
+}
+
+static DirectX::XMFLOAT3 DirectionFromNodeForward(const RE::NiAVObject* object)
+{
+    if (!object) {
+        return DirectX::XMFLOAT3(0.0f, 0.0f, 0.0f);
+    }
+
+    const auto& row = object->world.rotate[1];
+    const float lenSq = row.x * row.x + row.y * row.y + row.z * row.z;
+    if (lenSq <= 1.0e-6f) {
+        return DirectX::XMFLOAT3(0.0f, 0.0f, 0.0f);
+    }
+
+    const float invLen = 1.0f / std::sqrt(lenSq);
+    return DirectX::XMFLOAT3(row.x * invLen, row.y * invLen, row.z * invLen);
+}
+
 // Ring of distinct buffer+SRV pairs so each draw gets its own backing.
 // F4 batches draws into BSGraphics command queues; with a single shared
 // buffer, all queued draws would resolve to whatever value was Mapped last
@@ -1883,18 +1934,22 @@ void STDMETHODCALLTYPE MyPSSetShader(
         // Check if this shader is matched with a replacement shader in our DB
         if (g_ShaderDB.IsEntryMatched(pPixelShader)) {
             g_ShaderDB.SetEntryRecentlyUsed(pPixelShader, true); // Mark this shader as recently used for tracking
+            auto* matchedDefinition = g_ShaderDB.GetMatchedDefinition(pPixelShader);
+            // If the HLSL watcher flagged a disk change for this definition,
+            // drop the cached compiled shader + replacement pointers BEFORE we
+            // read them below. Done here on the render thread so the D3D11
+            // Release happens on the immediate-context-owning thread.
+            MaybeApplyHlslHotReload_Internal(matchedDefinition);
             auto* replacementPixelShader = g_ShaderDB.GetReplacementShader(pPixelShader);
             // Get the replacement shader for this original shader
             if (replacementPixelShader) {
                 // Replace the shader with our replacement shader
                 if (DEBUGGING) {
-                    auto* matchedDefinition = g_ShaderDB.GetMatchedDefinition(pPixelShader);
                     REX::INFO("MyPSSetShader: Replacing pixel shader with matched replacement for definition '{}'", matchedDefinition ? matchedDefinition->id : "Unknown");
                 }
                 pPixelShader = replacementPixelShader;
                 usingReplacementPixelShader = true;
             } else {
-                auto* matchedDefinition = g_ShaderDB.GetMatchedDefinition(pPixelShader);
                 if (matchedDefinition && !matchedDefinition->buggy) {
                     if (DEBUGGING)
                         REX::INFO("MyPSSetShader: Shader is matched but no replacement shader found, trying to compile...");
@@ -1944,19 +1999,22 @@ void STDMETHODCALLTYPE MyVSSetShader(
         // Check if this shader is matched with a replacement shader in our DB
         if (g_ShaderDB.IsEntryMatched(pVertexShader)) {
             g_ShaderDB.SetEntryRecentlyUsed(pVertexShader, true); // Mark this shader as recently used for tracking
+            auto* matchedDefinition = g_ShaderDB.GetMatchedDefinition(pVertexShader);
+            // See MyPSSetShader for rationale: we evict cached compiled state
+            // here, before reading the replacement, so the D3D11 Release runs
+            // on the render thread.
+            MaybeApplyHlslHotReload_Internal(matchedDefinition);
             auto* replacementVertexShader = g_ShaderDB.GetReplacementShader(pVertexShader);
             // Get the replacement shader for this original shader
             if (replacementVertexShader) {
                 // Replace the shader with our replacement shader
                 if (DEBUGGING) {
-                    auto* matchedDefinition = g_ShaderDB.GetMatchedDefinition(pVertexShader);
                     REX::INFO("MyVSSetShader: Replacing vertex shader with matched replacement for definition '{}'", matchedDefinition ? matchedDefinition->id : "Unknown");
                 }
                 pVertexShader = replacementVertexShader;
                 // Set our custom SRVs for replacement shaders to use in their shader code
                 BindInjectedVertexShaderResources(This);
             } else {
-                auto* matchedDefinition = g_ShaderDB.GetMatchedDefinition(pVertexShader);
                 if (matchedDefinition && !matchedDefinition->buggy) {
                     if (DEBUGGING)
                         REX::INFO("MyVSSetShader: Shader is matched but no replacement shader found, trying to compile...");
@@ -2142,7 +2200,16 @@ ShaderDBEntry AnalyzeShader_Internal(REX::W32::ID3D11PixelShader* pixelShader, R
 // Compile the HLSL shaders that were defined in the INI for each shader
 bool CompileShader_Internal(ShaderDefinition* def) {
     if (!def) return false;
-    // Check if already compiled
+    // Lazy-init in case a def slipped through without one (defensive).
+    if (!def->compileMutex) def->compileMutex = std::make_unique<std::mutex>();
+    // Per-def serialization: if the precompile worker is mid-flight on this
+    // def the render thread blocks here briefly, then sees loadedPixelShader
+    // already populated and short-circuits. Same in reverse. The lock spans
+    // the cache lookup + D3DCompile + Create*Shader so observers always see
+    // a consistent (compiledShader, loadedPixelShader/VertexShader) pair.
+    std::lock_guard compileLock(*def->compileMutex);
+    // Check if already compiled (re-checked under the lock so a concurrent
+    // compile that finished while we were waiting is observed correctly).
     if (def->loadedPixelShader || def->loadedVertexShader) {
         if (DEBUGGING)
             REX::INFO("CompileShader_Internal: Shader '{}' is already compiled. Skipping compilation.", def->id);
@@ -2191,30 +2258,53 @@ bool CompileShader_Internal(ShaderDefinition* def) {
         return false;
     }
     REX::W32::ID3D11Device* device = g_rendererData->device;
-    ID3DBlob* errorBlob = nullptr;
-    ID3DInclude* includeHandler = new ShaderIncludeHandler(); // Custom include handler to resolve #include directives relative to the plugin directory
-    HRESULT hr = D3DCompile(
-        shaderSource.c_str(),
-        shaderSource.size(),
-        def->id.c_str(),
-        nullptr,
-        includeHandler,
-        "main",
-        targetProfile.c_str(),
-        D3DCOMPILE_OPTIMIZATION_LEVEL3,
-        0,
-        &def->compiledShader,
-        &errorBlob
-    );
-    delete includeHandler;
-    if (!REX::W32::SUCCESS(hr)) {
-        if (errorBlob) {
-            REX::WARN("CompileShader_Internal: Shader compilation failed: {}", static_cast<const char*>(errorBlob->GetBufferPointer()));
-            errorBlob->Release();
+
+    // Try the on-disk compiled-shader cache first. The key is computed from
+    // the fully assembled source plus profile/entry/flags plus include-dir
+    // contents — any input change naturally produces a miss.
+    constexpr uint32_t kCompileFlags = D3DCOMPILE_OPTIMIZATION_LEVEL3;
+    constexpr std::string_view kEntry = "main";
+    const std::string cacheKey = ShaderCache::ComputeKey({
+        .assembledSource = shaderSource,
+        .profile         = targetProfile,
+        .entry           = kEntry,
+        .flags           = kCompileFlags,
+    });
+    ID3DBlob* cachedBlob = nullptr;
+    if (ShaderCache::TryLoad(cacheKey, &cachedBlob)) {
+        def->compiledShader = cachedBlob;
+        REX::INFO("CompileShader_Internal: cache HIT for '{}' ({} bytes)", def->id, def->compiledShader->GetBufferSize());
+    } else {
+        ID3DBlob* errorBlob = nullptr;
+        ID3DInclude* includeHandler = new ShaderIncludeHandler(); // Custom include handler to resolve #include directives relative to the plugin directory
+        HRESULT hr = D3DCompile(
+            shaderSource.c_str(),
+            shaderSource.size(),
+            def->id.c_str(),
+            nullptr,
+            includeHandler,
+            kEntry.data(),
+            targetProfile.c_str(),
+            kCompileFlags,
+            0,
+            &def->compiledShader,
+            &errorBlob
+        );
+        delete includeHandler;
+        if (!REX::W32::SUCCESS(hr)) {
+            if (errorBlob) {
+                REX::WARN("CompileShader_Internal: Shader compilation failed: {}", static_cast<const char*>(errorBlob->GetBufferPointer()));
+                errorBlob->Release();
+            }
+            return false;
         }
-        return false;
+        if (errorBlob) errorBlob->Release();
+        // Only cache on success — failed compiles must not poison future runs.
+        ShaderCache::Store(cacheKey, def->compiledShader);
+        REX::INFO("CompileShader_Internal: {} compiled successfully! Bytecode size: {} bytes",
+                  def->shaderFile.string(), def->compiledShader->GetBufferSize());
     }
-    if (errorBlob) errorBlob->Release();
+    HRESULT hr = S_OK;
     // Set flag to prevent hook from analyzing the shader
     g_isCreatingReplacementShader = true;
     // Create the actual shader object from the compiled bytecode
@@ -2242,13 +2332,6 @@ bool CompileShader_Internal(ShaderDefinition* def) {
             REX::WARN("CompileShader_Internal: Failed to create pixel shader for '{}'", def->id);
         }
         return false;
-    }
-    if (DEBUGGING) {
-        if (def->type == ShaderType::Vertex) {
-            REX::INFO("CompileShader_Internal: {} compiled successfully! Bytecode size: {} bytes", def->shaderFile.string(), def->compiledShader->GetBufferSize());
-        } else {
-            REX::INFO("CompileShader_Internal: {} compiled successfully! Bytecode size: {} bytes", def->shaderFile.string(), def->compiledShader->GetBufferSize());
-        }
     }
     return true;
 }
@@ -2660,6 +2743,28 @@ bool ReflectShader_Internal(ShaderDBEntry& entry) {
     return true;
 }
 
+// Render-thread half of the HLSL hot-reload pipeline. The watcher thread
+// just flips a flag (HlslFileWatcher::Check); we do the actual D3D11
+// Release / replacement-cache eviction here, on the same thread that issues
+// draws, so we never race the immediate context. Called from MyPSSetShader
+// and MyVSSetShader before they reach CompileShader_Internal.
+void MaybeApplyHlslHotReload_Internal(ShaderDefinition* def) {
+    if (!def || !def->hlslFileWatcher) return;
+    if (!def->hlslFileWatcher->ConsumeReloadRequest()) return;
+    // Take the per-def compile mutex so an in-flight precompile (or a
+    // concurrent on-demand render-thread compile) cannot publish bytecode
+    // that we're about to drop, leaving us with a stale but newly-cached
+    // replacement.
+    if (!def->compileMutex) def->compileMutex = std::make_unique<std::mutex>();
+    std::lock_guard compileLock(*def->compileMutex);
+    if (def->loadedPixelShader)  { def->loadedPixelShader->Release();  def->loadedPixelShader  = nullptr; }
+    if (def->loadedVertexShader) { def->loadedVertexShader->Release(); def->loadedVertexShader = nullptr; }
+    if (def->compiledShader)     { def->compiledShader->Release();     def->compiledShader     = nullptr; }
+    def->buggy = false;
+    g_ShaderDB.ClearReplacementsForDefinition(def);
+    REX::INFO("MaybeApplyHlslHotReload_Internal: dropped compiled state for definition '{}'", def->id);
+}
+
 // Orchestrator for hot INI reload - rematches all ShaderDB entries against current definitions
 void RematchAllShaders_Internal() {
     std::unique_lock lockDB(g_ShaderDB.mutex);  // Write lock on ShaderDB
@@ -2828,7 +2933,7 @@ void UIDrawShaderSettingsOverlay() {
         for (auto& kv : globalGroups) {
             const std::string& groupName = kv.first;
             auto& vals = kv.second;
-            if (ImGui::CollapsingHeader(groupName.c_str(), ImGuiTreeNodeFlags_DefaultOpen)) {
+            if (ImGui::CollapsingHeader(groupName.c_str())) {
                 ImGui::PushID(groupName.c_str());
                 if (ImGui::SmallButton("Reset group")) {
                     for (auto* sValue : vals) {
@@ -2857,7 +2962,7 @@ void UIDrawShaderSettingsOverlay() {
         for (auto &kv : settingsGroups) {
             const std::string &groupName = kv.first;
             auto &vals = kv.second;
-            if (ImGui::CollapsingHeader(groupName.c_str(), ImGuiTreeNodeFlags_DefaultOpen)) {
+            if (ImGui::CollapsingHeader(groupName.c_str())) {
                 ImGui::PushID(groupName.c_str());
                 if (ImGui::SmallButton("Reset group")) {
                     for (auto* sValue : vals) {
@@ -3274,6 +3379,13 @@ void UIDrawCustomBufferMonitorOverlay() {
             renderFloat4("g_FogDistances1", data.g_FogDistances1, previousData.g_FogDistances1, 50.0f);
             renderFloat4("g_FogParams", data.g_FogParams, previousData.g_FogParams, 0.25f);
             renderFloat4("g_FogColor", data.g_FogColor, previousData.g_FogColor, 0.05f);
+            renderFloat("g_SunR", data.g_SunR, previousData.g_SunR, 0.05f);
+            renderFloat("g_SunG", data.g_SunG, previousData.g_SunG, 0.05f);
+            renderFloat("g_SunB", data.g_SunB, previousData.g_SunB, 0.05f);
+            renderFloat("g_SunDirX", data.g_SunDirX, previousData.g_SunDirX, 0.05f);
+            renderFloat("g_SunDirY", data.g_SunDirY, previousData.g_SunDirY, 0.05f);
+            renderFloat("g_SunDirZ", data.g_SunDirZ, previousData.g_SunDirZ, 0.05f);
+            renderFloat("g_SunValid", data.g_SunValid, previousData.g_SunValid, 0.5f);
             endColumns();
         }
     }
@@ -3474,10 +3586,13 @@ void UpdateCustomBuffer_Internal() {
     uint32_t skyMode = 0;
     int32_t currentWeatherClass = -1;
     int32_t outgoingWeatherClass = -1;
+    auto* parentCell = g_player ? g_player->GetParentCell() : nullptr;
+    DirectX::XMFLOAT3 sunColor(1.0f, 1.0f, 1.0f);
+    DirectX::XMFLOAT3 sunDir(0.0f, 0.0f, 0.0f);
+    float sunValid = 0.0f;
     if (g_sky) {
         timeOfDay = g_sky->currentGameHour;
         skyMode = g_sky->mode.underlying();
-        auto* parentCell = g_player ? g_player->GetParentCell() : nullptr;
         const bool validInterior = parentCell && parentCell->IsInterior() && parentCell->lightingTemplate;
         if (validInterior) {
             weatherTransition = g_sky->lightingTransition == 0.0f ? 1.0f : g_sky->lightingTransition;
@@ -3494,6 +3609,23 @@ void UpdateCustomBuffer_Internal() {
                 outgoingWeatherClass = GetWeatherClassification(g_sky->lastWeather);
             }
         }
+    }
+    if (parentCell && parentCell->IsInterior()) {
+        if (const auto* interiorData = GetInteriorDataForDominantLight(parentCell)) {
+            sunColor = ColorFromPackedRGB(interiorData->directional);
+            sunDir = DirectionFromInteriorAngles(interiorData->directionalXY, interiorData->directionalZ);
+            sunValid = std::clamp(interiorData->directionalFade, 0.0f, 1.0f);
+        }
+    } else if (g_sky) {
+        // Sky::GetSunLightColor is a trivial return of Sky+0x0D8, i.e.
+        // skyColor[4]. Use the already-blended Sky value instead of sampling
+        // TESWeather colorData manually.
+        const auto& c = g_sky->skyColor[4];
+        sunColor = DirectX::XMFLOAT3(c.r, c.g, c.b);
+        if (g_sky->sun && g_sky->sun->light) {
+            sunDir = DirectionFromNodeForward(reinterpret_cast<const RE::NiAVObject*>(g_sky->sun->light.get()));
+        }
+        sunValid = 1.0f;
     }
     if (g_player) {
         if (g_player->currentLocation) {
@@ -3530,6 +3662,14 @@ void UpdateCustomBuffer_Internal() {
     g_customBufferData.viewDirY = vd.m128_f32[1];
     g_customBufferData.viewDirZ = vd.m128_f32[2];
     g_customBufferData.pHealthPerc = g_healthPerc;
+    g_customBufferData.g_SunR = sunColor.x;
+    g_customBufferData.g_SunG = sunColor.y;
+    g_customBufferData.g_SunB = sunColor.z;
+    g_customBufferData.g_SunDirX = sunDir.x;
+    g_customBufferData.g_SunDirY = sunDir.y;
+    g_customBufferData.g_SunDirZ = sunDir.z;
+    g_customBufferData.g_SunValid = sunValid;
+    g_customBufferData.g_SunPadding = 0.0f;
     DirectX::XMStoreFloat4(&g_customBufferData.g_InvProjRow0, invProj.r[0]);
     DirectX::XMStoreFloat4(&g_customBufferData.g_InvProjRow1, invProj.r[1]);
     DirectX::XMStoreFloat4(&g_customBufferData.g_InvProjRow2, invProj.r[2]);

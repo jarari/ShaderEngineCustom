@@ -116,6 +116,20 @@ struct alignas(16) GFXBoosterAccessData
     DirectX::XMFLOAT4 g_FogDistances1;  // x=heightMid, y=heightRange, z=farHeightMid, w=farHeightRange
     DirectX::XMFLOAT4 g_FogParams;      // x=fogHeight, y=fogPower, z=fogClamp, w=fogHighDensityScale
     DirectX::XMFLOAT4 g_FogColor;       // x,y,z=blended fog RGB (0 until per-weather blend lands), w=reserved
+
+    // Dominant stylized world light. Exterior color is Sky::GetSunLightColor
+    // (skyColor[4], Sky+0x0D8); interior color resolves cell/template
+    // directional light. Direction is best-effort: exterior sun node forward,
+    // interior decoded cell/template directional angles.
+    float g_SunR;
+    float g_SunG;
+    float g_SunB;
+    float g_SunDirX;
+
+    float g_SunDirY;
+    float g_SunDirZ;
+    float g_SunValid;
+    float g_SunPadding;
 };
 
 struct alignas(16) DrawTagData
@@ -409,6 +423,14 @@ struct ShaderDefinition {
     ID3DBlob* compiledShader = nullptr;
     REX::W32::ID3D11PixelShader* loadedPixelShader = nullptr;
     REX::W32::ID3D11VertexShader* loadedVertexShader = nullptr;
+    // Per-definition compile mutex. Held by CompileShader_Internal so the
+    // background precompile worker and the render thread can't both try to
+    // compile the same def at once (which would leak one of the two
+    // CreatePixelShader results). After whichever side wins, the loser
+    // takes the lock, sees loadedPixelShader/loadedVertexShader populated,
+    // and short-circuits. unique_ptr because std::mutex is non-movable but
+    // ShaderDefinition is moved by value at parse time.
+    std::unique_ptr<std::mutex> compileMutex = std::make_unique<std::mutex>();
     // File watcher for this shader definition Shader.ini
     std::unique_ptr<HlslFileWatcher> hlslFileWatcher;
     // Logging and dumping options
@@ -693,7 +715,10 @@ struct ShaderDB {
         }
     }
     void ClearReplacementsForDefinition(ShaderDefinition* def) {
-        std::shared_lock lock(mutex);
+        // Mutates entries — must be exclusive. Was previously a shared_lock
+        // which raced when multiple watcher threads / hot-reload paths fired
+        // at once.
+        std::unique_lock lock(mutex);
         for (auto& [shader, entry] : entries) {
             if (entry.matchedDefinition == def) {
                 entry.SetReplacementPixelShader(nullptr);
@@ -732,6 +757,11 @@ bool ReflectShader_Internal(ShaderDBEntry& entry);
 void ResetPlayerRadDamageTracking();
 void ReloadAllShaderDefinitions_Internal();
 void RematchAllShaders_Internal();
+// If the HLSL watcher for `def` flagged a disk change, drop the cached
+// compiled shader / replacement pointers so the next compile path picks up
+// the fresh source. Must be called from the render thread (does D3D11
+// Release on the immediate-context-owning thread); a no-op otherwise.
+void MaybeApplyHlslHotReload_Internal(ShaderDefinition* def);
 void ShaderDumpWorker();
 void ShutdownShaderDumping_Internal();
 void UIDrawShaderSettingsOverlay();

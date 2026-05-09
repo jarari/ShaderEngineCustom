@@ -200,6 +200,10 @@ public:
     // thread mutating D3D11 objects directly (deadlock + use-after-free risk
     // if FirePass was mid-flight).
     std::atomic<bool>                           reloadRequested{ false };
+    // Per-pass compile mutex. Held by EnsureCompiled so the background
+    // precompile worker and the render-thread FirePass path can't both
+    // compile this pass at once. unique_ptr because std::mutex is non-movable.
+    std::unique_ptr<std::mutex>                 compileMutex = std::make_unique<std::mutex>();
 
     void Release();
 };
@@ -243,6 +247,14 @@ public:
     // Spawn HLSL hot-reload watchers for every pass currently registered.
     // Called once after Shader.ini parsing completes when DEVELOPMENT=true.
     void StartFileWatchers();
+
+    // Submit one compile job per registered pass to the background
+    // precompile worker. The worker is owned externally (g_precompileWorker)
+    // — we just hand it std::function<void()>s. Each job locks the per-pass
+    // compileMutex inside EnsureCompiled, so a render-thread FirePass that
+    // hits the same pass while it's mid-compile blocks until the worker is
+    // done, then short-circuits on the now-populated psShader/csShader.
+    void EnqueuePrecompileJobs();
 
     // Frame hooks ------------------------------------------------------------
     // Called from MyPSSetShader before the engine swap takes effect. Returns
