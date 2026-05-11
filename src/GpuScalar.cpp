@@ -307,17 +307,6 @@ void TickProbe(Probe& probe, REX::W32::ID3D11DeviceContext* ctx)
     }
     probe.writeIdx = (probe.writeIdx + 1) % kReadbackRingSize;
 
-    // Periodic diagnostic so the user can confirm the probe is producing the
-    // expected value without attaching a debugger. First successful read +
-    // every ~600 frames thereafter (≈10s at 60 FPS).
-    if (probe.valid) {
-        const bool firstLog = (probe.framesDispatched == kReadbackRingSize);
-        if (firstLog || (probe.framesDispatched % 600) == 0) {
-            REX::INFO("GpuScalar[{}]: value={:.4f} (frame {})",
-                      probe.spec.name, probe.value, probe.framesDispatched);
-        }
-    }
-
     // Restore prior CS state.
     ctx->CSSetShader(prevCs, prevInst, prevInstCount);
     UINT restoreInit = 0;

@@ -146,13 +146,6 @@ float OnTestFrustumCullEnterImpl(void* light)
     if (!radiusPtr) {
         return kNoScaleSaved;
     }
-    // Diagnostic: log the FIRST time we successfully apply a scale, and
-    // periodically thereafter.
-    static std::atomic<std::uint64_t> s_appliedCalls{ 0 };
-    const auto callIdx = s_appliedCalls.fetch_add(1, std::memory_order_relaxed);
-    if (callIdx == 0 || (callIdx % 30000) == 0) {
-        REX::INFO("LightCullPolicy: applying scale={:.4f} (cull call #{})", scale, callIdx);
-    }
     const float saved = *radiusPtr;
     *radiusPtr = saved * scale;
     return saved;
