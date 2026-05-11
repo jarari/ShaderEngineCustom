@@ -446,6 +446,7 @@ bool Registry::ParsePassSection(const std::string& name,
         std::string lk = ToLower(key);
 
         if      (lk == "active")        pass->spec.active = (ToLower(value) == "true" || value == "1");
+        else if (lk == "activewhen")    pass->spec.activeWhen = value;
         else if (lk == "priority")      { try { pass->spec.priority = std::stoi(value); } catch (...) {} }
         else if (lk == "type")          pass->spec.type = (ToLower(value) == "cs") ? PassType::Compute : PassType::Pixel;
         else if (lk == "shader") {
@@ -769,8 +770,11 @@ void LogEngineBindings(const Pass& pass, REX::W32::ID3D11DeviceContext* ctx, uin
 }  // anonymous
 
 // --- State save/restore ---------------------------------------------------
+// NOTE: SavedState lives at CustomPass-namespace scope (NOT anonymous) so
+// the header can forward-declare it for Registry::FireBatch /
+// FirePassWithSaved. The rest of the file-local helpers (PassStateCache,
+// EnsureSamplers, ...) remain in the anonymous namespace below.
 
-namespace {
 struct SavedState {
     REX::W32::ID3D11RenderTargetView*       rtvs[8] = {};
     REX::W32::ID3D11DepthStencilView*       dsv = nullptr;
@@ -846,6 +850,7 @@ struct SavedState {
     }
 };
 
+namespace {
 // Lightweight state cache for blend/depth/raster states used by passes.
 struct PassStateCache {
     REX::W32::ID3D11BlendState*             opaqueBlend = nullptr;
@@ -957,8 +962,68 @@ void EnsureSamplers(REX::W32::ID3D11Device* dev) {
 }  // anonymous
 
 void Registry::FirePass(REX::W32::ID3D11DeviceContext* context, Pass& pass) {
+    if (!context) return;
+    SavedState saved; saved.Capture(context);
+    FirePassWithSaved(context, pass, saved);
+    saved.Restore(context);
+}
+
+bool Registry::FireBatch(REX::W32::ID3D11DeviceContext* context, std::vector<Pass*>& matches) {
+    if (!context || matches.empty()) return false;
+    // Priority-stable sort: lower number fires first. Matches the engine's
+    // priority convention used elsewhere.
+    std::stable_sort(matches.begin(), matches.end(),
+        [](Pass* a, Pass* b) { return a->spec.priority < b->spec.priority; });
+
+    // Single capture before the chain; single restore after. Per-pass
+    // FirePassWithSaved calls do NOT touch capture/restore. This collapses
+    // up to N (chain-length) save/restore cycles into one, which dominates
+    // CPU overhead when many passes share a trigger (e.g. SSAO + SSRTGI +
+    // fake skin bloom firing at beforeDrawForHook:visualTonemap).
+    SavedState saved; saved.Capture(context);
+    bool firedAny = false;
+    for (auto* p : matches) {
+        if (!p->spec.active) continue;
+        FirePassWithSaved(context, *p, saved);
+        firedAny = true;
+    }
+    saved.Restore(context);
+    return firedAny;
+}
+
+// Evaluate the optional `activeWhen` runtime gate. Returns true (fire)
+// when the spec is empty, the bool is true, or the spec is "!id" and the
+// bool is false. The resolved ShaderValue* is cached in the pass on first
+// call so subsequent fires skip the linear scan.
+static bool EvaluateActiveWhen(Pass& pass) {
+    const std::string& spec = pass.spec.activeWhen;
+    if (spec.empty()) return true;
+
+    if (!pass.activeWhenChecked) {
+        bool negate = !spec.empty() && spec[0] == '!';
+        const std::string id = negate ? spec.substr(1) : spec;
+        ShaderValue* resolved = nullptr;
+        for (auto* sv : g_shaderSettings.GetBoolShaderValues()) {
+            if (sv && sv->id == id) { resolved = sv; break; }
+        }
+        if (!resolved) {
+            REX::WARN("CustomPass[{}]: activeWhen='{}' did not resolve to a Values.ini bool — pass will fire as if no gate were set",
+                pass.spec.name, spec);
+        }
+        pass.activeWhenResolved = resolved;
+        pass.activeWhenNegated  = negate;
+        pass.activeWhenChecked  = true;
+    }
+
+    auto* sv = static_cast<ShaderValue*>(pass.activeWhenResolved);
+    if (!sv) return true;  // fire-open on unknown id
+    return pass.activeWhenNegated ? !sv->current.b : sv->current.b;
+}
+
+void Registry::FirePassWithSaved(REX::W32::ID3D11DeviceContext* context, Pass& pass, SavedState& saved) {
     if (!context || !g_rendererData || !g_rendererData->device) return;
     if (!pass.spec.active) return;
+    if (!EvaluateActiveWhen(pass)) return;
 
     // Hot-reload: if the watcher thread saw a disk change, drop compiled
     // state on this (main render) thread before EnsureCompiled re-builds.
@@ -984,15 +1049,13 @@ void Registry::FirePass(REX::W32::ID3D11DeviceContext* context, Pass& pass) {
     EnsureSamplers(device);
 
     // Diagnostic: dump engine bindings on the first fire when log=true.
-    // Lets users discover which renderTargets[] index is wired to which PS
-    // SRV slot at trigger time, which is the only way to confirm whether
-    // gbufferRT:N is the right composite output. Read BEFORE we mutate state.
+    // Reads `saved` (captured by caller before any pass in the batch fired)
+    // so the dump reflects engine state, not whatever a previous pass in
+    // the same batch left behind.
     if (pass.spec.log) {
         const uint64_t fc = pass.totalFireCount.load(std::memory_order_relaxed);
         LogEngineBindings(pass, context, fc + 1);
     }
-
-    SavedState saved; saved.Capture(context);
 
     // Resolve inputs
     std::vector<REX::W32::ID3D11ShaderResourceView*> srvBindings;
@@ -1142,7 +1205,8 @@ void Registry::FirePass(REX::W32::ID3D11DeviceContext* context, Pass& pass) {
         // with NumViews=0), so skip cleanly.
         bool anyRTV = false;
         for (auto* rt : rtvBindings) if (rt) { anyRTV = true; break; }
-        if (!fsVS || !pass.psShader || !anyRTV) { saved.Restore(context); return; }
+        // Caller (FirePass or FireBatch) owns the Restore — just bail.
+        if (!fsVS || !pass.psShader || !anyRTV) return;
 
         if (pass.spec.clearOnFire) {
             for (auto* rt : rtvBindings) if (rt) {
@@ -1183,10 +1247,19 @@ void Registry::FirePass(REX::W32::ID3D11DeviceContext* context, Pass& pass) {
     }
     // ----- Compute pass --------------------------------------------------------
     else {
-        if (!pass.csShader) { saved.Restore(context); return; }
+        // Caller owns the Restore — just bail.
+        if (!pass.csShader) return;
         context->CSSetShader(pass.csShader, nullptr, 0);
         if (!srvBindings.empty()) context->CSSetShaderResources(0, (UINT)srvBindings.size(), srvBindings.data());
-        if (g_customSRV) context->CSSetShaderResources(CUSTOMBUFFER_SLOT, 1, &g_customSRV);
+        // Re-publish the standard injected SRVs so the CS pass can read
+        // GFXInjected + Values.ini-backed modular shader values (vu_* /
+        // ps_* knobs). The PS path does this just above; the CS path
+        // previously only bound GFXInjected, so any CS pass referencing
+        // a Values.ini knob would compile but sample garbage.
+        if (g_customSRV)        context->CSSetShaderResources(CUSTOMBUFFER_SLOT, 1, &g_customSRV);
+        if (g_modularFloatsSRV) context->CSSetShaderResources(MODULAR_FLOATS_SLOT, 1, &g_modularFloatsSRV);
+        if (g_modularIntsSRV)   context->CSSetShaderResources(MODULAR_INTS_SLOT,   1, &g_modularIntsSRV);
+        if (g_modularBoolsSRV)  context->CSSetShaderResources(MODULAR_BOOLS_SLOT,  1, &g_modularBoolsSRV);
         if (!uavBindings.empty()) {
             std::vector<UINT> initial(uavBindings.size(), 0);
             context->CSSetUnorderedAccessViews(0, (UINT)uavBindings.size(), uavBindings.data(), initial.data());
@@ -1228,7 +1301,8 @@ void Registry::FirePass(REX::W32::ID3D11DeviceContext* context, Pass& pass) {
                 pass.spec.name, currentFrame, fires);
         }
     }
-    saved.Restore(context);
+    // No saved.Restore here — caller (FirePass single-pass wrapper or
+    // FireBatch) owns the snapshot lifecycle.
 }
 
 bool Registry::OnBeforeDraw(REX::W32::ID3D11DeviceContext* context, const char* source) {
@@ -1304,15 +1378,9 @@ bool Registry::OnBeforeDraw(REX::W32::ID3D11DeviceContext* context, const char* 
         }
     }
 
-    std::stable_sort(matches.begin(), matches.end(),
-        [](Pass* a, Pass* b) { return a->spec.priority < b->spec.priority; });
-    bool firedAny = false;
-    for (auto* p : matches) {
-        if (!p->spec.active) continue;
-        FirePass(context, *p);
-        firedAny = true;
-    }
-    return firedAny;
+    // Batched fire: one shared SavedState capture/restore across the
+    // entire priority-sorted chain.
+    return FireBatch(context, matches);
 }
 
 bool Registry::OnBeforeShaderBound(REX::W32::ID3D11DeviceContext* context,
@@ -1338,17 +1406,7 @@ bool Registry::OnBeforeShaderBound(REX::W32::ID3D11DeviceContext* context,
         for (auto p = range.first; p != range.second; ++p) matches.push_back(p->second);
     }
     if (matches.empty()) return false;
-    // Fire in priority order (lower number first), matching the engine
-    // convention used elsewhere in the plugin.
-    std::stable_sort(matches.begin(), matches.end(),
-        [](Pass* a, Pass* b) { return a->spec.priority < b->spec.priority; });
-    bool firedAny = false;
-    for (auto* p : matches) {
-        if (!p->spec.active) continue;
-        FirePass(context, *p);
-        firedAny = true;
-    }
-    return firedAny;
+    return FireBatch(context, matches);
 }
 
 void Registry::OnFramePresent(REX::W32::ID3D11DeviceContext* context) {

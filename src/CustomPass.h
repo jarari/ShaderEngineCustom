@@ -18,6 +18,10 @@ class Resource;
 class Pass;
 class Registry;
 class FileWatcher;
+// Per-fire D3D11 state snapshot. Definition is in CustomPass.cpp; only the
+// type name is needed at the Registry method signatures for the batched
+// fire path (see Registry::FireBatch).
+struct SavedState;
 
 // HLSL hot-reload watcher specialised for customPass. Mirrors the design of
 // the existing HlslFileWatcher (in Global.h) which is hard-tied to
@@ -153,6 +157,13 @@ struct ThreadGroupDim {
 struct PassSpec {
     std::string                             name;
     bool                                    active = true;
+    // Optional runtime gate. Names a Values.ini-backed bool — when the
+    // referenced bool is false the pass is skipped entirely (no fire,
+    // no state perturbation), so e.g. flipping `vu_FakeSkinBloomEnabled`
+    // off cleanly drops all three blur passes from the per-frame chain.
+    // Leading '!' inverts: "activeWhen=!vu_Foo" fires only when vu_Foo
+    // is false. Empty string = no gate (always fires).
+    std::string                             activeWhen;
     int                                     priority = 0;
     PassType                                type = PassType::Pixel;
     std::filesystem::path                   shaderFile;
@@ -204,6 +215,16 @@ public:
     // precompile worker and the render-thread FirePass path can't both
     // compile this pass at once. unique_ptr because std::mutex is non-movable.
     std::unique_ptr<std::mutex>                 compileMutex = std::make_unique<std::mutex>();
+
+    // Cache for activeWhen resolution. Set on first fire after lookup
+    // against g_shaderSettings.GetBoolShaderValues(). Subsequent fires
+    // read sv->current.b directly without rescanning the list.
+    //   activeWhenResolved == nullptr && !activeWhenChecked → unresolved
+    //   activeWhenResolved == nullptr &&  activeWhenChecked → unknown id (fire-open)
+    //   activeWhenResolved != nullptr                       → cached pointer
+    void*                                       activeWhenResolved = nullptr;
+    bool                                        activeWhenChecked = false;
+    bool                                        activeWhenNegated = false;
 
     void Release();
 };
@@ -304,7 +325,24 @@ private:
     Resource*                           FindResource(const std::string& name);
     bool                                EnsureCompiled(Pass& pass);
     bool                                EnsurePassResources(Pass& pass);
+    // Single-pass entry point: captures D3D state, runs the pass, restores.
+    // Used for one-off fires (e.g. AtPresent passes).
     void                                FirePass(REX::W32::ID3D11DeviceContext* context, Pass& pass);
+    // Batched entry point: captures D3D state ONCE, fires all matches sorted
+    // by priority, restores ONCE. Used when many passes share a trigger
+    // (e.g. the SSAO / SSRTGI / fake-skin-bloom chains all firing at
+    // beforeDrawForHook:visualTonemap). Eliminates the per-pass
+    // save/restore cycle that dominated CPU overhead with large chains.
+    // Returns true if any matched pass was active.
+    bool                                FireBatch(REX::W32::ID3D11DeviceContext* context,
+                                                  std::vector<Pass*>& matches);
+    // Internal: per-pass body shared by FirePass and FireBatch. Assumes
+    // the caller has already captured `saved`; reads it for currentRTV
+    // snapshot resolution and viewport fallback. Does NOT restore — the
+    // caller owns lifecycle.
+    void                                FirePassWithSaved(REX::W32::ID3D11DeviceContext* context,
+                                                          Pass& pass,
+                                                          SavedState& saved);
     void                                ApplyPingpong();
 
     // Containers store unique_ptrs so address stability survives rehash.
