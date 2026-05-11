@@ -130,6 +130,25 @@ struct alignas(16) GFXBoosterAccessData
     float g_SunDirZ;
     float g_SunValid;
     float g_SunPadding;
+
+    // L1 spherical-harmonics ambient, computed from RE::Sky's 6-axis
+    // directional ambient cube (Sky+0x3B8, NiColor[3][2]). The engine's own
+    // deferred SH pass (CAEE89E9) consumes a similarly packed cb2[6..8],
+    // but its bind timing is unreliable for shaders that run early in the
+    // deferred pipeline (e.g. OG) and the engine only emits the SH pass when
+    // it deems SH "meaningful," leaving OG-only permutations (capture 121152)
+    // with no ambient signal at all. Sourcing the SH ourselves and routing
+    // through GFXInjected closes that gap deterministically: any deferred
+    // shader can evaluate dot(g_SH_*, float4(N, 1)) per pixel and recover the
+    // engine's directional ambient irradiance regardless of which
+    // permutation the engine emitted this frame.
+    //
+    // Packing per channel: .x = X+ - X- band, .y = Y+ - Y-, .z = Z+ - Z-,
+    // .w = mean of all 6 directions (DC term). Linear domain — no gamma
+    // encoding, so shaders evaluate dot() and use the result directly.
+    DirectX::XMFLOAT4 g_SH_R;
+    DirectX::XMFLOAT4 g_SH_G;
+    DirectX::XMFLOAT4 g_SH_B;
 };
 
 struct alignas(16) DrawTagData

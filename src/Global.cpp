@@ -164,6 +164,9 @@ DEVGUI_OPACITY=0.75
 ;    float    GFXInjected[0].g_SunDirY; // dominant stylized light direction Y
 ;    float    GFXInjected[0].g_SunDirZ; // dominant stylized light direction Z
 ;    float    GFXInjected[0].g_SunValid; // 0=no dominant light, exterior=1, interior=directional fade
+;    float4   GFXInjected[0].g_SH_R; // L1 SH for R channel (.xyz=dir bands, .w=DC). From RE::Sky 6-axis ambient cube.
+;    float4   GFXInjected[0].g_SH_G; // L1 SH for G channel.
+;    float4   GFXInjected[0].g_SH_B; // L1 SH for B channel.
 
 ; Settings for shaders can be defined in the Values.ini file in the shader definition folder
 ; Globals are at the top of the menu, while locals are grouped with other values of the shader definition
@@ -322,6 +325,17 @@ std::string GetCommonShaderHeaderHLSLTop()
             float  g_SunDirZ;
             float  g_SunValid;
             float  _sunPadding;
+
+            // L1 SH coefficients per color channel, computed plugin-side from
+            // RE::Sky::directionalAmbientColorsA (6-axis directional ambient
+            // cube, weather/cell-blended). Packing:
+            //   .x = X+ - X- band, .y = Y+ - Y-, .z = Z+ - Z-, .w = DC mean.
+            // Linear domain — evaluate as float3(dot(g_SH_R, float4(N,1)),
+            //                                   dot(g_SH_G, float4(N,1)),
+            //                                   dot(g_SH_B, float4(N,1))).
+            float4 g_SH_R;
+            float4 g_SH_G;
+            float4 g_SH_B;
         };
 
         struct DrawTagData

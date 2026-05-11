@@ -1,6 +1,7 @@
 ﻿#include <Global.h>
 #include <PCH.h>
 #include <CustomPass.h>
+#include <LightTracker.h>
 #include <RenderTargets.h>
 #include <d3d11.h>
 
@@ -1741,6 +1742,10 @@ HRESULT STDMETHODCALLTYPE MyPresent(
     REX::W32::IDXGISwapChain* This,
     UINT SyncInterval,
     UINT Flags) {
+    // Light-tracker frame boundary: finalize the previous capture (if any),
+    // poll Numpad * for new arms, open the next capture file. No-op when
+    // DEVELOPMENT is off.
+    LightTracker::Tick();
     if (CUSTOMBUFFER_ON) {
         UpdateCustomBuffer_Internal();
     }
@@ -1921,6 +1926,11 @@ void STDMETHODCALLTYPE MyPSSetShader(
     UINT NumClassInstances) {
     bool usingReplacementPixelShader = false;
     g_currentOriginalPixelShader.store(pPixelShader, std::memory_order_release);
+
+    // Light-tracker capture at PS-bind time. Engine sets RTVs / blend /
+    // scissor / cb2 / SRVs before PSSetShader, so all the per-pass state
+    // we want is live at this moment. Cheap no-op when not capturing.
+    LightTracker::OnPSBind(This, pPixelShader);
     // Trigger any customPass blocks attached to this original shader. The
     // pass runs immediately *before* we forward to OriginalPSSetShader so the
     // engine state we save/restore is the state the engine just established
@@ -3455,6 +3465,48 @@ void UIUnlockShaderList_Internal() {
     g_lockedShaderKeys.clear();
 }
 
+struct SHRows
+{
+    DirectX::XMFLOAT4 r;
+    DirectX::XMFLOAT4 g;
+    DirectX::XMFLOAT4 b;
+};
+
+static DirectX::XMFLOAT3 Mul3x3(const float m[3][3], DirectX::XMFLOAT3 v)
+{
+    return {
+        m[0][0] * v.x + m[0][1] * v.y + m[0][2] * v.z,
+        m[1][0] * v.x + m[1][1] * v.y + m[1][2] * v.z,
+        m[2][0] * v.x + m[2][1] * v.y + m[2][2] * v.z
+    };
+}
+
+static DirectX::XMFLOAT4 PackChannel(
+    float xp, float xn,
+    float yp, float yn,
+    float zp, float zn,
+    const float skyToNormalBasis[3][3])
+{
+    // No pow here.
+    DirectX::XMFLOAT3 gradientSky{
+        (xp - xn) * 0.5f,
+        (yp - yn) * 0.5f,
+        (zp - zn) * 0.5f
+    };
+
+    DirectX::XMFLOAT3 gradientNormal =
+        Mul3x3(skyToNormalBasis, gradientSky);
+
+    float mean = (xp + xn + yp + yn + zp + zn) * (1.0f / 6.0f);
+
+    return {
+        gradientNormal.x,
+        gradientNormal.y,
+        gradientNormal.z,
+        mean
+    };
+}
+
 // Update the custom buffer for shaders
 void UpdateCustomBuffer_Internal() {
     // Fill the custom buffer data structure with current frame info
@@ -3670,6 +3722,106 @@ void UpdateCustomBuffer_Internal() {
     g_customBufferData.g_SunDirZ = sunDir.z;
     g_customBufferData.g_SunValid = sunValid;
     g_customBufferData.g_SunPadding = 0.0f;
+
+    auto Normalize3 = [](DirectX::XMFLOAT3 v) {
+        const float lenSq = v.x * v.x + v.y * v.y + v.z * v.z;
+        if (lenSq <= 1.0e-8f) {
+            return DirectX::XMFLOAT3(0.0f, 0.0f, 0.0f);
+        }
+
+        const float invLen = 1.0f / std::sqrt(lenSq);
+        return DirectX::XMFLOAT3(v.x * invLen, v.y * invLen, v.z * invLen);
+    };
+
+    auto FromXM = [](DirectX::XMVECTOR v) {
+        return DirectX::XMFLOAT3(
+            DirectX::XMVectorGetX(v),
+            DirectX::XMVectorGetY(v),
+            DirectX::XMVectorGetZ(v));
+    };
+
+    // View-space L1 SH packing — derived basis matching engine's cb2[6..8].
+    //
+    // Empirically reverse-engineered from CAEE89E9/B9652BF6 capture data
+    // across 5+ camera orientations: cb2[6..8] = M @ (dac_diff/2) where
+    //   M[0] = normalize(world_up × camera_forward)
+    //   M[1] = -normalize(camera_forward × M[0])
+    //   M[2] = -camera_forward
+    // Plus cb2.w = mean of all 6 dac values (DC term).
+    //
+    // Verified bit-exact (err < 1e-6) for the engine's own cb2[6..8] given
+    // current camera basis. See AmbientLightFix.md for derivation.
+    //
+    // KNOWN ISSUE: per-pixel output still drifts visibly with camera
+    // rotation despite matching engine's cb2 packing. The dot product
+    // should be rotation-invariant when both cb2 and gbuffer normal
+    // rotate together — but we have evidence the gbuffer normal in
+    // Fallout 4 is in WORLD space (OG's existing math requires this for
+    // cascade shadows + world sun direction). Engine view-space cb2 ×
+    // world-space N gives camera-dependent results. This contradicts the
+    // engine's B9652BF6 producing stable output, suggesting some part of
+    // our understanding is incomplete (possibly: gbuffer normal IS view-
+    // space but OG transforms it implicitly through some path we haven't
+    // identified, OR engine has a separate cb2[1] convention per shader).
+    DirectX::XMFLOAT3 cameraForwardWorld = Normalize3(FromXM(camView.viewDir));
+    DirectX::XMFLOAT3 worldUp(0.0f, 0.0f, 1.0f);
+    DirectX::XMFLOAT3 row0, row1, row2;
+    {
+        DirectX::XMFLOAT3 cross0(
+            worldUp.y * cameraForwardWorld.z - worldUp.z * cameraForwardWorld.y,
+            worldUp.z * cameraForwardWorld.x - worldUp.x * cameraForwardWorld.z,
+            worldUp.x * cameraForwardWorld.y - worldUp.y * cameraForwardWorld.x);
+        float cross0Len = std::sqrt(cross0.x * cross0.x + cross0.y * cross0.y + cross0.z * cross0.z);
+        if (cross0Len > 1e-4f) {
+            row0 = DirectX::XMFLOAT3(cross0.x / cross0Len, cross0.y / cross0Len, cross0.z / cross0Len);
+        } else {
+            row0 = DirectX::XMFLOAT3(1.0f, 0.0f, 0.0f);
+        }
+        DirectX::XMFLOAT3 cross1(
+            cameraForwardWorld.y * row0.z - cameraForwardWorld.z * row0.y,
+            cameraForwardWorld.z * row0.x - cameraForwardWorld.x * row0.z,
+            cameraForwardWorld.x * row0.y - cameraForwardWorld.y * row0.x);
+        float cross1Len = std::sqrt(cross1.x * cross1.x + cross1.y * cross1.y + cross1.z * cross1.z);
+        if (cross1Len > 1e-6f) {
+            row1 = DirectX::XMFLOAT3(-cross1.x / cross1Len, -cross1.y / cross1Len, -cross1.z / cross1Len);
+        } else {
+            row1 = DirectX::XMFLOAT3(0.0f, 0.0f, -1.0f);
+        }
+        row2 = DirectX::XMFLOAT3(-cameraForwardWorld.x, -cameraForwardWorld.y, -cameraForwardWorld.z);
+    }
+    float skyToNormalBasis[3][3] = {
+        { row0.x, row0.y, row0.z },
+        { row1.x, row1.y, row1.z },
+        { row2.x, row2.y, row2.z },
+    };
+    DirectX::XMFLOAT4 shR(0.0f, 0.0f, 0.0f, 0.0f);
+    DirectX::XMFLOAT4 shG(0.0f, 0.0f, 0.0f, 0.0f);
+    DirectX::XMFLOAT4 shB(0.0f, 0.0f, 0.0f, 0.0f);
+    if (g_sky) {
+        const auto& dac = g_sky->directionalAmbientColorsA;
+
+        shR = PackChannel(
+            dac[0][0].r, dac[0][1].r,
+            dac[1][0].r, dac[1][1].r,
+            dac[2][0].r, dac[2][1].r,
+            skyToNormalBasis);
+
+        shG = PackChannel(
+            dac[0][0].g, dac[0][1].g,
+            dac[1][0].g, dac[1][1].g,
+            dac[2][0].g, dac[2][1].g,
+            skyToNormalBasis);
+
+        shB = PackChannel(
+            dac[0][0].b, dac[0][1].b,
+            dac[1][0].b, dac[1][1].b,
+            dac[2][0].b, dac[2][1].b,
+            skyToNormalBasis);
+    }
+    g_customBufferData.g_SH_R = shR;
+    g_customBufferData.g_SH_G = shG;
+    g_customBufferData.g_SH_B = shB;
+
     DirectX::XMStoreFloat4(&g_customBufferData.g_InvProjRow0, invProj.r[0]);
     DirectX::XMStoreFloat4(&g_customBufferData.g_InvProjRow1, invProj.r[1]);
     DirectX::XMStoreFloat4(&g_customBufferData.g_InvProjRow2, invProj.r[2]);

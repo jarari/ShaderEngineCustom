@@ -1,5 +1,6 @@
 ﻿#include <Global.h>
 #include <CustomPass.h>
+#include <LightTracker.h>
 
 // Global logger pointer
 std::shared_ptr<spdlog::logger> gLog;
@@ -1143,6 +1144,10 @@ F4SE_PLUGIN_LOAD(const F4SE::LoadInterface* a_f4se)
     // Sort the shader definitions by priority (highest first)
     // So we match the definitions with then highest priority
     g_shaderDefinitions.SortByPriority();
+    // Light-tracker reset. Does no work itself until DEVELOPMENT is on and
+    // the user presses Numpad *; D3D resources are allocated lazily on first
+    // capture, so it's safe to call this before the renderer is up.
+    LightTracker::Initialize();
     // Get the task interface
     g_taskInterface = F4SE::GetTaskInterface();
     // Allocate Trampoline size
@@ -1214,6 +1219,8 @@ extern "C"
             g_precompileWorker->Stop();
             g_precompileWorker.reset();
         }
+        // Release the light-tracker staging buffer before D3D teardown.
+        LightTracker::Shutdown();
         // Clear Shader resources
         if (g_customSRV)       { g_customSRV->Release();       g_customSRV = nullptr; }
         if (g_customSRVBuffer) { g_customSRVBuffer->Release(); g_customSRVBuffer = nullptr; }
