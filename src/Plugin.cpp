@@ -1,6 +1,8 @@
 ﻿#include <Global.h>
 #include <PCH.h>
 #include <CustomPass.h>
+#include <GpuScalar.h>
+#include <LightCullPolicy.h>
 #include <LightTracker.h>
 #include <RenderTargets.h>
 #include <d3d11.h>
@@ -378,6 +380,58 @@ namespace
     using BuildCommandBuffer_t = char* (*)(void* this_, void* param);
     BuildCommandBuffer_t OriginalBuildCommandBuffer = nullptr;
     REL::Relocation<std::uintptr_t> ptr_BuildCommandBuffer{ REL::ID{ 833764, 2318870 } };
+
+    // BSLight::TestFrustumCull — engine's per-light frustum cull. We wrap it
+    // so LightCullPolicy can temporarily scale geometry[+0x138] (the source
+    // bound radius the cull function reads) for the duration of the engine's
+    // call, then restore. See src/LightCullPolicy.{h,cpp} for the why.
+    // Mangled: ?TestFrustumCull@BSLight@@QEAAIAEAVNiCullingProcess@@@Z
+    // AE/NG IDs not yet mapped — REL::ID's second slot is 0 and will fail to
+    // resolve on AE; install is still attempted so the failure is loud rather
+    // than silent. Fill in the AE ID in tools/og_ae_function_map.csv to enable.
+    using BSLightTestFrustumCull_t = std::uint32_t (*)(void* light, void* cullingProcess);
+    BSLightTestFrustumCull_t OriginalBSLightTestFrustumCull = nullptr;
+    REL::Relocation<std::uintptr_t> ptr_BSLightTestFrustumCull{ REL::ID{ 1440624, 0 } };
+
+    // BSDFTiledLighting::AddLight call-site redirect — MULTIPLIES the radius
+    // arg by the active scale so the tiled-buffer slot (offset +0x10 of each
+    // 48-byte slot) sees the scaled radius. The downstream pDFTLCS compute
+    // shader uses this for tile assignment + per-tile attenuation.
+    //
+    // Context: LightCullPolicy applies *transient* scaling around individual
+    // engine consumers (cull-time and mesh-setup-time), restoring vanilla
+    // immediately after each so shadow projection / fade-distance keep their
+    // original values. By the time the lambda reads geometry[+0x138] for the
+    // AddLight radius arg, the cull-side scale has already been restored —
+    // so the arg is vanilla. We multiply here to give the tiled-buffer slot
+    // the same scaled value the per-volume mesh sees.
+    //
+    // The function has only ONE caller (this lambda); patch the `call rel32`
+    // at lambda+0x281 directly so AddLight's RIP-relative prologue stays
+    // untouched.
+    using BSDFTiledLightingAddLight_t = void (*)(std::uint32_t id,
+                                                 const RE::NiPoint3* pos,
+                                                 float radius,
+                                                 const RE::NiColor* color,
+                                                 const RE::NiPoint3* dir,
+                                                 bool flagA, bool flagB, bool flagC, bool flagD);
+    BSDFTiledLightingAddLight_t OriginalBSDFTiledLightingAddLight = nullptr;
+    REL::Relocation<std::uintptr_t> ptr_TryAddTiledLightLambda{ REL::ID{ 999390, 0 } };
+    constexpr std::uintptr_t kAddLightCallSiteOffsetOG = 0x281;  // 0x142813F61 - 0x142813CE0
+
+    // BSDFLightShader::SetupPointLightGeometry — per-volume rasterization
+    // setup. Called from DrawWorld::DrawPointLight to bind the technique,
+    // build the world matrix from the light's bounding sphere, and push
+    // per-light constants. Internally calls SetupPointLightTransforms which
+    // reads geometry[+0x138] to size the rasterized sphere mesh. Hooking the
+    // outer function lets us scale the source bound radius for the duration
+    // of the entire mesh-setup chain, then restore — so the volume mesh
+    // expands but shadow projection (which runs outside this window) sees
+    // the vanilla radius.
+    // Mangled: ?SetupPointLightGeometry@BSDFLightShader@@QEAA_NPEAVBSLight@@I_N@Z
+    using SetupPointLightGeometry_t = bool (*)(void* shader, void* light, std::uint32_t mask, char isUnk);
+    SetupPointLightGeometry_t OriginalSetupPointLightGeometry = nullptr;
+    REL::Relocation<std::uintptr_t> ptr_SetupPointLightGeometry{ REL::ID{ 212931, 0 } };
 
     thread_local float g_currentDrawTag = static_cast<float>(DrawMaterialTag::kUnknown);
     thread_local float g_currentDrawTagIsHead = 0.0f;
@@ -1754,6 +1808,11 @@ HRESULT STDMETHODCALLTYPE MyPresent(
     // GFXInjected[0] is fresh for any AtPresent pass.
     if (g_rendererData && g_rendererData->context) {
         CustomPass::g_registry.OnFramePresent(g_rendererData->context);
+        // GPU scalar probes: dispatch each probe's 1-thread CS and read back
+        // the previous frame's value. GFXInjected and modular value buffers
+        // are already fresh from UpdateCustomBuffer_Internal above, so the
+        // probes see the same per-frame data as regular customPass shaders.
+        GpuScalar::OnFramePresent(g_rendererData->context);
     }
     // Always draw a frame if ImGui is initialized to allow hotkeys
     if (g_imguiInitialized) {
@@ -4244,6 +4303,75 @@ HRESULT __stdcall HookedD3D11CreateDeviceAndSwapChain(IDXGIAdapter* a_pAdapter,
     return res;
 }
 
+// Engine entry to BSLight::TestFrustumCull. Wraps the original with an
+// Enter/Leave pair from LightCullPolicy: Enter optionally scales the BSLight's
+// bound radius (geometry[+0x138]) before the engine runs its frustum test,
+// Leave restores the source field afterwards. The engine internally caches the
+// scaled value into geometry[+0xBC] during its run; Leave deliberately does
+// not undo that so downstream consumers of the cached cull sphere see the
+// boosted reach. See src/LightCullPolicy.cpp for the rationale.
+std::uint32_t HookedBSLightTestFrustumCull(void* light, void* cullingProcess)
+{
+    const float saved = LightCullPolicy::OnTestFrustumCullEnter(light);
+    const auto result = OriginalBSLightTestFrustumCull(light, cullingProcess);
+    LightCullPolicy::OnTestFrustumCullLeave(light, saved);
+    return result;
+}
+
+// Engine entry to BSDFTiledLighting::AddLight. Multiplies the radius arg by
+// the current active scale before forwarding. The lambda reads geometry[+0x138]
+// for this arg AFTER our cull-side restore has run, so the value it passes us
+// is vanilla. Scaling here puts the tiled slot in the same regime as the
+// per-volume mesh (which gets its own transient scale via the
+// SetupPointLightGeometry hook). Both paths now use the same boosted radius
+// so non-shadow lights with both paths active match shadow-light coverage.
+void HookedBSDFTiledLightingAddLight(std::uint32_t id,
+                                     const RE::NiPoint3* pos, float radius,
+                                     const RE::NiColor* color,
+                                     const RE::NiPoint3* dir,
+                                     bool flagA, bool flagB, bool flagC, bool flagD)
+{
+    float adjusted = radius;
+    const float scale = LightCullPolicy::GetCurrentScale();
+    if (std::isfinite(scale) && scale > 0.0f && std::abs(scale - 1.0f) >= 1e-4f) {
+        adjusted = radius * scale;
+    }
+    OriginalBSDFTiledLightingAddLight(id, pos, adjusted, color, dir,
+                                      flagA, flagB, flagC, flagD);
+}
+
+// Engine entry to BSDFLightShader::SetupPointLightGeometry. Transiently scales
+// the light's geometry[+0x138] (source bound radius) for the duration of the
+// engine's setup so the world-matrix construction inside
+// SetupPointLightTransforms sees the boosted radius and builds an expanded
+// volume mesh. Restores immediately on return so shadow projection / fade-
+// distance / etc. that read +0x138 outside this window see vanilla.
+//
+// Helper layout: light[+0xB8] is the geometry pointer; geometry[+0x138] is
+// the source bound radius. Same field LightCullPolicy::GetBoundRadiusPtr
+// targets. Duplicating the offset math here to avoid widening the public
+// LightCullPolicy API just for this one consumer.
+bool HookedSetupPointLightGeometry(void* shader, void* light, std::uint32_t mask, char isUnk)
+{
+    float saved = std::numeric_limits<float>::quiet_NaN();
+    float* radiusPtr = nullptr;
+    if (light) {
+        if (auto* geometry = *reinterpret_cast<void**>(static_cast<std::byte*>(light) + 0xB8)) {
+            radiusPtr = reinterpret_cast<float*>(static_cast<std::byte*>(geometry) + 0x138);
+            const float scale = LightCullPolicy::GetCurrentScale();
+            if (std::isfinite(scale) && scale > 0.0f && std::abs(scale - 1.0f) >= 1e-4f) {
+                saved = *radiusPtr;
+                *radiusPtr = saved * scale;
+            }
+        }
+    }
+    const bool result = OriginalSetupPointLightGeometry(shader, light, mask, isUnk);
+    if (!std::isnan(saved) && radiusPtr) {
+        *radiusPtr = saved;
+    }
+    return result;
+}
+
 // This is called during Plugin load very early
 bool InstallShaderCreationHooks_Internal() {
     REX::INFO("Hooking D3D11CreateDeviceAndSwapChain");
@@ -4286,7 +4414,10 @@ bool InstallDrawTaggingHooks_Internal()
         OriginalReset3D &&
         OriginalRenderCommandBufferPassesImpl &&
         OriginalBuildCommandBuffer &&
-        OriginalReplaceHeadTaskRun) {
+        OriginalReplaceHeadTaskRun &&
+        OriginalBSLightTestFrustumCull &&
+        OriginalBSDFTiledLightingAddLight &&
+        OriginalSetupPointLightGeometry) {
         return true;
     }
 
@@ -4566,6 +4697,63 @@ bool InstallDrawTaggingHooks_Internal()
         }
 
         REX::INFO("InstallDrawTaggingHooks_Internal: Script::ModifyFaceGen::ReplaceHeadTask::Run hook installed");
+    }
+
+    if (!OriginalBSLightTestFrustumCull) {
+        // Prologue at OG 0x14285ACB0 (verified by IDA disasm) — 14 bytes ends
+        // on a clean instruction boundary right before `sub rsp, 70h`:
+        //   mov [rsp+0x10], rbx     ; 5 bytes
+        //   mov [rsp+0x18], rbp     ; 5 bytes
+        //   push rsi                 ; 1 byte
+        //   push rdi                 ; 1 byte
+        //   push r14                 ; 2 bytes
+        // Total = 14, room for the JMP14 absolute patch.
+        constexpr std::size_t kBSLightTestFrustumCullPrologueSize = 14;
+        OriginalBSLightTestFrustumCull = CreateBranchGateway<BSLightTestFrustumCull_t>(
+            ptr_BSLightTestFrustumCull, kBSLightTestFrustumCullPrologueSize,
+            reinterpret_cast<void*>(&HookedBSLightTestFrustumCull));
+
+        if (!OriginalBSLightTestFrustumCull) {
+            REX::WARN("InstallDrawTaggingHooks_Internal: Failed to install BSLight::TestFrustumCull hook");
+            return false;
+        }
+
+        REX::INFO("InstallDrawTaggingHooks_Internal: BSLight::TestFrustumCull hook installed");
+    }
+
+    if (!OriginalBSDFTiledLightingAddLight) {
+        // 5-byte `call rel32` patch at lambda+0x281. write_call<5> returns the
+        // original target (AddLight @ 0x14286DBD0) for forwarding.
+        const std::uintptr_t callSite = ptr_TryAddTiledLightLambda.address() + kAddLightCallSiteOffsetOG;
+        REL::Relocation<std::uintptr_t> callSiteRel{ callSite };
+        OriginalBSDFTiledLightingAddLight = reinterpret_cast<BSDFTiledLightingAddLight_t>(
+            callSiteRel.write_call<5>(reinterpret_cast<std::uintptr_t>(&HookedBSDFTiledLightingAddLight)));
+
+        if (!OriginalBSDFTiledLightingAddLight) {
+            REX::WARN("InstallDrawTaggingHooks_Internal: Failed to redirect BSDFTiledLighting::AddLight call site at {:#x}", callSite);
+            return false;
+        }
+
+        REX::INFO("InstallDrawTaggingHooks_Internal: BSDFTiledLighting::AddLight call-site redirect installed at {:#x} (scales radius arg)", callSite);
+    }
+
+    if (!OriginalSetupPointLightGeometry) {
+        // Prologue at OG 0x1428C37A0: `mov [rsp-8+arg_18], r9b` is exactly 5
+        // bytes and a clean instruction boundary. Use CreateBranchGateway5 so
+        // we only patch those 5 bytes (the surrounding `push rbp/rbx/rsi/rdi`
+        // etc. stay intact). The 14-byte path would mid-cut `lea rbp` at
+        // offset +13.
+        constexpr std::size_t kSetupPointLightGeometryPrologueSize = 5;
+        OriginalSetupPointLightGeometry = CreateBranchGateway5<SetupPointLightGeometry_t>(
+            ptr_SetupPointLightGeometry, kSetupPointLightGeometryPrologueSize,
+            reinterpret_cast<void*>(&HookedSetupPointLightGeometry));
+
+        if (!OriginalSetupPointLightGeometry) {
+            REX::WARN("InstallDrawTaggingHooks_Internal: Failed to install BSDFLightShader::SetupPointLightGeometry hook");
+            return false;
+        }
+
+        REX::INFO("InstallDrawTaggingHooks_Internal: BSDFLightShader::SetupPointLightGeometry hook installed");
     }
 
     return true;

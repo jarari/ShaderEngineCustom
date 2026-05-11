@@ -1,5 +1,7 @@
 ﻿#include <Global.h>
 #include <CustomPass.h>
+#include <GpuScalar.h>
+#include <LightCullPolicy.h>
 #include <LightTracker.h>
 
 // Global logger pointer
@@ -254,6 +256,15 @@ int LoadShaderDefinitionsFromFile(const std::filesystem::path& shaderFolderPath,
             if (CustomPass::Registry::IsCustomSection(shaderId)) {
                 std::string endTag = "[/" + shaderId + "]";
                 CustomPass::g_registry.ParseSection(shaderId, file, endTag, shaderFolderPath, folderName);
+                continue;
+            }
+            // [gpuScalar:NAME] blocks expose a single-float HLSL function's
+            // return value to CPU consumers via a per-frame compute dispatch.
+            // See src/GpuScalar.{h,cpp}.
+            if (GpuScalar::IsGpuScalarSection(shaderId)) {
+                std::string suffix = shaderId.substr(strlen("gpuScalar:"));
+                std::string endTag = "[/" + shaderId + "]";
+                GpuScalar::ParseSection(suffix, file, endTag, folderName);
                 continue;
             }
             // Create new shader definition
@@ -560,6 +571,13 @@ int LoadShaderDefinitionsFromFile(const std::filesystem::path& shaderFolderPath,
                     if (ToLower(value) == "true" || value == "1") {
                         def.dump = true;
                     }
+                }
+                // Optional reference to a float value (declared in this folder's
+                // Values.ini, or any [global] block) whose current value scales
+                // the engine's BSLight cull bound while the rule is active.
+                // See LightCullPolicy.{h,cpp}. Default empty (no scaling).
+                else if (lowerKey == "lightcullradiusscalevalue") {
+                    def.lightCullRadiusScaleValue = value;
                 }
             }
             // Cache the ShaderDefinition ID
@@ -1018,6 +1036,7 @@ void ReloadAllShaderDefinitions_Internal() {
     // At this point we have no active watchers and no connections between ShaderDB and ShaderDefDB
     g_shaderDefinitions.Clear();  // Deletes old definitions
     CustomPass::g_registry.Reset();  // Wipe customPass / customResource state for re-parse
+    GpuScalar::Reset();              // Wipe gpuScalar probes alongside customPass state
     // Build a new ShaderDefDB from the INI files on disk
     if (g_shaderFolderPath.empty()) {
         g_shaderFolderPath = g_pluginPath / "ShaderEngine";
@@ -1148,6 +1167,15 @@ F4SE_PLUGIN_LOAD(const F4SE::LoadInterface* a_f4se)
     // the user presses Numpad *; D3D resources are allocated lazily on first
     // capture, so it's safe to call this before the renderer is up.
     LightTracker::Initialize();
+    // Cull-policy module: arms BSLight::TestFrustumCull to consult active
+    // shader rules for an optional bound-radius scale value. Side-effect-free
+    // until a Shader.ini block sets `lightCullRadiusScaleValue` AND that
+    // rule's replacement compiles.
+    LightCullPolicy::Initialize();
+    // GPU scalar probes: per-frame CS dispatches that bridge HLSL-evaluated
+    // scalars back to CPU. Side-effect-free until at least one [gpuScalar:NAME]
+    // section is parsed AND its include + entry function compile cleanly.
+    GpuScalar::Initialize();
     // Get the task interface
     g_taskInterface = F4SE::GetTaskInterface();
     // Allocate Trampoline size
@@ -1221,6 +1249,11 @@ extern "C"
         }
         // Release the light-tracker staging buffer before D3D teardown.
         LightTracker::Shutdown();
+        // Disarm the cull-policy hook gate so any in-flight cull running
+        // during teardown bails out of the slow path cheaply.
+        LightCullPolicy::Shutdown();
+        // Release GPU-scalar probe resources (CS + UAV buffer + staging ring).
+        GpuScalar::Shutdown();
         // Clear Shader resources
         if (g_customSRV)       { g_customSRV->Release();       g_customSRV = nullptr; }
         if (g_customSRVBuffer) { g_customSRVBuffer->Release(); g_customSRVBuffer = nullptr; }

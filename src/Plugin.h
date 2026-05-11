@@ -455,6 +455,22 @@ struct ShaderDefinition {
     // Logging and dumping options
     bool log = false;
     bool dump = false;
+    // Optional: name of a Float ShaderValue (declared in some folder's
+    // Values.ini, [global] or [local]) whose current value gets multiplied
+    // into BSLight::geometry[+0x138] (the bound radius) every time the engine
+    // runs BSLight::TestFrustumCull — but ONLY while this rule has a compiled
+    // replacement pixel shader AND active=true. Lets a PS replacement that
+    // boosts a light's apparent intensity expand the engine's cull bound so
+    // distant pixels still receive the boosted contribution. Empty = no
+    // scaling. Lookup is lazy on first cull (Values.ini load order independent).
+    // See src/LightCullPolicy.{h,cpp}.
+    std::string  lightCullRadiusScaleValue;
+    // Resolved cache. Exactly one of {Resolved, GpuRef} is non-null after a
+    // successful lookup. GpuRef points into a GpuScalar probe's last-readback
+    // float and is updated by GpuScalar::OnFramePresent each frame.
+    ShaderValue* lightCullRadiusScaleResolved = nullptr;
+    const float* lightCullRadiusScaleGpuRef   = nullptr;
+    bool         lightCullRadiusScaleResolveLogged = false;    // one-shot warn
     // Collection of shader values defined for this shader, keyed by the byte offset in the SRV buffer
     std::vector<ShaderValue> shaderValues;
 };
