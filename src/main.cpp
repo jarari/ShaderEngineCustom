@@ -3,6 +3,8 @@
 #include <GpuScalar.h>
 #include <LightCullPolicy.h>
 #include <LightTracker.h>
+#include <ShadowCullCache.h>
+#include <InstancingProbe.h>
 
 // Global logger pointer
 std::shared_ptr<spdlog::logger> gLog;
@@ -931,6 +933,36 @@ void LoadConfig(HMODULE hModule) {
             }
             continue;
         }
+        else if (lowerKey == "instancing_probe_mode") {
+            const std::string v = ToLower(value);
+            if (v == "on" || v == "true" || v == "1") {
+                InstancingProbe::g_mode.store(InstancingProbe::Mode::On, std::memory_order_relaxed);
+                REX::INFO("LoadConfig: INSTANCING_PROBE_MODE set to on");
+            } else {
+                InstancingProbe::g_mode.store(InstancingProbe::Mode::Off, std::memory_order_relaxed);
+                REX::INFO("LoadConfig: INSTANCING_PROBE_MODE set to off");
+            }
+            continue;
+        }
+        else if (lowerKey == "shadow_cull_cache_mode") {
+            // off | measure | cache  — see ShadowCullCache.h for semantics.
+            const std::string v = ToLower(value);
+            if (v == "measure") {
+                ShadowCullCache::g_mode.store(ShadowCullCache::Mode::Measure, std::memory_order_relaxed);
+                REX::INFO("LoadConfig: SHADOW_CULL_CACHE_MODE set to measure");
+            } else if (v == "cache") {
+                ShadowCullCache::g_mode.store(ShadowCullCache::Mode::Cache, std::memory_order_relaxed);
+                REX::INFO("LoadConfig: SHADOW_CULL_CACHE_MODE set to cache (experimental — verify shadows look correct)");
+            } else {
+                ShadowCullCache::g_mode.store(ShadowCullCache::Mode::Off, std::memory_order_relaxed);
+                if (v != "off" && !v.empty()) {
+                    REX::WARN("LoadConfig: Unknown SHADOW_CULL_CACHE_MODE='{}', using off", value);
+                } else {
+                    REX::INFO("LoadConfig: SHADOW_CULL_CACHE_MODE set to off");
+                }
+            }
+            continue;
+        }
     }
     file.close();
     // Scan for shader definitions in subdirectories
@@ -1183,10 +1215,24 @@ F4SE_PLUGIN_LOAD(const F4SE::LoadInterface* a_f4se)
     // Budget covers existing CreateBranchGateway hooks (~210B on OG) plus the
     // 5-byte branch hooks for Update3DModel/Reset3D, each of which costs a
     // gateway (~19B) + an absolute-jump thunk (~14B) in this same arena.
-    trampoline.create(512);
+    // Bumped 512 -> 768 to cover ShadowCullCache (28B/hook) plus headroom for
+    // upcoming perf hooks targeting the G-buffer command-buffer rebuild and
+    // BSBatchRenderer batch coalesce (~28B each).
+    trampoline.create(768);
     // Install the shader creation hooks very early.
     InstallShaderCreationHooks_Internal();
     InstallDrawTaggingHooks_Internal();
+    // Shadow-cull measurement / cache module. Hooks ShadowSceneNode::OnVisible
+    // ONLY when ShaderEngine.ini sets SHADOW_CULL_CACHE_MODE=measure (or a
+    // future cache mode). Default off = zero impact. Must run AFTER
+    // trampoline.create() since it allocates a gateway from that arena.
+    // See ShadowCullCache.h.
+    ShadowCullCache::Initialize();
+    // Instancing-probe — does NO hooking of its own, just publishes an
+    // OnDraw() entry point that Plugin.cpp's HookedBSBatchRendererDraw
+    // invokes at the head of every per-pass draw. Off by default. See
+    // InstancingProbe.h for what it measures and why.
+    InstancingProbe::Initialize();
     // Get the scaleform interface
     g_scaleformInterface = F4SE::GetScaleformInterface();
     // Set the messagehandler to listen to events

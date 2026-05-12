@@ -2,6 +2,7 @@
 #include <PCH.h>
 #include <CustomPass.h>
 #include <GpuScalar.h>
+#include <InstancingProbe.h>
 #include <LightCullPolicy.h>
 #include <LightTracker.h>
 #include <RenderTargets.h>
@@ -864,6 +865,12 @@ namespace
 
     void HookedBSBatchRendererDraw(BSRenderPassLayout* pass, std::uintptr_t unk2, std::uintptr_t unk3, RE::BSGraphics::DynamicTriShapeDrawData* dynamicDrawData)
     {
+        // Phase-1 instancing measurement. Cheap when INI is `off`
+        // (single relaxed atomic load + branch). Counts consecutive same
+        // shader/material/geometry runs so we can decide whether a real
+        // instancing coalesce (Phase 2) is worth doing.
+        InstancingProbe::OnDraw(pass);
+
         PushCurrentDrawTag(pass);
 
         if (DEBUGGING) {
