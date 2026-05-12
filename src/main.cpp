@@ -3,8 +3,9 @@
 #include <GpuScalar.h>
 #include <LightCullPolicy.h>
 #include <LightTracker.h>
-#include <ShadowCullCache.h>
-#include <InstancingProbe.h>
+#include <PhaseTelemetry.h>
+#include <LightSorter.h>
+#include <HiZCull.h>
 
 // Global logger pointer
 std::shared_ptr<spdlog::logger> gLog;
@@ -933,33 +934,39 @@ void LoadConfig(HMODULE hModule) {
             }
             continue;
         }
-        else if (lowerKey == "instancing_probe_mode") {
+        else if (lowerKey == "light_sorter_mode") {
             const std::string v = ToLower(value);
             if (v == "on" || v == "true" || v == "1") {
-                InstancingProbe::g_mode.store(InstancingProbe::Mode::On, std::memory_order_relaxed);
-                REX::INFO("LoadConfig: INSTANCING_PROBE_MODE set to on");
+                LightSorter::g_mode.store(LightSorter::Mode::On, std::memory_order_relaxed);
+                REX::INFO("LoadConfig: LIGHT_SORTER_MODE set to on");
             } else {
-                InstancingProbe::g_mode.store(InstancingProbe::Mode::Off, std::memory_order_relaxed);
-                REX::INFO("LoadConfig: INSTANCING_PROBE_MODE set to off");
+                LightSorter::g_mode.store(LightSorter::Mode::Off, std::memory_order_relaxed);
+                REX::INFO("LoadConfig: LIGHT_SORTER_MODE set to off");
             }
             continue;
         }
-        else if (lowerKey == "shadow_cull_cache_mode") {
-            // off | measure | cache  — see ShadowCullCache.h for semantics.
+        else if (lowerKey == "phase_telemetry_mode") {
             const std::string v = ToLower(value);
-            if (v == "measure") {
-                ShadowCullCache::g_mode.store(ShadowCullCache::Mode::Measure, std::memory_order_relaxed);
-                REX::INFO("LoadConfig: SHADOW_CULL_CACHE_MODE set to measure");
-            } else if (v == "cache") {
-                ShadowCullCache::g_mode.store(ShadowCullCache::Mode::Cache, std::memory_order_relaxed);
-                REX::INFO("LoadConfig: SHADOW_CULL_CACHE_MODE set to cache (experimental — verify shadows look correct)");
+            if (v == "on" || v == "true" || v == "1") {
+                PhaseTelemetry::g_mode.store(PhaseTelemetry::Mode::On, std::memory_order_relaxed);
+                REX::INFO("LoadConfig: PHASE_TELEMETRY_MODE set to on");
             } else {
-                ShadowCullCache::g_mode.store(ShadowCullCache::Mode::Off, std::memory_order_relaxed);
-                if (v != "off" && !v.empty()) {
-                    REX::WARN("LoadConfig: Unknown SHADOW_CULL_CACHE_MODE='{}', using off", value);
-                } else {
-                    REX::INFO("LoadConfig: SHADOW_CULL_CACHE_MODE set to off");
-                }
+                PhaseTelemetry::g_mode.store(PhaseTelemetry::Mode::Off, std::memory_order_relaxed);
+                REX::INFO("LoadConfig: PHASE_TELEMETRY_MODE set to off");
+            }
+            continue;
+        }
+        else if (lowerKey == "hiz_cull_mode") {
+            const std::string v = ToLower(value);
+            if (v == "cull" || v == "on" || v == "true" || v == "1") {
+                HiZCull::g_mode.store(HiZCull::Mode::Cull, std::memory_order_relaxed);
+                REX::INFO("LoadConfig: HIZ_CULL_MODE set to cull");
+            } else if (v == "measure") {
+                HiZCull::g_mode.store(HiZCull::Mode::Measure, std::memory_order_relaxed);
+                REX::INFO("LoadConfig: HIZ_CULL_MODE set to measure");
+            } else {
+                HiZCull::g_mode.store(HiZCull::Mode::Off, std::memory_order_relaxed);
+                REX::INFO("LoadConfig: HIZ_CULL_MODE set to off");
             }
             continue;
         }
@@ -1212,27 +1219,33 @@ F4SE_PLUGIN_LOAD(const F4SE::LoadInterface* a_f4se)
     g_taskInterface = F4SE::GetTaskInterface();
     // Allocate Trampoline size
     auto& trampoline = REL::GetTrampoline();
-    // Budget covers existing CreateBranchGateway hooks (~210B on OG) plus the
-    // 5-byte branch hooks for Update3DModel/Reset3D, each of which costs a
-    // gateway (~19B) + an absolute-jump thunk (~14B) in this same arena.
-    // Bumped 512 -> 768 to cover ShadowCullCache (28B/hook) plus headroom for
-    // upcoming perf hooks targeting the G-buffer command-buffer rebuild and
-    // BSBatchRenderer batch coalesce (~28B each).
-    trampoline.create(768);
+    // Budget covers ShaderEngine's pre-existing CreateBranchGateway hooks
+    // (~210 B on OG) plus the 5-byte branch hooks for Update3DModel/Reset3D
+    // (each ~19 B gateway + 14 B abs-jump thunk in this same arena) plus
+    // PhaseTelemetry's DrawWorld:: per-phase hooks (14 sites × ~30 B ≈ 420 B,
+    // including the rip-rel instruction relocator for 5 of those sites that
+    // expands the gateway to ~32 B each). 2 KB total leaves comfortable
+    // headroom and matches commonlibf4's default upper bound.
+    trampoline.create(2048);
     // Install the shader creation hooks very early.
     InstallShaderCreationHooks_Internal();
     InstallDrawTaggingHooks_Internal();
-    // Shadow-cull measurement / cache module. Hooks ShadowSceneNode::OnVisible
-    // ONLY when ShaderEngine.ini sets SHADOW_CULL_CACHE_MODE=measure (or a
-    // future cache mode). Default off = zero impact. Must run AFTER
-    // trampoline.create() since it allocates a gateway from that arena.
-    // See ShadowCullCache.h.
-    ShadowCullCache::Initialize();
-    // Instancing-probe — does NO hooking of its own, just publishes an
-    // OnDraw() entry point that Plugin.cpp's HookedBSBatchRendererDraw
-    // invokes at the head of every per-pass draw. Off by default. See
-    // InstancingProbe.h for what it measures and why.
-    InstancingProbe::Initialize();
+    // Phase telemetry — installs per-DrawWorld:: hooks to attribute wall time
+    // + draw count per sub-phase under DrawWorld::Render_PreUI. Default off
+    // = zero impact (hooks not installed). See PhaseTelemetry.h. Auto-installs
+    // hooks when LIGHT_SORTER_MODE is on, since LightSorter piggy-backs on
+    // PhaseTelemetry's DeferredLightsImpl wrapper.
+    PhaseTelemetry::Initialize();
+    // LightSorter — stable-partitions the point-light array by stencil flag
+    // before DrawWorld::DeferredLightsImpl, then restores. No own hook;
+    // PhaseTelemetry's HookedDeferredLightsImpl calls OnEnter/OnExit.
+    LightSorter::Initialize();
+    // HiZCull — patches BSGeometry-family vtables' OnVisible slot to insert
+    // Hi-Z occlusion test before pass-list enrolment. Piggy-backs on
+    // PhaseTelemetry's HookedMainAccum for the per-frame Hi-Z build dispatch.
+    // Default mode=off → vtables not patched, zero cost. See src/HiZCull.{h,cpp}
+    // and the HIZ_CULL_MODE doc in ShaderEngine.ini for modes and limitations.
+    HiZCull::Initialize();
     // Get the scaleform interface
     g_scaleformInterface = F4SE::GetScaleformInterface();
     // Set the messagehandler to listen to events
@@ -1293,6 +1306,10 @@ extern "C"
             g_precompileWorker->Stop();
             g_precompileWorker.reset();
         }
+        // HiZCull goes first — restores vtables BEFORE any D3D release. Order
+        // matters: an in-flight worker inside HookedOnVisible should not race
+        // a free of the Hi-Z mip pyramid it might be sampling.
+        HiZCull::Shutdown();
         // Release the light-tracker staging buffer before D3D teardown.
         LightTracker::Shutdown();
         // Disarm the cull-policy hook gate so any in-flight cull running
