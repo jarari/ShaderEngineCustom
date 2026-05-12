@@ -1,7 +1,6 @@
 #include <PCH.h>
 #include "PhaseTelemetry.h"
 #include "LightSorter.h"
-#include "HiZCull.h"
 
 #include <chrono>
 #include <cstring>
@@ -11,6 +10,8 @@ namespace PhaseTelemetry {
 std::atomic<Mode> g_mode{ Mode::Off };
 
 namespace {
+
+std::atomic<bool> s_forceHooks{ false };
 
 // --- Hook targets ----------------------------------------------------------
 //
@@ -352,6 +353,8 @@ const char* SubPhaseName(SubPhase p) noexcept
 struct Bucket {
     std::atomic<std::uint64_t> calls{ 0 };
     std::atomic<std::uint64_t> draws{ 0 };
+    std::atomic<std::uint64_t> d3dDraws{ 0 };
+    std::atomic<std::uint64_t> cmdBufDraws{ 0 };
     std::atomic<std::uint64_t> totalNs{ 0 };
     std::atomic<std::uint64_t> maxNs{ 0 };
 
@@ -359,6 +362,8 @@ struct Bucket {
     {
         calls.store(0, std::memory_order_relaxed);
         draws.store(0, std::memory_order_relaxed);
+        d3dDraws.store(0, std::memory_order_relaxed);
+        cmdBufDraws.store(0, std::memory_order_relaxed);
         totalNs.store(0, std::memory_order_relaxed);
         maxNs.store(0, std::memory_order_relaxed);
     }
@@ -407,6 +412,8 @@ void MaybeLog()
 
     const auto frameTotalNs = s_frame.totalNs.load(std::memory_order_relaxed);
     const auto frameDraws   = s_frame.draws.load(std::memory_order_relaxed);
+    const auto frameD3DDraws = s_frame.d3dDraws.load(std::memory_order_relaxed);
+    const auto frameCmdBufDraws = s_frame.cmdBufDraws.load(std::memory_order_relaxed);
     const auto frameMaxNs   = s_frame.maxNs.load(std::memory_order_relaxed);
 
     std::uint64_t childNsSum = 0;
@@ -416,13 +423,15 @@ void MaybeLog()
 
     REX::INFO(
         "PhaseTelemetry[Frame]: calls={} over {:.2f}s ({:.1f}/s) "
-        "totalMs/s={:.2f} avgMs={:.2f} maxMs={:.2f} draws/frame={:.0f} "
+        "totalMs/s={:.2f} avgMs={:.2f} maxMs={:.2f} bsDraws/frame={:.0f} cmdBuf/frame={:.0f} d3dDraws/frame={:.0f} "
         "unaccountedMs={:.2f}",
         frameCalls, secs, frameCalls / secs,
         (frameTotalNs / 1'000'000.0) / secs,
         (frameTotalNs / 1'000'000.0) / static_cast<double>(frameCalls),
         frameMaxNs / 1'000'000.0,
         static_cast<double>(frameDraws) / static_cast<double>(frameCalls),
+        static_cast<double>(frameCmdBufDraws) / static_cast<double>(frameCalls),
+        static_cast<double>(frameD3DDraws) / static_cast<double>(frameCalls),
         (frameTotalNs > childNsSum ? (frameTotalNs - childNsSum) : 0) / 1'000'000.0);
 
     for (int i = 1; i < static_cast<int>(SubPhase::Count); ++i) {
@@ -430,13 +439,15 @@ void MaybeLog()
         const auto c = b.calls.load(std::memory_order_relaxed);
         if (c == 0) continue;
         const auto d  = b.draws.load(std::memory_order_relaxed);
+        const auto dd = b.d3dDraws.load(std::memory_order_relaxed);
+        const auto cd = b.cmdBufDraws.load(std::memory_order_relaxed);
         const auto ns = b.totalNs.load(std::memory_order_relaxed);
         const auto mx = b.maxNs.load(std::memory_order_relaxed);
         REX::INFO(
-            "  Frame[{}]: calls={} draws={} totMs/s={:.2f} avgUs={:.1f} maxUs={:.1f} "
+            "  Frame[{}]: calls={} bsDraws={} cmdBuf={} d3dDraws={} totMs/s={:.2f} avgUs={:.1f} maxUs={:.1f} "
             "(%frame={:.1f})",
             SubPhaseName(static_cast<SubPhase>(i)),
-            c, d,
+            c, d, cd, dd,
             (ns / 1'000'000.0) / secs,
             (ns / 1000.0) / static_cast<double>(c),
             mx / 1000.0,
@@ -503,15 +514,9 @@ void HookedSubPhase(VoidVoid_t orig)
     RecordBucket(s_subBuckets[static_cast<std::size_t>(P)], ns);
 }
 
-// Special-cased: dispatch HiZCull's per-frame Hi-Z build BEFORE the original
-// MainAccum runs (we want the Hi-Z built from the current main depth target
-// before BuildSceneLists/AccumulatePasses fire OnVisible per object). The
-// call is cheap when HIZ_CULL_MODE=off (single relaxed atomic load).
 void HookedMainAccumCore()
 {
-    HiZCull::OnMainAccumEnter();
     s_origMainAccum();
-    HiZCull::OnMainAccumExit();
 }
 void HookedMainAccum()          { HookedSubPhase<SubPhase::MainAccum         >(&HookedMainAccumCore); }
 void HookedMainRenderSetup()    { HookedSubPhase<SubPhase::MainRenderSetup   >(s_origMainRenderSetup); }
@@ -537,7 +542,6 @@ void HookedDeferredComposite()  { HookedSubPhase<SubPhase::DeferredComposite >(s
 void HookedForwardCore()
 {
     s_origForward();
-    HiZCull::OnWorldDepthReadyExit();
 }
 void HookedForward()            { HookedSubPhase<SubPhase::Forward           >(&HookedForwardCore); }
 // Tier 0 — installed via E9-5 + relocator.
@@ -617,6 +621,43 @@ void OnDraw()
     }
 }
 
+void OnD3DDraw()
+{
+    if (g_mode.load(std::memory_order_relaxed) != Mode::On) return;
+    if (!tl_inFrame) return;
+    s_frame.d3dDraws.fetch_add(1, std::memory_order_relaxed);
+    if (tl_subphase != SubPhase::None) {
+        s_subBuckets[static_cast<std::size_t>(tl_subphase)]
+            .d3dDraws.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+void OnCommandBufferDraw()
+{
+    if (g_mode.load(std::memory_order_relaxed) != Mode::On) return;
+    if (!tl_inFrame) return;
+    s_frame.cmdBufDraws.fetch_add(1, std::memory_order_relaxed);
+    if (tl_subphase != SubPhase::None) {
+        s_subBuckets[static_cast<std::size_t>(tl_subphase)]
+            .cmdBufDraws.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+void RequireHooks()
+{
+    s_forceHooks.store(true, std::memory_order_relaxed);
+}
+
+bool IsInRenderPreUI()
+{
+    return tl_inFrame;
+}
+
+bool IsInDeferredPrePass()
+{
+    return tl_inFrame && tl_subphase == SubPhase::DeferredPrePass;
+}
+
 bool Initialize()
 {
     if (s_installed) {
@@ -627,24 +668,23 @@ bool Initialize()
 
     // The DrawWorld:: hooks aren't owned by PhaseTelemetry alone — LightSorter
     // runs its OnEnter/OnExit logic from inside our HookedDeferredLightsImpl
-    // wrapper, and HiZCull dispatches its per-frame Hi-Z build from inside
-    // our HookedMainAccum wrapper. If either piggy-back consumer is on but
+    // wrapper, and renderer hooks can request phase context without enabling
+    // telemetry logging. If either piggy-back consumer is on but
     // PhaseTelemetry itself is Off, we still install the hooks. Each per-call
     // check inside HookedSubPhase / the wrappers is a single relaxed atomic
     // load when disabled.
     const bool lightSorterOn = LightSorter::g_mode.load(std::memory_order_relaxed)
                                != LightSorter::Mode::Off;
-    const bool hizCullOn = HiZCull::g_mode.load(std::memory_order_relaxed)
-                           != HiZCull::Mode::Off;
-    const bool needHooks = (mode == Mode::On) || lightSorterOn || hizCullOn;
+    const bool forced = s_forceHooks.load(std::memory_order_relaxed);
+    const bool needHooks = (mode == Mode::On) || lightSorterOn || forced;
 
     REX::INFO("PhaseTelemetry::Initialize: mode={} (hooks {} — telemetry={}, "
-              "LightSorter={}, HiZCull={})",
+              "LightSorter={}, forced={})",
               mode == Mode::On ? "on" : "off",
               needHooks ? "installing" : "skipped",
               mode == Mode::On ? "on" : "off",
               lightSorterOn ? "on" : "off",
-              hizCullOn ? "on" : "off");
+              forced ? "on" : "off");
     if (!needHooks) {
         return true;
     }

@@ -5,7 +5,6 @@
 #include <LightTracker.h>
 #include <PhaseTelemetry.h>
 #include <LightSorter.h>
-#include <HiZCull.h>
 
 // Global logger pointer
 std::shared_ptr<spdlog::logger> gLog;
@@ -956,20 +955,6 @@ void LoadConfig(HMODULE hModule) {
             }
             continue;
         }
-        else if (lowerKey == "hiz_cull_mode") {
-            const std::string v = ToLower(value);
-            if (v == "cull" || v == "on" || v == "true" || v == "1") {
-                HiZCull::g_mode.store(HiZCull::Mode::Cull, std::memory_order_relaxed);
-                REX::INFO("LoadConfig: HIZ_CULL_MODE set to cull");
-            } else if (v == "measure") {
-                HiZCull::g_mode.store(HiZCull::Mode::Measure, std::memory_order_relaxed);
-                REX::INFO("LoadConfig: HIZ_CULL_MODE set to measure");
-            } else {
-                HiZCull::g_mode.store(HiZCull::Mode::Off, std::memory_order_relaxed);
-                REX::INFO("LoadConfig: HIZ_CULL_MODE set to off");
-            }
-            continue;
-        }
     }
     file.close();
     // Scan for shader definitions in subdirectories
@@ -1232,20 +1217,14 @@ F4SE_PLUGIN_LOAD(const F4SE::LoadInterface* a_f4se)
     InstallDrawTaggingHooks_Internal();
     // Phase telemetry — installs per-DrawWorld:: hooks to attribute wall time
     // + draw count per sub-phase under DrawWorld::Render_PreUI. Default off
-    // = zero impact (hooks not installed). See PhaseTelemetry.h. Auto-installs
-    // hooks when LIGHT_SORTER_MODE is on, since LightSorter piggy-backs on
-    // PhaseTelemetry's DeferredLightsImpl wrapper.
+    // = no logging. Render-pass occlusion uses these hooks as phase context,
+    // so it requests hook installation without enabling telemetry output.
+    PhaseTelemetry::RequireHooks();
     PhaseTelemetry::Initialize();
     // LightSorter — stable-partitions the point-light array by stencil flag
     // before DrawWorld::DeferredLightsImpl, then restores. No own hook;
     // PhaseTelemetry's HookedDeferredLightsImpl calls OnEnter/OnExit.
     LightSorter::Initialize();
-    // HiZCull — patches BSGeometry-family vtables' OnVisible slot to insert
-    // Hi-Z occlusion test before pass-list enrolment. Piggy-backs on
-    // PhaseTelemetry's HookedMainAccum for the per-frame Hi-Z build dispatch.
-    // Default mode=off → vtables not patched, zero cost. See src/HiZCull.{h,cpp}
-    // and the HIZ_CULL_MODE doc in ShaderEngine.ini for modes and limitations.
-    HiZCull::Initialize();
     // Get the scaleform interface
     g_scaleformInterface = F4SE::GetScaleformInterface();
     // Set the messagehandler to listen to events
@@ -1306,10 +1285,8 @@ extern "C"
             g_precompileWorker->Stop();
             g_precompileWorker.reset();
         }
-        // HiZCull goes first — restores vtables BEFORE any D3D release. Order
-        // matters: an in-flight worker inside HookedOnVisible should not race
-        // a free of the Hi-Z mip pyramid it might be sampling.
-        HiZCull::Shutdown();
+        // Release pass-level occlusion query objects before D3D teardown.
+        ShutdownPassOcclusionCache_Internal();
         // Release the light-tracker staging buffer before D3D teardown.
         LightTracker::Shutdown();
         // Disarm the cull-policy hook gate so any in-flight cull running

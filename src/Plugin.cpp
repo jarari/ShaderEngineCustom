@@ -78,6 +78,9 @@ enum class DepthStencilTarget : UINT
 };
 static constexpr auto MAIN_DEPTHSTENCIL_TARGET = DepthStencilTarget::kMain;
 static constexpr UINT DEPTHSTENCIL_TARGET_COUNT = static_cast<UINT>(DepthStencilTarget::kCount);
+static std::atomic<UINT> g_currentDepthTargetIndex{ DEPTHSTENCIL_TARGET_COUNT };
+static std::atomic<UINT> g_currentRenderTargetCount{ 0 };
+static std::atomic<bool> g_currentHasRenderTarget{ false };
 // Global depth buffer SRV for shaders to read depth when DEPTHBUFFER_ON is enabled
 REX::W32::ID3D11ShaderResourceView* g_depthSRV = nullptr;
 static bool g_activeReplacementPixelShader = false;
@@ -350,6 +353,10 @@ namespace
     // replay path. We hook entry to scan the pass list and decide between two
     // strategies (see HookedRenderCommandBufferPassesImpl for the full story).
     // Mangled: ?RenderCommandBufferPassesImpl@BSBatchRenderer@@QEAAXHPEAUCommandBufferPassesData@1@I_N@Z
+    using RenderBatches_t = void (*)(void* this_, unsigned int passGroupIdx, bool allowAlpha, unsigned int filter);
+    RenderBatches_t OriginalRenderBatches = nullptr;
+    REL::Relocation<std::uintptr_t> ptr_RenderBatches{ REL::ID{ 1083446, 0 } };
+
     using RenderCommandBufferPassesImpl_t = void (*)(void* this_, int passGroupIdx, void* cbData, unsigned int subIdx, bool allowAlpha);
     RenderCommandBufferPassesImpl_t OriginalRenderCommandBufferPassesImpl = nullptr;
     REL::Relocation<std::uintptr_t> ptr_RenderCommandBufferPassesImpl{ REL::ID{ 1184461, 2318711 } };
@@ -360,7 +367,8 @@ namespace
     // passGroupNext chain calling RenderPassImmediatelySameTechnique for each.
     // Mangled: ?RenderPassImpl@BSBatchRenderer@@QEAAXPEAVBSRenderPass@@I_N@Z
     using RenderPassImpl_t = void (*)(void* this_, BSRenderPassLayout* head, std::uint32_t techniqueID, bool allowAlpha);
-    REL::Relocation<RenderPassImpl_t> RenderPassImpl_fn{ REL::ID{ 1543785, 2318710 } };
+    RenderPassImpl_t OriginalRenderPassImpl = nullptr;
+    REL::Relocation<std::uintptr_t> ptr_RenderPassImpl{ REL::ID{ 1543785, 2318710 } };
 
     // BSShader::BuildCommandBuffer - the chokepoint where command buffers are
     // built per pass. We hook this to inject one extra
@@ -528,6 +536,499 @@ namespace
     void ResetCommandBufferDrawTagWrappers();
     FakeStructuredResource* GetCommandBufferDrawTagWrapper(RE::BSGeometry* geometry, WrapperTag tag);
     bool EnsureDrawTagWrapperResources();
+
+    enum class PassOcclusionDomain : std::uint8_t
+    {
+        None,
+        MainGBuffer,
+        Shadow
+    };
+
+    struct PassOcclusionKey
+    {
+        RE::BSGeometry* geometry;
+        RE::BSShader* shader;
+        RE::BSShaderProperty* shaderProperty;
+        std::uint32_t techniqueID;
+        std::uint32_t group;
+        std::uint32_t viewportSig;
+        PassOcclusionDomain domain;
+
+        bool operator==(const PassOcclusionKey& rhs) const noexcept
+        {
+            return geometry == rhs.geometry &&
+                   shader == rhs.shader &&
+                   shaderProperty == rhs.shaderProperty &&
+                   techniqueID == rhs.techniqueID &&
+                   group == rhs.group &&
+                   viewportSig == rhs.viewportSig &&
+                   domain == rhs.domain;
+        }
+    };
+
+    struct PassOcclusionKeyHash
+    {
+        std::size_t operator()(const PassOcclusionKey& k) const noexcept
+        {
+            std::size_t h = std::hash<void*>{}(k.geometry);
+            auto mix = [&h](std::size_t v) {
+                h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+            };
+            mix(std::hash<void*>{}(k.shader));
+            mix(std::hash<void*>{}(k.shaderProperty));
+            mix(std::hash<std::uint32_t>{}(k.techniqueID));
+            mix(std::hash<std::uint32_t>{}(k.group));
+            mix(std::hash<std::uint32_t>{}(k.viewportSig));
+            mix(std::hash<std::uint8_t>{}(static_cast<std::uint8_t>(k.domain)));
+            return h;
+        }
+    };
+
+    struct PassOcclusionState
+    {
+        REX::W32::ID3D11Query* query = nullptr;
+        bool pending = false;
+        std::uint8_t hiddenStreak = 0;
+        std::uint8_t skippedSinceRefresh = 0;
+        std::uint64_t lastTouchedFrame = 0;
+    };
+
+    struct CameraOcclusionSnapshot
+    {
+        float x = 0.0f;
+        float y = 0.0f;
+        float z = 0.0f;
+        float dx = 0.0f;
+        float dy = 0.0f;
+        float dz = 1.0f;
+    };
+
+    constexpr std::size_t kPassOcclusionMaxEntries = 32768;
+    constexpr std::uint32_t kPassOcclusionMainQueryBudget = 384;
+    constexpr std::uint32_t kPassOcclusionShadowQueryBudget = 192;
+    constexpr std::uint32_t kPassOcclusionMainSkipBudget = 2048;
+    constexpr std::uint32_t kPassOcclusionShadowSkipBudget = 512;
+    constexpr std::uint8_t kPassOcclusionMainHiddenFrames = 2;
+    constexpr std::uint8_t kPassOcclusionShadowHiddenFrames = 3;
+    constexpr std::uint8_t kPassOcclusionMainMaxSkips = 2;
+    constexpr std::uint8_t kPassOcclusionShadowMaxSkips = 1;
+    constexpr std::uint64_t kPassOcclusionStaleFrames = 600;
+    constexpr std::uint32_t kPassOcclusionPrunePeriod = 120;
+
+    std::unordered_map<PassOcclusionKey, PassOcclusionState, PassOcclusionKeyHash> g_passOcclusionCache;
+    std::uint64_t g_passOcclusionFrame = 0;
+    std::uint32_t g_passOcclusionMainQueries = 0;
+    std::uint32_t g_passOcclusionShadowQueries = 0;
+    std::uint32_t g_passOcclusionMainSkips = 0;
+    std::uint32_t g_passOcclusionShadowSkips = 0;
+    bool g_passOcclusionCameraStable = false;
+    bool g_passOcclusionHaveCamera = false;
+    CameraOcclusionSnapshot g_passOcclusionPrevCamera;
+
+    thread_local unsigned int g_renderBatchesGroup = UINT_MAX;
+    thread_local std::uint32_t g_renderBatchesDepth = 0;
+
+    bool IsMainGBufferGroup(unsigned int group)
+    {
+        switch (group) {
+            case 0:
+            case 1:
+            case 4:
+            case 7:
+            case 8:
+            case 9:
+            case 14:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    bool IsStaticGeometryType(std::uint8_t type)
+    {
+        switch (type) {
+            case 3:   // BSTriShape
+            case 5:   // BSMeshLODTriShape / merge-style static geometry
+            case 6:   // BSMultiIndexTriShape
+            case 7:   // static tri variant
+            case 15:  // BSCombinedTriShape / precombined geometry
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    bool IsActorTaggedGeometry(RE::BSGeometry* geometry)
+    {
+        std::shared_lock lock(g_actorDrawTaggedGeometryLock);
+        return g_actorDrawTaggedGeometry.contains(geometry);
+    }
+
+    bool IsGeometryEligibleForPassOcclusion(RE::BSGeometry* geometry, PassOcclusionDomain domain)
+    {
+        if (!geometry || geometry->skinInstance) {
+            return false;
+        }
+        if (!IsStaticGeometryType(geometry->type)) {
+            return false;
+        }
+
+        const float radius = geometry->worldBound.fRadius;
+        if (!(radius > 0.0f) || !std::isfinite(radius)) {
+            return false;
+        }
+
+        const float minRadius = domain == PassOcclusionDomain::Shadow ? 160.0f : 80.0f;
+        const float maxRadius = domain == PassOcclusionDomain::Shadow ? 18000.0f : 24000.0f;
+        if (radius < minRadius || radius > maxRadius) {
+            return false;
+        }
+
+        const auto& c = geometry->worldBound.center;
+        const float dx = c.x - g_customBufferData.camX;
+        const float dy = c.y - g_customBufferData.camY;
+        const float dz = c.z - g_customBufferData.camZ;
+        const float distSq = dx * dx + dy * dy + dz * dz;
+        const float nearLimit = domain == PassOcclusionDomain::Shadow ? 768.0f : 384.0f;
+        if (distSq < nearLimit * nearLimit) {
+            return false;
+        }
+
+        if (IsActorTaggedGeometry(geometry)) {
+            return false;
+        }
+
+        return true;
+    }
+
+    bool IsPassChainEligibleForOcclusion(BSRenderPassLayout* head, bool allowAlpha, PassOcclusionDomain domain)
+    {
+        if (!head || allowAlpha) {
+            return false;
+        }
+
+        unsigned int count = 0;
+        for (auto* pass = head; pass && count < 128; pass = pass->passGroupNext, ++count) {
+            if (!IsGeometryEligibleForPassOcclusion(pass->geometry, domain)) {
+                return false;
+            }
+        }
+        return count > 0 && count < 128;
+    }
+
+    PassOcclusionDomain GetCurrentPassOcclusionDomain(unsigned int group)
+    {
+        const UINT depthTarget = g_currentDepthTargetIndex.load(std::memory_order_relaxed);
+        const bool hasRT = g_currentHasRenderTarget.load(std::memory_order_relaxed);
+
+        if (depthTarget == static_cast<UINT>(MAIN_DEPTHSTENCIL_TARGET) &&
+            hasRT &&
+            PhaseTelemetry::IsInDeferredPrePass() &&
+            IsMainGBufferGroup(group)) {
+            return PassOcclusionDomain::MainGBuffer;
+        }
+
+        if (depthTarget == static_cast<UINT>(DepthStencilTarget::kShadowMap) && !hasRT) {
+            return PassOcclusionDomain::Shadow;
+        }
+
+        return PassOcclusionDomain::None;
+    }
+
+    std::uint32_t CaptureViewportSignature(REX::W32::ID3D11DeviceContext* context, PassOcclusionDomain domain)
+    {
+        if (!context || domain != PassOcclusionDomain::Shadow) {
+            return 0;
+        }
+
+        std::uint32_t count = 1;
+        REX::W32::D3D11_VIEWPORT vp{};
+        context->RSGetViewports(&count, &vp);
+        if (count == 0) {
+            return 0;
+        }
+
+        const auto q = [](float v) -> std::uint32_t {
+            return static_cast<std::uint32_t>((std::max)(0, static_cast<int>(v + 0.5f)));
+        };
+
+        std::uint32_t h = q(vp.topLeftX) & 0x3ffu;
+        h |= (q(vp.topLeftY) & 0x3ffu) << 10;
+        h ^= (q(vp.width) & 0xfffu) << 4;
+        h ^= (q(vp.height) & 0xfffu) << 16;
+        return h;
+    }
+
+    BSRenderPassLayout* GetRenderBatchNodeHead(void* batchRenderer, int group, unsigned int subIdx)
+    {
+        if (!batchRenderer || group < 0 || group >= 32 || subIdx >= 0xFFFFu) {
+            return nullptr;
+        }
+
+        const auto base = reinterpret_cast<std::uintptr_t>(batchRenderer);
+        const auto nodeArray = *reinterpret_cast<std::uintptr_t*>(base + 24ull * static_cast<unsigned int>(group) + 8ull);
+        if (!nodeArray) {
+            return nullptr;
+        }
+
+        const auto node = nodeArray + 16ull * subIdx;
+        return *reinterpret_cast<BSRenderPassLayout**>(node);
+    }
+
+    void ResolvePassOcclusionQuery(REX::W32::ID3D11DeviceContext* context, PassOcclusionState& state)
+    {
+        if (!context || !state.query || !state.pending) {
+            return;
+        }
+
+        std::uint64_t samples = 0;
+        const HRESULT hr = context->GetData(
+            state.query,
+            &samples,
+            sizeof(samples),
+            REX::W32::D3D11_ASYNC_GETDATA_DONOTFLUSH);
+        if (hr != S_OK) {
+            return;
+        }
+
+        state.pending = false;
+        if (samples == 0) {
+            if (state.hiddenStreak < 255) {
+                ++state.hiddenStreak;
+            }
+        } else {
+            state.hiddenStreak = 0;
+            state.skippedSinceRefresh = 0;
+        }
+    }
+
+    PassOcclusionState* FindOrCreatePassOcclusionState(const PassOcclusionKey& key, bool allowCreate)
+    {
+        auto it = g_passOcclusionCache.find(key);
+        if (it != g_passOcclusionCache.end()) {
+            return &it->second;
+        }
+        if (!allowCreate) {
+            return nullptr;
+        }
+        if (g_passOcclusionCache.size() >= kPassOcclusionMaxEntries) {
+            return nullptr;
+        }
+        if (!g_rendererData || !g_rendererData->device) {
+            return nullptr;
+        }
+
+        PassOcclusionState state;
+        REX::W32::D3D11_QUERY_DESC desc{};
+        desc.query = REX::W32::D3D11_QUERY_OCCLUSION;
+        desc.miscFlags = 0;
+        if (FAILED(g_rendererData->device->CreateQuery(&desc, &state.query)) || !state.query) {
+            return nullptr;
+        }
+
+        auto [newIt, inserted] = g_passOcclusionCache.emplace(key, state);
+        if (!inserted) {
+            if (state.query) {
+                state.query->Release();
+            }
+        }
+        return &newIt->second;
+    }
+
+    bool ConsumePassOcclusionSkipBudget(PassOcclusionDomain domain)
+    {
+        if (domain == PassOcclusionDomain::Shadow) {
+            if (g_passOcclusionShadowSkips >= kPassOcclusionShadowSkipBudget) {
+                return false;
+            }
+            ++g_passOcclusionShadowSkips;
+            return true;
+        }
+
+        if (g_passOcclusionMainSkips >= kPassOcclusionMainSkipBudget) {
+            return false;
+        }
+        ++g_passOcclusionMainSkips;
+        return true;
+    }
+
+    bool ConsumePassOcclusionQueryBudget(PassOcclusionDomain domain)
+    {
+        if (domain == PassOcclusionDomain::Shadow) {
+            if (g_passOcclusionShadowQueries >= kPassOcclusionShadowQueryBudget) {
+                return false;
+            }
+            ++g_passOcclusionShadowQueries;
+            return true;
+        }
+
+        if (g_passOcclusionMainQueries >= kPassOcclusionMainQueryBudget) {
+            return false;
+        }
+        ++g_passOcclusionMainQueries;
+        return true;
+    }
+
+    struct PassOcclusionDecision
+    {
+        PassOcclusionState* state = nullptr;
+        PassOcclusionDomain domain = PassOcclusionDomain::None;
+        bool queryActive = false;
+        bool skip = false;
+    };
+
+    PassOcclusionDecision BeginPassOcclusionDecision(
+        REX::W32::ID3D11DeviceContext* context,
+        void* batchRenderer,
+        BSRenderPassLayout* head,
+        unsigned int group,
+        bool allowAlpha)
+    {
+        PassOcclusionDecision decision;
+        if (!context || !batchRenderer || !head || g_renderBatchesDepth == 0) {
+            return decision;
+        }
+
+        const PassOcclusionDomain domain = GetCurrentPassOcclusionDomain(group);
+        if (domain == PassOcclusionDomain::None ||
+            !IsPassChainEligibleForOcclusion(head, allowAlpha, domain)) {
+            return decision;
+        }
+
+        PassOcclusionKey key{
+            head->geometry,
+            head->shader,
+            head->shaderProperty,
+            head->techniqueID,
+            group,
+            CaptureViewportSignature(context, domain),
+            domain
+        };
+
+        bool queryBudgetAlreadyConsumed = false;
+        auto* state = FindOrCreatePassOcclusionState(key, false);
+        if (!state) {
+            if (!ConsumePassOcclusionQueryBudget(domain)) {
+                return decision;
+            }
+            queryBudgetAlreadyConsumed = true;
+            state = FindOrCreatePassOcclusionState(key, true);
+        }
+        if (!state) {
+            return decision;
+        }
+
+        state->lastTouchedFrame = g_passOcclusionFrame;
+        ResolvePassOcclusionQuery(context, *state);
+
+        const std::uint8_t requiredHidden =
+            domain == PassOcclusionDomain::Shadow ? kPassOcclusionShadowHiddenFrames : kPassOcclusionMainHiddenFrames;
+        const std::uint8_t maxSkips =
+            domain == PassOcclusionDomain::Shadow ? kPassOcclusionShadowMaxSkips : kPassOcclusionMainMaxSkips;
+
+        if (g_passOcclusionCameraStable &&
+            state->hiddenStreak >= requiredHidden &&
+            state->skippedSinceRefresh < maxSkips &&
+            ConsumePassOcclusionSkipBudget(domain)) {
+            ++state->skippedSinceRefresh;
+            decision.state = state;
+            decision.domain = domain;
+            decision.skip = true;
+            return decision;
+        }
+
+        state->skippedSinceRefresh = 0;
+        if (!state->pending &&
+            (queryBudgetAlreadyConsumed || ConsumePassOcclusionQueryBudget(domain))) {
+            context->Begin(state->query);
+            decision.queryActive = true;
+        }
+
+        decision.state = state;
+        decision.domain = domain;
+        return decision;
+    }
+
+    void EndPassOcclusionDecision(REX::W32::ID3D11DeviceContext* context, PassOcclusionDecision& decision)
+    {
+        if (!context || !decision.state || !decision.queryActive || !decision.state->query) {
+            return;
+        }
+
+        context->End(decision.state->query);
+        decision.state->pending = true;
+        decision.queryActive = false;
+    }
+
+    void PassOcclusionOnFramePresent()
+    {
+        ++g_passOcclusionFrame;
+        g_passOcclusionMainQueries = 0;
+        g_passOcclusionShadowQueries = 0;
+        g_passOcclusionMainSkips = 0;
+        g_passOcclusionShadowSkips = 0;
+
+        if (!CUSTOMBUFFER_ON ||
+            !std::isfinite(g_customBufferData.camX) ||
+            !std::isfinite(g_customBufferData.camY) ||
+            !std::isfinite(g_customBufferData.camZ) ||
+            !std::isfinite(g_customBufferData.viewDirX) ||
+            !std::isfinite(g_customBufferData.viewDirY) ||
+            !std::isfinite(g_customBufferData.viewDirZ)) {
+            g_passOcclusionCameraStable = false;
+            g_passOcclusionHaveCamera = false;
+            return;
+        }
+
+        CameraOcclusionSnapshot cur{
+            g_customBufferData.camX,
+            g_customBufferData.camY,
+            g_customBufferData.camZ,
+            g_customBufferData.viewDirX,
+            g_customBufferData.viewDirY,
+            g_customBufferData.viewDirZ
+        };
+
+        if (g_passOcclusionHaveCamera) {
+            const float px = cur.x - g_passOcclusionPrevCamera.x;
+            const float py = cur.y - g_passOcclusionPrevCamera.y;
+            const float pz = cur.z - g_passOcclusionPrevCamera.z;
+            const float posSq = px * px + py * py + pz * pz;
+            const float dot = cur.dx * g_passOcclusionPrevCamera.dx +
+                              cur.dy * g_passOcclusionPrevCamera.dy +
+                              cur.dz * g_passOcclusionPrevCamera.dz;
+            g_passOcclusionCameraStable = posSq < 16.0f && dot > 0.9994f;
+        } else {
+            g_passOcclusionCameraStable = false;
+            g_passOcclusionHaveCamera = true;
+        }
+        g_passOcclusionPrevCamera = cur;
+
+        if ((g_passOcclusionFrame % kPassOcclusionPrunePeriod) == 0) {
+            for (auto it = g_passOcclusionCache.begin(); it != g_passOcclusionCache.end();) {
+                if (g_passOcclusionFrame > it->second.lastTouchedFrame &&
+                    g_passOcclusionFrame - it->second.lastTouchedFrame > kPassOcclusionStaleFrames) {
+                    if (it->second.query) {
+                        it->second.query->Release();
+                    }
+                    it = g_passOcclusionCache.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+    }
+
+    void ShutdownPassOcclusionCache()
+    {
+        for (auto& [key, state] : g_passOcclusionCache) {
+            if (state.query) {
+                state.query->Release();
+                state.query = nullptr;
+            }
+        }
+        g_passOcclusionCache.clear();
+    }
 
     void CollectActorDrawTaggedGeometry(RE::NiAVObject* root, std::unordered_set<RE::BSGeometry*>& geometry)
     {
@@ -981,8 +1482,34 @@ namespace
         RefreshActorDrawTaggedGeometry(biped);
     }
 
+    void HookedRenderBatches(void* this_, unsigned int passGroupIdx, bool allowAlpha, unsigned int filter)
+    {
+        const unsigned int prevGroup = g_renderBatchesGroup;
+        ++g_renderBatchesDepth;
+        g_renderBatchesGroup = passGroupIdx;
+        OriginalRenderBatches(this_, passGroupIdx, allowAlpha, filter);
+        g_renderBatchesGroup = prevGroup;
+        --g_renderBatchesDepth;
+    }
+
     void HookedRenderCommandBufferPassesImpl(void* this_, int passGroupIdx, void* cbData, unsigned int subIdx, bool allowAlpha)
     {
+        PhaseTelemetry::OnCommandBufferDraw();
+
+        auto* head = GetRenderBatchNodeHead(this_, passGroupIdx, subIdx);
+        auto decision = BeginPassOcclusionDecision(
+            g_rendererData ? g_rendererData->context : nullptr,
+            this_,
+            head,
+            passGroupIdx >= 0 ? static_cast<unsigned int>(passGroupIdx) : g_renderBatchesGroup,
+            allowAlpha);
+        if (decision.skip) {
+            if (cbData) {
+                reinterpret_cast<std::uint32_t*>(cbData)[16388] = 0xFFFFFFFFu;
+            }
+            return;
+        }
+
         // Per-draw classification for replayed command-buffer draws is handled
         // by the SRV record injected in HookedBuildCommandBuffer. Mark this
         // scope so the lower-level D3D hooks do not overwrite that recorded
@@ -1002,6 +1529,24 @@ namespace
         }
 
         OriginalRenderCommandBufferPassesImpl(this_, passGroupIdx, cbData, subIdx, allowAlpha);
+        EndPassOcclusionDecision(g_rendererData ? g_rendererData->context : nullptr, decision);
+    }
+
+    void HookedRenderPassImpl(void* this_, BSRenderPassLayout* head, std::uint32_t techniqueID, bool allowAlpha)
+    {
+        const unsigned int group = g_renderBatchesGroup;
+        auto decision = BeginPassOcclusionDecision(
+            g_rendererData ? g_rendererData->context : nullptr,
+            this_,
+            head,
+            group,
+            allowAlpha);
+        if (decision.skip) {
+            return;
+        }
+
+        OriginalRenderPassImpl(this_, head, techniqueID, allowAlpha);
+        EndPassOcclusionDecision(g_rendererData ? g_rendererData->context : nullptr, decision);
     }
 
     // Lazy-create the two immutable structured buffers + SRVs and wire them
@@ -1249,6 +1794,11 @@ void ClearActorDrawTaggedGeometry_Internal()
     g_actorDrawTaggedGeometryByRef.clear();
     g_actorHeadDrawTaggedGeometryByRef.clear();
     ResetCommandBufferDrawTagWrappers();
+}
+
+void ShutdownPassOcclusionCache_Internal()
+{
+    ShutdownPassOcclusionCache();
 }
 
 void ReleaseDrawTagBuffers_Internal()
@@ -1649,11 +2199,12 @@ static std::string g_shaderSettingsSaveMessage;
 
 static void SaveShaderSettingsWithFeedback()
 {
-    std::string errorMessage;
-    g_shaderSettingsSaveSucceeded = g_shaderSettings.SaveSettings(&errorMessage);
+    std::string shaderError;
+    const bool shaderSaved = g_shaderSettings.SaveSettings(&shaderError);
+    g_shaderSettingsSaveSucceeded = shaderSaved;
     g_shaderSettingsSaveMessage = g_shaderSettingsSaveSucceeded ?
         "Shader settings saved successfully." :
-        "Failed to save shader settings: " + errorMessage;
+        "Failed to save settings: " + shaderError;
     g_shaderSettingsSaveModalRequested = true;
 }
 
@@ -1809,6 +2360,7 @@ HRESULT STDMETHODCALLTYPE MyPresent(
     if (CUSTOMBUFFER_ON) {
         UpdateCustomBuffer_Internal();
     }
+    PassOcclusionOnFramePresent();
     // Custom-pass per-frame work: allocate resources, run any AtPresent passes,
     // ping-pong, advance frame counter. Done after the booster CB update so
     // GFXInjected[0] is fresh for any AtPresent pass.
@@ -1890,7 +2442,22 @@ void STDMETHODCALLTYPE MyOMSetRenderTargets(
 {
     OriginalOMSetRenderTargets(This, NumViews, ppRenderTargetViews, pDepthStencilView);
 
-    if (FindDepthTargetIndexForDSV(pDepthStencilView) == static_cast<UINT>(MAIN_DEPTHSTENCIL_TARGET)) {
+    bool hasRT = false;
+    if (ppRenderTargetViews) {
+        for (UINT i = 0; i < NumViews; ++i) {
+            if (ppRenderTargetViews[i]) {
+                hasRT = true;
+                break;
+            }
+        }
+    }
+
+    const UINT depthTarget = FindDepthTargetIndexForDSV(pDepthStencilView);
+    g_currentDepthTargetIndex.store(depthTarget, std::memory_order_relaxed);
+    g_currentRenderTargetCount.store(NumViews, std::memory_order_relaxed);
+    g_currentHasRenderTarget.store(hasRT, std::memory_order_relaxed);
+
+    if (depthTarget == static_cast<UINT>(MAIN_DEPTHSTENCIL_TARGET)) {
         g_lastSceneDepthSRV = GetMainDepthSRV();
     }
 }
@@ -1907,6 +2474,7 @@ void STDMETHODCALLTYPE MyDrawIndexed(
     UINT StartIndexLocation,
     INT BaseVertexLocation)
 {
+    PhaseTelemetry::OnD3DDraw();
     BindDrawTagForCurrentDraw(This);
     // BeforeDrawForMatchedDef custom passes fire here, when the engine has
     // fully set up the pipeline for the upcoming draw. State is fresh.
@@ -1926,6 +2494,7 @@ void STDMETHODCALLTYPE MyDraw(
     UINT VertexCount,
     UINT StartVertexLocation)
 {
+    PhaseTelemetry::OnD3DDraw();
     BindDrawTagForCurrentDraw(This);
     if (CustomPass::g_registry.OnBeforeDraw(This, "d3d11-Draw") && g_activeReplacementPixelShader) {
         BindInjectedPixelShaderResources(This);
@@ -1949,6 +2518,7 @@ void STDMETHODCALLTYPE MyDrawIndexedInstanced(
     INT BaseVertexLocation,
     UINT StartInstanceLocation)
 {
+    PhaseTelemetry::OnD3DDraw();
     BindDrawTagForCurrentDraw(This);
     if (CustomPass::g_registry.OnBeforeDraw(This, "d3d11-DrawIndexedInstanced") && g_activeReplacementPixelShader) {
         BindInjectedPixelShaderResources(This);
@@ -1970,6 +2540,7 @@ void STDMETHODCALLTYPE MyDrawInstanced(
     UINT StartVertexLocation,
     UINT StartInstanceLocation)
 {
+    PhaseTelemetry::OnD3DDraw();
     BindDrawTagForCurrentDraw(This);
     if (CustomPass::g_registry.OnBeforeDraw(This, "d3d11-DrawInstanced") && g_activeReplacementPixelShader) {
         BindInjectedPixelShaderResources(This);
@@ -2926,6 +3497,7 @@ void UIDrawShaderSettingsOverlay() {
         SaveShaderSettingsWithFeedback();
     }
     ImGui::Separator();
+
     static std::string editingValueId;
     static bool focusEditInput = false;
 
@@ -4418,7 +4990,9 @@ bool InstallDrawTaggingHooks_Internal()
         OriginalPlayerCharacterOnHeadInitialized &&
         OriginalUpdate3DModel &&
         OriginalReset3D &&
+        OriginalRenderBatches &&
         OriginalRenderCommandBufferPassesImpl &&
+        OriginalRenderPassImpl &&
         OriginalBuildCommandBuffer &&
         OriginalReplaceHeadTaskRun &&
         OriginalBSLightTestFrustumCull &&
@@ -4493,6 +5067,27 @@ bool InstallDrawTaggingHooks_Internal()
         REX::INFO("InstallDrawTaggingHooks_Internal: BSBatchRenderer::Draw hook installed");
     }
 
+    if (!OriginalRenderBatches) {
+        if (ptr_RenderBatches.address() < 0x140000000ull) {
+            REX::WARN("InstallDrawTaggingHooks_Internal: BSBatchRenderer::RenderBatches REL::ID failed to resolve");
+            return false;
+        }
+        // IDA OG 0x14287F380: 5 + 4 + 1 + 4 bytes reaches a clean boundary
+        // after `sub rsp, 60h`, exactly enough for the JMP14 patch.
+        constexpr std::size_t kRenderBatchesPrologueSize = 14;
+        OriginalRenderBatches = CreateBranchGateway<RenderBatches_t>(
+            ptr_RenderBatches,
+            kRenderBatchesPrologueSize,
+            reinterpret_cast<void*>(&HookedRenderBatches));
+
+        if (!OriginalRenderBatches) {
+            REX::WARN("InstallDrawTaggingHooks_Internal: Failed to install BSBatchRenderer::RenderBatches hook");
+            return false;
+        }
+
+        REX::INFO("InstallDrawTaggingHooks_Internal: BSBatchRenderer::RenderBatches hook installed");
+    }
+
     if (!OriginalRenderCommandBufferPassesImpl) {
         constexpr std::size_t kRenderCmdBufPrologueSize = 15;
         OriginalRenderCommandBufferPassesImpl = CreateBranchGateway<RenderCommandBufferPassesImpl_t>(ptr_RenderCommandBufferPassesImpl, kRenderCmdBufPrologueSize, reinterpret_cast<void*>(&HookedRenderCommandBufferPassesImpl));
@@ -4503,6 +5098,23 @@ bool InstallDrawTaggingHooks_Internal()
         }
 
         REX::INFO("InstallDrawTaggingHooks_Internal: BSBatchRenderer::RenderCommandBufferPassesImpl hook installed");
+    }
+
+    if (!OriginalRenderPassImpl) {
+        // IDA OG 0x142880030: clean 16-byte boundary after
+        // `mov rbx, rdx`; the first 14 bytes would split that instruction.
+        constexpr std::size_t kRenderPassImplPrologueSize = 16;
+        OriginalRenderPassImpl = CreateBranchGateway<RenderPassImpl_t>(
+            ptr_RenderPassImpl,
+            kRenderPassImplPrologueSize,
+            reinterpret_cast<void*>(&HookedRenderPassImpl));
+
+        if (!OriginalRenderPassImpl) {
+            REX::WARN("InstallDrawTaggingHooks_Internal: Failed to install BSBatchRenderer::RenderPassImpl hook");
+            return false;
+        }
+
+        REX::INFO("InstallDrawTaggingHooks_Internal: BSBatchRenderer::RenderPassImpl hook installed");
     }
 
     if (!OriginalBuildCommandBuffer) {

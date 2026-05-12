@@ -785,6 +785,7 @@ void DumpOriginalShader_Internal(ShaderDBEntry const& entry, ShaderDefinition* d
 REX::W32::ID3D11ShaderResourceView* GetDepthBufferSRV_Internal();
 void ClearActorDrawTaggedGeometry_Internal();
 void ReleaseDrawTagBuffers_Internal();
+void ShutdownPassOcclusionCache_Internal();
 bool InstallGFXHooks_Internal();
 bool InstallShaderCreationHooks_Internal();
 bool InstallDrawTaggingHooks_Internal();

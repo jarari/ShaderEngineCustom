@@ -49,11 +49,28 @@ enum class Mode {
 
 extern std::atomic<Mode> g_mode;
 
+// Force-install the DrawWorld wrappers even when telemetry logging is off.
+// Rendering-side features use these wrappers as cheap phase context only.
+void RequireHooks();
+
+// Cheap render-thread phase predicates used by renderer hooks.
+bool IsInRenderPreUI();
+bool IsInDeferredPrePass();
+
 // Called from Plugin.cpp's HookedBSBatchRendererDraw. Cheap when mode==Off
 // (single relaxed atomic load + branch). Attributes a draw to the currently
 // active sub-phase bucket (or to the Frame total if just inside Render_PreUI
 // but outside any tracked sub-phase).
 void OnDraw();
+
+// Called from the D3D11 immediate-context Draw* hooks. This is the ground-truth
+// API draw-call counter; OnDraw is the higher-level BSBatchRenderer counter.
+void OnD3DDraw();
+
+// Called from BSBatchRenderer::RenderCommandBufferPassesImpl. This captures
+// Bethesda's pre-recorded command-buffer draw path, which bypasses
+// BSBatchRenderer::Draw and may also bypass our immediate-context hooks.
+void OnCommandBufferDraw();
 
 // Install the DrawWorld:: hooks. Hooks are installed if PHASE_TELEMETRY_MODE is
 // `on` OR if any piggy-back consumer (LightSorter) is enabled — see
