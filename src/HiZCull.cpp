@@ -3,14 +3,16 @@
 
 #include <Global.h>
 #include <Plugin.h>
+#include <RenderTargets.h>
 
 #include <d3d11.h>
 
 #include <chrono>
 #include <cstring>
+#include <limits>
 
 // =============================================================================
-// HiZCull — Hi-Z-based occlusion culling.
+// HiZCull ??Hi-Z-based occlusion culling.
 //
 // Architecture (single-file; details in HiZCull.h).
 //
@@ -29,32 +31,32 @@
 //     2. Dispatch the Hi-Z build CS: reads g_depthSRV (the engine's main
 //        depth as an SRV), linearises depth via near/far, writes max-reduced
 //        view-space depth to s_hiZTex (64x36 R32_FLOAT UAV).
-//     3. `CopyResource` Hi-Z → staging[ring]. Readback is *deferred by one
+//     3. `CopyResource` Hi-Z ??staging[ring]. Readback is *deferred by one
 //        frame* (we map staging[ring^1] which holds the previous-frame Hi-Z).
 //        This avoids a CPU/GPU stall.
-//     4. Map the *previous* frame's staging buffer into a CPU-side mip
-//        pyramid (s_cpuMips). Build downward mips with max() reduction.
-//     5. Snapshot the world-to-clip matrix from g_customBufferData.g_ViewProj
-//        rows (computed by the plugin's existing render hook) plus the live
-//        world camera's near/far from NiCamera::viewFrustum at +0x160.
+//     4. Capture the camera metadata that matches the depth history currently
+//        in the engine depth target, then copy Hi-Z into staging[ring].
+//     5. Map the previous staging buffer into a CPU-side mip pyramid. The
+//        snapshot inherits that staging slot's camera metadata, not the current
+//        frame camera. This is critical under TAA/DLSS jitter and camera motion.
 //     6. Atomic-flip the double-buffered snapshot so OnVisible workers see
 //        the new data.
 //
 //   On HookedOnVisible(self, cullProc)
-//     Mode::Off    — should not be reachable (vtable patch only installed
+//     Mode::Off    ??should not be reachable (vtable patch only installed
 //                    when mode != Off).  Defensive: passthrough.
-//     Mode::Measure — read snapshot, compute would-cull decision, increment
+//     Mode::Measure ??read snapshot, compute would-cull decision, increment
 //                    counters, ALWAYS call the original.
-//     Mode::Cull   — same compute, but if occluded, return without calling
+//     Mode::Cull   ??same compute, but if occluded, return without calling
 //                    the original (geometry not enrolled into pass lists).
 //
 // Hi-Z value semantics
 //   The depth buffer holds NDC z in [0, 1] (1 = far). After linearization we
 //   store *view-space distance* in world units (positive, larger = farther
-//   from camera) — a single max() reduction puts the "farthest visible
+//   from camera) ??a single max() reduction puts the "farthest visible
 //   surface in the region" in the Hi-Z. Per-object: project bound center to
 //   view space, subtract radius (closest point), compare against sampled
-//   max(). If sphereNearestViewDepth > sampledMaxViewDepth → occluded.
+//   max(). If sphereNearestViewDepth > sampledMaxViewDepth ??occluded.
 //
 // What ISN'T here in v1 (see HiZCull.h):
 //   - BSCullingGroup::Process / BSCuller-arena path
@@ -73,13 +75,13 @@ namespace {
 // --- Engine references (resolved via CommonLibF4 REL::ID address library) ----
 //
 // We patch *every* vtable in the BSGeometry hierarchy whose slot 55 inherits
-// BSGeometry::OnVisible — i.e. subclasses that did not override. Patching
+// BSGeometry::OnVisible ??i.e. subclasses that did not override. Patching
 // only BSGeometry's own vtable would miss every BSTriShape / BSCombinedTriShape
-// instance (which is the bulk of world geometry — direct BSGeometry instances
+// instance (which is the bulk of world geometry ??direct BSGeometry instances
 // are rare). For each candidate vtable we first verify slot 55 currently
 // resolves to BSGeometry::OnVisible; if a subclass overrides (BSSegmented,
 // BSLODMultiIndex, BSMergeInstanced, BSMeshLOD, BSMultiStreamInstance) we
-// skip it cleanly — those have their own visibility logic that we'd corrupt
+// skip it cleanly ??those have their own visibility logic that we'd corrupt
 // by replacing it with a generic Hi-Z test.
 //
 // REL::IDs (OG 1.10.163, vtables from RE::VTABLE; offsets cross-checked vs
@@ -92,7 +94,7 @@ namespace {
 //   BSGeometry::OnVisible REL::ID  =  844915  (fn @ 0x141BB11E0; AE 0x16D5200)
 //   World camera NiCamera* global  =   81406  (OG @ 0x146723240)
 //
-// OnVisible vtable slot index — CommonLibF4's NiAVObject.h annotates it as
+// OnVisible vtable slot index ??CommonLibF4's NiAVObject.h annotates it as
 // `// 39` (HEX). 0x39 = 57 decimal. Empirically verified by reading
 // *(uintptr_t*)(0x142E161D8 + 57*8) == 0x141BB11E0 (= BSGeometry::OnVisible).
 // (An earlier draft used slot 55 based on a misread of Ghidra's
@@ -109,6 +111,11 @@ namespace {
 constexpr std::size_t kOnVisibleVtableSlot    = 57;   // NiAVObject_vtbl::OnVisible (CommonLibF4 // 39 hex)
 constexpr std::size_t kNiCamera_viewFrustumOff = 0x160;
 constexpr std::size_t kNiAVObject_worldBoundOff = 0xB0;
+constexpr std::size_t kBSShaderAccumulator_firstPersonOff = 0xB0;
+constexpr std::size_t kNiAVObject_worldTranslateOff = 0xA0;
+constexpr std::size_t kNiAVObject_previousWorldTranslateOff = 0xF0;
+constexpr std::size_t kBSGeometry_property0Off = 0x130;
+constexpr std::size_t kBSShaderProperty_flagsOff = 0x30;
 
 struct VtableTarget {
     REL::ID     id;
@@ -133,7 +140,7 @@ std::uintptr_t s_worldCameraGlobalAddr        = 0;
 // Why this hook in addition to OnVisible:
 //   Empirically, Boston gameplay shows HookedOnVisible never fires (0 calls/s
 //   over 60 fps). All world geometry enrolment routes through the
-//   BSCullingGroup arena path — `AccumulatePassesFromArena` dispatches
+//   BSCullingGroup arena path ??`AccumulatePassesFromArena` dispatches
 //   `accumulator->vtable[+0x168](accumulator, geometry)`, which on
 //   `BSShaderAccumulator` is `RegisterObject` (REL::ID 1447420, OG 0x14282CED0).
 //
@@ -145,22 +152,22 @@ std::uintptr_t s_worldCameraGlobalAddr        = 0;
 // Signature: `bool RegisterObject(BSShaderAccumulator* self, BSGeometry* geom)`.
 //   Returns bool. The single observed call site (AccumulatePassesFromArena)
 //   ignores the return value, so we can safely return `false` for the
-//   "occluded → skipped" case without engine-visible side effects.
+//   "occluded ??skipped" case without engine-visible side effects.
 constexpr std::size_t kRegisterObjectVtableSlot = 45;   // 0x168 / 8
 
 using RegisterObjectFn = bool (*)(void* self, void* geom);
 RegisterObjectFn s_origRegisterObject = nullptr;
 bool             s_accumPatched       = false;
 
-// Hi-Z target size: small enough to readback cheaply, large enough to keep
-// per-object screen-space AABB sampling above 1 texel for medium objects.
-// 64x36 = 64*36*4 = 9 KB per frame, ~15 µs PCIe readback.
-constexpr int kHiZWidth   = 64;
-constexpr int kHiZHeight  = 36;
-constexpr int kHiZMipLevels = 6;  // 64x36, 32x18, 16x9, 8x4, 4x2, 2x1
+// Hi-Z target size: high enough to keep Boston's fragmented occluders useful,
+// still small enough for cheap deferred CPU readback.
+// 256x144 = 144 KB per frame for mip 0.
+constexpr int kHiZWidth   = 256;
+constexpr int kHiZHeight  = 144;
+constexpr int kHiZMipLevels = 8;  // 256x144, 128x72, 64x36, 32x18, 16x9, 8x4, 4x2, 2x1
 
-// Staging ring size — readback is deferred by (kReadbackRing - 1) frames.
-// 2 buffers → 1 frame delay → Hi-Z is from 2 frames ago by the time we cull
+// Staging ring size ??readback is deferred by (kReadbackRing - 1) frames.
+// 2 buffers ??1 frame delay ??Hi-Z is from 2 frames ago by the time we cull
 // against it. Acceptable for gameplay; cinematic cuts may need invalidation.
 constexpr std::size_t kReadbackRing = 2;
 
@@ -183,6 +190,7 @@ bool                         s_stagingPrimed[kReadbackRing] = {};   // has valid
 int                          s_ringWriteIndex = 0;                   // next staging to write
 int                          s_renderW = 0;                          // last seen render width
 int                          s_renderH = 0;                          // last seen render height
+std::atomic<int>             s_depthMode{ 0 };                       // 0=forward-Z, 1=reverse-Z
 
 // --- CPU-side snapshot (double-buffered) ------------------------------------
 
@@ -194,9 +202,10 @@ struct CpuMip {
 
 struct Snapshot {
     bool   valid = false;
+    bool   temporalSafe = false;
     // (Camera-relative-world)-to-clip rows, read live at MainAccum entry from
     // BSGraphics::State.camViewData.viewProjMat. Engine builds these as
-    // (rotation-only view) × proj — so input must be (world - cam_origin) and
+    // (rotation-only view) 횞 proj ??so input must be (world - cam_origin) and
     // cam_origin must be the engine's posAdjust (NOT cameraRoot.world.t).
     // Convention: HLSL `mul(camRelativePos, viewProj)`,
     //   clip = camRel.x*r0 + camRel.y*r1 + camRel.z*r2 + 1*r3.
@@ -219,18 +228,40 @@ struct Snapshot {
     // For logging.
     int    sourceW = 0;
     int    sourceH = 0;
+    int    cameraSource = 0;
+    float  hizMin = 0.0f;
+    float  hizMax = 0.0f;
+    float  hizAvg = 0.0f;
+    float  hizZeroPct = 0.0f;
+};
+
+struct CameraMeta {
+    bool  valid = false;
+    float vp_r0[4]{};
+    float vp_r1[4]{};
+    float vp_r2[4]{};
+    float vp_r3[4]{};
+    float near_plane = 0.1f;
+    float far_plane = 1.0f;
+    float near_times_far = 0.1f;
+    float far_minus_near = 0.9f;
+    float cam_origin[3]{};
+    int   source = 0;
 };
 
 Snapshot         s_snapshots[2];
 std::atomic<int> s_currentSnapshot{ -1 };  // index of the snapshot OnVisible should read; -1 = none ready
 std::atomic<std::uint64_t> s_frame{ 0 };
+CameraMeta       s_stagingMeta[kReadbackRing];
 
 // "Currently inside DrawWorld::MainAccum." Set true by OnMainAccumEnter,
 // false by OnMainAccumExit. HookedOnVisible only consults the Hi-Z when this
-// is true — shadow path / 3D UI / refraction OnVisible calls all happen
+// is true ??shadow path / 3D UI / refraction OnVisible calls all happen
 // outside MainAccum, against a camera that isn't the snapshot's world camera,
 // and would mis-cull if we applied the world Hi-Z to them.
 std::atomic<bool> s_inMainAccum{ false };
+std::atomic<unsigned> s_invalidateFrames{ 0 };
+std::atomic<bool> s_forcePassthroughThisFrame{ false };
 
 // --- Stats -----------------------------------------------------------------
 
@@ -245,6 +276,11 @@ struct Stats {
     std::atomic<std::uint64_t> snapshotMissing{ 0 };
     std::atomic<std::uint64_t> nearPlanePassthrough{ 0 };
     std::atomic<std::uint64_t> offscreenSkipped{ 0 };
+    std::atomic<std::uint64_t> firstPersonPassthrough{ 0 };
+    std::atomic<std::uint64_t> temporalPassthrough{ 0 };
+    std::atomic<std::uint64_t> largeFootprintPassthrough{ 0 };
+    std::atomic<std::uint64_t> badDepthPassthrough{ 0 };
+    std::atomic<std::uint64_t> candidatePassthrough{ 0 };
     std::atomic<std::uint64_t> wouldCullByHiZ{ 0 };
     std::atomic<std::uint64_t> notCulledByHiZ{ 0 };
     std::atomic<std::uint64_t> cullActuallySkipped{ 0 };
@@ -254,7 +290,10 @@ struct Stats {
         onVisHookCalls.store(0); onVisInMainAccum.store(0);
         regObjHookCalls.store(0); regObjInMainAccum.store(0);
         snapshotMissing.store(0); nearPlanePassthrough.store(0);
-        offscreenSkipped.store(0); wouldCullByHiZ.store(0); notCulledByHiZ.store(0);
+        offscreenSkipped.store(0); firstPersonPassthrough.store(0);
+        temporalPassthrough.store(0); largeFootprintPassthrough.store(0);
+        badDepthPassthrough.store(0); candidatePassthrough.store(0);
+        wouldCullByHiZ.store(0); notCulledByHiZ.store(0);
         cullActuallySkipped.store(0);
         mainAccumEnters.store(0);
     }
@@ -266,14 +305,15 @@ std::chrono::steady_clock::time_point s_lastLogTime;
 
 // --- HLSL: Hi-Z build compute shader ----------------------------------------
 //
-// One thread per Hi-Z output texel. Each thread reads a sourceW/HiZW × sourceH/HiZH
+// One thread per Hi-Z output texel. Each thread reads a sourceW/HiZW 횞 sourceH/HiZH
 // tile of the engine depth (typed SRV viewing the D24S8 depth as R24_UNORM_X8),
 // linearises each sample to view-space distance, and writes the max to UAV.
 //
 // We use a constant buffer (b0):
 //   uint  srcWidth, srcHeight, dstWidth, dstHeight;
 //   float nearPlane, farPlane;
-//   float pad0, pad1;
+//   uint  depthMode; // 0=forward-Z, 1=reverse-Z
+//   float pad1;
 //
 // The depth SRV format depends on what the engine bound. The engine's
 // g_depthSRV is created with format DXGI_FORMAT_R24_UNORM_X8_TYPELESS, so
@@ -289,7 +329,7 @@ cbuffer Params : register(b0) {
     uint  g_DstHeight;
     float g_Near;
     float g_Far;
-    float g_Pad0;
+    uint  g_DepthMode;
     float g_Pad1;
 };
 
@@ -298,10 +338,11 @@ RWTexture2D<float> g_HiZ  : register(u0);   // small linear-view-depth target
 
 float LinearizeDepth(float d)
 {
-    // D3D11 reverse-or-forward independent: assume forward Z (0=near, 1=far)
-    // matching what RenderDoc observed in boston.rdc (depth ~0.97 for distant).
-    // viewZ = nearFar / (far - d * (far - near))
-    float denom = g_Far - d * (g_Far - g_Near);
+    // Forward Z: 0=near, 1=far.
+    // Reverse Z: 1=near, 0=far.
+    float denom = (g_DepthMode == 0)
+        ? (g_Far - d * (g_Far - g_Near))
+        : (g_Near + d * (g_Far - g_Near));
     return (g_Near * g_Far) / max(denom, 1e-6f);
 }
 
@@ -320,8 +361,6 @@ void main(uint3 tid : SV_DispatchThreadID)
     for (uint y = y0; y < y1; ++y) {
         for (uint x = x0; x < x1; ++x) {
             float d = g_Depth.Load(int3(x, y, 0));
-            // Skip "no surface" sentinel (depth == 1.0 with no geometry written
-            // is treated as "far" → useful for occlusion, so we include it).
             float lin = LinearizeDepth(d);
             maxLinear = max(maxLinear, lin);
         }
@@ -359,6 +398,85 @@ inline bool ReadNiFrustum(void* cam, float& near_p, float& far_p) noexcept {
     return true;
 }
 
+inline bool RowsLookValid(const float rows[4][4]) noexcept
+{
+    float sum = 0.0f;
+    for (int r = 0; r < 4; ++r) {
+        for (int c = 0; c < 4; ++c) {
+            const float v = rows[r][c];
+            if (!std::isfinite(v)) return false;
+            sum += std::abs(v);
+        }
+    }
+    return sum > 1.0e-4f;
+}
+
+inline void StoreRows(const __m128* src, float outRows[4][4]) noexcept
+{
+    DirectX::XMFLOAT4X4 m;
+    DirectX::XMStoreFloat4x4(&m, DirectX::XMMATRIX(src[0], src[1], src[2], src[3]));
+    std::memcpy(outRows, m.m, sizeof(float) * 16);
+}
+
+inline void StoreCustomBufferRows(float outRows[4][4]) noexcept
+{
+    const DirectX::XMFLOAT4 rows[4] = {
+        g_customBufferData.g_ViewProjRow0,
+        g_customBufferData.g_ViewProjRow1,
+        g_customBufferData.g_ViewProjRow2,
+        g_customBufferData.g_ViewProjRow3,
+    };
+    std::memcpy(outRows, rows, sizeof(rows));
+}
+
+inline void CopyMetaToSnapshot(Snapshot& dst, const CameraMeta& meta) noexcept
+{
+    std::memcpy(dst.vp_r0, meta.vp_r0, sizeof(float) * 4);
+    std::memcpy(dst.vp_r1, meta.vp_r1, sizeof(float) * 4);
+    std::memcpy(dst.vp_r2, meta.vp_r2, sizeof(float) * 4);
+    std::memcpy(dst.vp_r3, meta.vp_r3, sizeof(float) * 4);
+    dst.near_plane = meta.near_plane;
+    dst.far_plane = meta.far_plane;
+    dst.near_times_far = meta.near_times_far;
+    dst.far_minus_near = meta.far_minus_near;
+    dst.cam_origin[0] = meta.cam_origin[0];
+    dst.cam_origin[1] = meta.cam_origin[1];
+    dst.cam_origin[2] = meta.cam_origin[2];
+    dst.cameraSource = meta.source;
+}
+
+inline void ClearSnapshotMips(Snapshot& dst)
+{
+    for (auto& mip : dst.mips) {
+        mip.width = 0;
+        mip.height = 0;
+        mip.pixels.clear();
+    }
+}
+
+inline const RE::BSGraphics::CameraStateData* SelectWorldCameraState(
+    RE::BSGraphics::State& state,
+    int* outSource = nullptr,
+    std::size_t* outCacheSize = nullptr,
+    const void** outWorldCam = nullptr,
+    const void** outMatchedRefCam = nullptr) noexcept
+{
+    if (outCacheSize) *outCacheSize = state.cameraDataCache.size();
+    if (const auto* worldCam = RE::Main::WorldRootCamera()) {
+        if (outWorldCam) *outWorldCam = worldCam;
+        for (const auto& cached : state.cameraDataCache) {
+            if (cached.referenceCamera == worldCam) {
+                if (outSource) *outSource = 1;
+                if (outMatchedRefCam) *outMatchedRefCam = cached.referenceCamera;
+                return std::addressof(cached);
+            }
+        }
+    }
+    if (outSource) *outSource = 2;
+    if (outMatchedRefCam) *outMatchedRefCam = state.cameraState.referenceCamera;
+    return std::addressof(state.cameraState);
+}
+
 // Read the world camera's live ViewProj + posAdjust from BSGraphics::State.
 //
 // Why "live" and not g_customBufferData.g_ViewProjRow*: Plugin.cpp's
@@ -384,22 +502,9 @@ inline bool ReadLiveCameraVPAndOrigin(float outRows[4][4],
                                       const void** outMatchedRefCam = nullptr) noexcept
 {
     auto state = RE::BSGraphics::State::GetSingleton();
-    if (outCacheSize) *outCacheSize = state.cameraDataCache.size();
-    const RE::BSGraphics::CameraStateData* csd = nullptr;
-    int source = 0;  // 0=none, 1=cache match, 2=fallback singleton
-    if (const auto* worldCam = RE::Main::WorldRootCamera()) {
-        if (outWorldCam) *outWorldCam = worldCam;
-        for (const auto& cached : state.cameraDataCache) {
-            if (cached.referenceCamera == worldCam) {
-                csd = std::addressof(cached);
-                source = 1;
-                if (outMatchedRefCam) *outMatchedRefCam = cached.referenceCamera;
-                break;
-            }
-        }
-    }
-    if (!csd) { csd = std::addressof(state.cameraState); source = 2;
-                if (outMatchedRefCam) *outMatchedRefCam = csd->referenceCamera; }
+    int source = 0;
+    const auto* csd = SelectWorldCameraState(state, &source, outCacheSize,
+                                             outWorldCam, outMatchedRefCam);
     if (outSource) *outSource = source;
 
     // Use viewProjUnjittered (+0x110), NOT viewProjMat (+0xD0). The latter is
@@ -425,9 +530,134 @@ inline bool ReadLiveCameraVPAndOrigin(float outRows[4][4],
     return !allZero;
 }
 
+// Capture the camera metadata that matches the depth buffer available at
+// MainAccum entry. That depth target was produced by an earlier rendered frame,
+// so current-frame live matrices are the wrong space for the Hi-Z readback.
+// Prefer the plugin's frame-end jittered ViewProj rows (they match the actual
+// rasterized depth, including DLSS/TAA jitter); fall back to CommonLib's
+// previous unjittered matrix if the custom buffer has not been populated yet.
+inline bool CaptureDepthHistoryCameraMeta(CameraMeta& out) noexcept
+{
+    out = {};
+
+    auto state = RE::BSGraphics::State::GetSingleton();
+    int srcPath = 0;
+    std::size_t cacheSz = 0;
+    const void* worldCamPtr = nullptr;
+    const void* matchedRefCam = nullptr;
+    const auto* csd = SelectWorldCameraState(state, &srcPath, &cacheSz,
+                                             &worldCamPtr, &matchedRefCam);
+    if (!csd) return false;
+
+    float rows[4][4]{};
+    StoreCustomBufferRows(rows);
+    int source = 10; // plugin frame-end jittered VP, best match for depth history
+    if (!RowsLookValid(rows)) {
+        StoreRows(csd->camViewData.previousViewProjUnjittered, rows);
+        source = 20; // engine previous unjittered VP fallback
+        if (!RowsLookValid(rows)) {
+            StoreRows(csd->camViewData.viewProjUnjittered, rows);
+            source = 21; // last-resort current unjittered VP
+            if (!RowsLookValid(rows)) {
+                return false;
+            }
+        }
+    }
+
+    std::memcpy(out.vp_r0, rows[0], sizeof(float) * 4);
+    std::memcpy(out.vp_r1, rows[1], sizeof(float) * 4);
+    std::memcpy(out.vp_r2, rows[2], sizeof(float) * 4);
+    std::memcpy(out.vp_r3, rows[3], sizeof(float) * 4);
+
+    out.cam_origin[0] = csd->previousPosAdjust.x;
+    out.cam_origin[1] = csd->previousPosAdjust.y;
+    out.cam_origin[2] = csd->previousPosAdjust.z;
+
+    void* cam = ReadWorldCamera();
+    float nearP = 0.0f, farP = 0.0f;
+    if (!ReadNiFrustum(cam, nearP, farP)) {
+        return false;
+    }
+    out.near_plane = nearP;
+    out.far_plane = farP;
+    out.near_times_far = nearP * farP;
+    out.far_minus_near = farP - nearP;
+    out.source = source;
+    out.valid = true;
+
+    static std::atomic<bool> s_loggedFirstHistorySource{ false };
+    if (!s_loggedFirstHistorySource.exchange(true, std::memory_order_relaxed)) {
+        REX::INFO("HiZCull: first depth-history camera source={} (10=custom jittered, "
+                  "20=prev unjittered, 21=current fallback), worldState={} "
+                  "(1=cache match, 2=fallback), cacheSize={}, worldCam={:#x}, "
+                  "matchedRefCam={:#x}",
+                  source, srcPath, cacheSz,
+                  reinterpret_cast<std::uintptr_t>(worldCamPtr),
+                  reinterpret_cast<std::uintptr_t>(matchedRefCam));
+    }
+
+    return true;
+}
+
+inline bool CaptureRenderedDepthCameraMeta(CameraMeta& out, int source) noexcept
+{
+    out = {};
+
+    auto state = RE::BSGraphics::State::GetSingleton();
+    int srcPath = 0;
+    std::size_t cacheSz = 0;
+    const void* worldCamPtr = nullptr;
+    const void* matchedRefCam = nullptr;
+    const auto* csd = SelectWorldCameraState(state, &srcPath, &cacheSz,
+                                             &worldCamPtr, &matchedRefCam);
+    if (!csd) return false;
+
+    float rows[4][4]{};
+    StoreRows(csd->camViewData.viewProjMat, rows);
+    if (!RowsLookValid(rows)) {
+        StoreRows(csd->camViewData.viewProjUnjittered, rows);
+        if (!RowsLookValid(rows)) {
+            return false;
+        }
+    }
+
+    std::memcpy(out.vp_r0, rows[0], sizeof(float) * 4);
+    std::memcpy(out.vp_r1, rows[1], sizeof(float) * 4);
+    std::memcpy(out.vp_r2, rows[2], sizeof(float) * 4);
+    std::memcpy(out.vp_r3, rows[3], sizeof(float) * 4);
+
+    out.cam_origin[0] = csd->posAdjust.x;
+    out.cam_origin[1] = csd->posAdjust.y;
+    out.cam_origin[2] = csd->posAdjust.z;
+
+    float nearP = 0.0f, farP = 0.0f;
+    if (!ReadNiFrustum(ReadWorldCamera(), nearP, farP)) {
+        return false;
+    }
+    out.near_plane = nearP;
+    out.far_plane = farP;
+    out.near_times_far = nearP * farP;
+    out.far_minus_near = farP - nearP;
+    out.source = source;
+    out.valid = true;
+
+    static std::atomic<bool> s_loggedFirstRenderedSource{ false };
+    if (!s_loggedFirstRenderedSource.exchange(true, std::memory_order_relaxed)) {
+        REX::INFO("HiZCull: first rendered-depth camera source={} "
+                  "(completed-world current jittered), worldState={} "
+                  "(1=cache match, 2=fallback), cacheSize={}, worldCam={:#x}, "
+                  "matchedRefCam={:#x}",
+                  source, srcPath, cacheSz,
+                  reinterpret_cast<std::uintptr_t>(worldCamPtr),
+                  reinterpret_cast<std::uintptr_t>(matchedRefCam));
+    }
+
+    return true;
+}
+
 // Patch all candidate vtables via REL::Relocation::write_vfunc (which handles
 // VirtualProtect / WriteSafeData internally). Each target is verified to
-// currently hold BSGeometry::OnVisible at slot 55 before patching — if a
+// currently hold BSGeometry::OnVisible at slot 55 before patching ??if a
 // subclass shipped with an override that doesn't show up in our static map
 // we skip it cleanly rather than calling the subclass override after our
 // Hi-Z test under a "this is BSGeometry::OnVisible" assumption.
@@ -446,7 +676,7 @@ std::size_t PatchAllVtables(std::uintptr_t hookAddr, std::uintptr_t& outSharedOr
         const auto slotAddr = vtblBase + kOnVisibleVtableSlot * sizeof(std::uintptr_t);
         const std::uintptr_t current = *reinterpret_cast<std::uintptr_t*>(slotAddr);
         if (current != s_BSGeometryOnVisibleAddr) {
-            REX::WARN("HiZCull: skipping {} vtable @ {:#x} — slot {} = {:#x} != "
+            REX::WARN("HiZCull: skipping {} vtable @ {:#x} ??slot {} = {:#x} != "
                       "BSGeometry::OnVisible {:#x} (subclass overrides OnVisible; "
                       "instances of this type are not covered by v1)",
                       kVtableTargets[i].name, vtblBase,
@@ -496,6 +726,7 @@ void ReleaseHiZResources() noexcept
     if (s_hiZTex)  { s_hiZTex->Release();  s_hiZTex  = nullptr; }
     for (auto*& t : s_stagingTex) { if (t) { t->Release(); t = nullptr; } }
     for (auto& p : s_stagingPrimed) p = false;
+    for (auto& meta : s_stagingMeta) meta = {};
 }
 
 bool CompileBuildShader(ID3D11Device* device)
@@ -531,7 +762,7 @@ bool EnsureResources(REX::W32::ID3D11Device* rexDevice, int renderW, int renderH
 {
     // Resources are sized to the Hi-Z target, not the render target. Render-size
     // change still triggers a re-init because the build CS reads from the
-    // depth SRV at its current dims via Load() — the source size is supplied
+    // depth SRV at its current dims via Load() ??the source size is supplied
     // via the constant buffer per dispatch, so technically nothing needs to
     // resize. But re-init on dim change anyway: it clears the staging buffers
     // so we don't briefly Hi-Z against a stale (wrong-fov) frame.
@@ -564,7 +795,7 @@ bool EnsureResources(REX::W32::ID3D11Device* rexDevice, int renderW, int renderH
         }
     }
 
-    // Hi-Z target — small R32_FLOAT, UAV + (no SRV needed; we readback only).
+    // Hi-Z target ??small R32_FLOAT, UAV + (no SRV needed; we readback only).
     {
         D3D11_TEXTURE2D_DESC td{};
         td.Width            = kHiZWidth;
@@ -628,7 +859,9 @@ void DispatchHiZBuild(ID3D11DeviceContext* ctx, ID3D11ShaderResourceView* depthS
     // Update CB.
     struct CBData {
         std::uint32_t srcW, srcH, dstW, dstH;
-        float nearP, farP, pad0, pad1;
+        float nearP, farP;
+        std::uint32_t depthMode;
+        float pad1;
         float pad2[8];
     } cb{};
     cb.srcW = static_cast<std::uint32_t>(srcW);
@@ -637,6 +870,7 @@ void DispatchHiZBuild(ID3D11DeviceContext* ctx, ID3D11ShaderResourceView* depthS
     cb.dstH = kHiZHeight;
     cb.nearP = nearP;
     cb.farP  = farP;
+    cb.depthMode = static_cast<std::uint32_t>(s_depthMode.load(std::memory_order_relaxed));
     ctx->UpdateSubresource(s_buildCb, 0, nullptr, &cb, 0, 0);
 
     // Save existing CS state so we don't disrupt the engine.
@@ -650,6 +884,17 @@ void DispatchHiZBuild(ID3D11DeviceContext* ctx, ID3D11ShaderResourceView* depthS
     ctx->CSGetConstantBuffers(0, 1, &prevCb0);
     ctx->CSGetShaderResources(0, 1, &prevSrv0);
     ctx->CSGetUnorderedAccessViews(0, 1, &prevUav0);
+
+    // D3D11 forbids reading a resource as an SRV while the same resource is
+    // still bound as an output DSV. The engine can leave the scene depth DSV
+    // attached after Forward; temporarily drop only the DSV so our compute
+    // shader samples the real depth instead of a hazard-null SRV.
+    ID3D11RenderTargetView* prevRtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
+    ID3D11DepthStencilView* prevDsv = nullptr;
+    ctx->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, prevRtvs, &prevDsv);
+    if (prevDsv) {
+        ctx->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, prevRtvs, nullptr);
+    }
 
     // Dispatch.
     ctx->CSSetShader(s_buildCs, nullptr, 0);
@@ -672,11 +917,21 @@ void DispatchHiZBuild(ID3D11DeviceContext* ctx, ID3D11ShaderResourceView* depthS
     ctx->CSSetConstantBuffers(0, 1, &prevCb0);
     ctx->CSSetShaderResources(0, 1, &prevSrv0);
     ctx->CSSetUnorderedAccessViews(0, 1, &prevUav0, &initCount);
+    if (prevDsv) {
+        ctx->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, prevRtvs, prevDsv);
+    }
     if (prevCs)   prevCs->Release();
     for (UINT i = 0; i < prevInstCount; ++i) { if (prevInst[i]) prevInst[i]->Release(); }
     if (prevCb0)  prevCb0->Release();
     if (prevSrv0) prevSrv0->Release();
     if (prevUav0) prevUav0->Release();
+    for (auto*& rtv : prevRtvs) {
+        if (rtv) {
+            rtv->Release();
+            rtv = nullptr;
+        }
+    }
+    if (prevDsv) prevDsv->Release();
 }
 
 void CopyHiZToStaging(ID3D11DeviceContext* ctx)
@@ -684,6 +939,29 @@ void CopyHiZToStaging(ID3D11DeviceContext* ctx)
     const int writeIdx = s_ringWriteIndex;
     ctx->CopyResource(s_stagingTex[writeIdx], s_hiZTex);
     s_stagingPrimed[writeIdx] = true;
+}
+
+bool GetDepthSourceDims(ID3D11ShaderResourceView* depthSrv, int& srcW, int& srcH)
+{
+    srcW = 0;
+    srcH = 0;
+    if (!depthSrv) return false;
+
+    ID3D11Resource* res = nullptr;
+    depthSrv->GetResource(&res);
+    if (!res) return false;
+
+    ID3D11Texture2D* tex2d = nullptr;
+    if (SUCCEEDED(res->QueryInterface(__uuidof(ID3D11Texture2D),
+                                      reinterpret_cast<void**>(&tex2d)))) {
+        D3D11_TEXTURE2D_DESC td{};
+        tex2d->GetDesc(&td);
+        srcW = static_cast<int>(td.Width);
+        srcH = static_cast<int>(td.Height);
+        tex2d->Release();
+    }
+    res->Release();
+    return srcW > 0 && srcH > 0;
 }
 
 // Reads the *least recently written* staging buffer (which holds the
@@ -697,6 +975,8 @@ bool ReadBackInto(Snapshot& snap, ID3D11DeviceContext* ctx)
     // ring size 2.
     const int readIdx = (s_ringWriteIndex + kReadbackRing - 1) % kReadbackRing;
     if (!s_stagingPrimed[readIdx]) return false;
+    if (!s_stagingMeta[readIdx].valid) return false;
+    CopyMetaToSnapshot(snap, s_stagingMeta[readIdx]);
 
     D3D11_MAPPED_SUBRESOURCE m{};
     HRESULT hr = ctx->Map(s_stagingTex[readIdx], 0, D3D11_MAP_READ, 0, &m);
@@ -716,6 +996,50 @@ bool ReadBackInto(Snapshot& snap, ID3D11DeviceContext* ctx)
                     static_cast<std::size_t>(kHiZWidth) * sizeof(float));
     }
     ctx->Unmap(s_stagingTex[readIdx], 0);
+
+    float minV = (std::numeric_limits<float>::max)();
+    float maxV = 0.0f;
+    double sumV = 0.0;
+    std::uint32_t zeroish = 0;
+    for (const float v : mip0.pixels) {
+        if (!std::isfinite(v)) continue;
+        minV = (std::min)(minV, v);
+        maxV = (std::max)(maxV, v);
+        sumV += v;
+        if (v <= snap.near_plane * 1.25f) {
+            ++zeroish;
+        }
+    }
+    const auto count = static_cast<float>((std::max<std::size_t>)(1, mip0.pixels.size()));
+    snap.hizMin = minV == (std::numeric_limits<float>::max)() ? 0.0f : minV;
+    snap.hizMax = maxV;
+    snap.hizAvg = static_cast<float>(sumV / count);
+    snap.hizZeroPct = 100.0f * static_cast<float>(zeroish) / count;
+
+    // Creation Engine's world projection is forward-Z (confirmed in
+    // BSGraphics::State::CalculateCameraViewProj). A near-plane-only or all-zero
+    // readback means this depth source is empty/clear at capture time. Do not
+    // publish that as a usable occlusion snapshot: per-object badDepth checks are
+    // just wasted CPU, and keeping a previous snapshot would be unsafe after a
+    // 180-degree turn.
+    if (snap.hizMax <= snap.near_plane * 8.0f &&
+        snap.hizAvg <= snap.near_plane * 4.0f)
+    {
+        static std::atomic<std::uint64_t> s_emptyDepthWarnFrame{ 0 };
+        const auto frameNow = s_frame.load(std::memory_order_relaxed);
+        auto lastWarn = s_emptyDepthWarnFrame.load(std::memory_order_relaxed);
+        if (frameNow > lastWarn + 120 &&
+            s_emptyDepthWarnFrame.compare_exchange_strong(
+                lastWarn, frameNow, std::memory_order_relaxed))
+        {
+            REX::WARN("HiZCull: depth readback is near-only/empty "
+                      "(mode={}, min={:.2f} avg={:.2f} max={:.2f} near={} zeroish={:.1f}%). "
+                      "Dropping this snapshot.",
+                      s_depthMode.load(std::memory_order_relaxed) == 0 ? "forward" : "reverse",
+                      snap.hizMin, snap.hizAvg, snap.hizMax, snap.near_plane, snap.hizZeroPct);
+        }
+        return false;
+    }
 
     // Build pyramid: each level halves dims, max() reduces 2x2.
     for (int lvl = 1; lvl < kHiZMipLevels; ++lvl) {
@@ -760,7 +1084,7 @@ bool ReadBackInto(Snapshot& snap, ID3D11DeviceContext* ctx)
 // the opposite direction* than the symmetric approximation predicts. For thin
 // foreground geometry near the camera this asymmetry is the difference
 // between sampling the Hi-Z texel that contains the object and sampling an
-// adjacent texel that may hold a closer occluder → false cull.
+// adjacent texel that may hold a closer occluder ??false cull.
 //
 // Algorithm (per axis, in the (axis, forward) plane of camera space):
 //   Camera at origin. Sphere is a 2D circle at (cAxis, cFwd) with radius r.
@@ -787,15 +1111,15 @@ inline bool ProjectSphereAxisTight(float cAxis, float cFwd, float r, float focal
     const float sinA = r * invD;
     const float cosA = std::sqrt((std::max)(1.0f - sinA * sinA, 0.0f));
 
-    // Tangent directions = (cosT ∓ A, sinT ∓ A). Standard angle-addition.
+    // Tangent directions = (cosT ??A, sinT ??A). Standard angle-addition.
     const float cosPlus  = cosT * cosA - sinT * sinA;   // toward +axis
     const float sinPlus  = sinT * cosA + cosT * sinA;
-    const float cosMinus = cosT * cosA + sinT * sinA;   // toward −axis
+    const float cosMinus = cosT * cosA + sinT * sinA;   // toward ?뭓xis
     const float sinMinus = sinT * cosA - cosT * sinA;
 
     // NDC = tan(theta) * focal = sin/cos * focal. If the tangent direction's
     // forward component (cos) is non-positive, the tangent line goes parallel
-    // to or behind the image plane → bound is unbounded in that direction;
+    // to or behind the image plane ??bound is unbounded in that direction;
     // clamp to a far-off-screen sentinel so the AABB clip downstream handles it.
     constexpr float kSentinel = 1.0e6f;
     const float ndcPlus  = cosPlus  > 1e-6f ? (sinPlus  / cosPlus)  * focal :  kSentinel;
@@ -811,7 +1135,7 @@ inline bool ProjectSphereAxisTight(float cAxis, float cFwd, float r, float focal
 //
 // IMPORTANT: The engine builds view as rotation-only (no translation row;
 // confirmed via Ghidra disassembly of BSGraphics::State::CalculateCameraViewProj
-// @ 0x141d216f0 — view row 3 is hardcoded (0,0,0,1)). World vertices are
+// @ 0x141d216f0 ??view row 3 is hardcoded (0,0,0,1)). World vertices are
 // pre-shifted by `posAdjust` on the CPU before they enter the matrix. So we
 // must subtract `s.cam_origin` (= posAdjust) from the world position here.
 //
@@ -830,17 +1154,105 @@ inline void ProjectWorld(const Snapshot& s, float wx, float wy, float wz,
     cw = rx * s.vp_r0[3] + ry * s.vp_r1[3] + rz * s.vp_r2[3] + s.vp_r3[3];
 }
 
+inline bool IsAccumulatorFirstPerson(const void* accum) noexcept
+{
+    if (!accum) return false;
+    bool firstPerson = false;
+    std::memcpy(&firstPerson, AsBytes(accum) + kBSShaderAccumulator_firstPersonOff,
+                sizeof(firstPerson));
+    return firstPerson;
+}
+
+inline bool IsDescendantOf(const RE::NiAVObject* object, const RE::NiAVObject* root) noexcept
+{
+    if (!object || !root) return false;
+    const RE::NiAVObject* current = object;
+    for (int depth = 0; current && depth < 96; ++depth) {
+        if (current == root) return true;
+        current = current->parent;
+    }
+    return false;
+}
+
+inline bool IsFirstPersonGeometry(const void* geom) noexcept
+{
+    if (!geom) return false;
+    const auto* object = reinterpret_cast<const RE::NiAVObject*>(geom);
+    const auto* player = RE::PlayerCharacter::GetSingleton();
+    if (!player) return false;
+
+    const RE::NiAVObject* firstPersonRoot = player->firstPerson3D.get();
+    if (IsDescendantOf(object, firstPersonRoot)) return true;
+    if (IsDescendantOf(object, player->firstPersonTorso)) return true;
+    if (IsDescendantOf(object, player->firstPersonEye)) return true;
+    return false;
+}
+
+inline bool ShouldBypassHiZ(void* accum, void* geom) noexcept
+{
+    if (IsAccumulatorFirstPerson(accum) || IsFirstPersonGeometry(geom)) {
+        s_stats.firstPersonPassthrough.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+    return false;
+}
+
+inline float Dot3(const float* a, const float* b) noexcept
+{
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+}
+
+inline void Normalize3(float* v) noexcept
+{
+    const float lenSq = Dot3(v, v);
+    if (lenSq <= 1.0e-8f) return;
+    const float invLen = 1.0f / std::sqrt(lenSq);
+    v[0] *= invLen;
+    v[1] *= invLen;
+    v[2] *= invLen;
+}
+
+bool IsTemporalReuseSafe(const Snapshot& s) noexcept
+{
+    float rows[4][4];
+    float pos[3];
+    if (!ReadLiveCameraVPAndOrigin(rows, pos)) {
+        return false;
+    }
+
+    const float dx = pos[0] - s.cam_origin[0];
+    const float dy = pos[1] - s.cam_origin[1];
+    const float dz = pos[2] - s.cam_origin[2];
+    const float distSq = dx * dx + dy * dy + dz * dz;
+
+    float staleForward[3] = { s.vp_r0[3], s.vp_r1[3], s.vp_r2[3] };
+    float liveForward[3] = { rows[0][3], rows[1][3], rows[2][3] };
+    Normalize3(staleForward);
+    Normalize3(liveForward);
+    const float facingDot = Dot3(staleForward, liveForward);
+
+    // Conservative temporal Hi-Z for *active* CPU culling. This is previous
+    // frame depth, so even moderate camera motion creates disocclusion holes
+    // that the history buffer cannot know about. Keep this deliberately tight;
+    // measure mode can still report would-cull candidates, but cull mode must
+    // prefer visible over risky.
+    constexpr float kMaxCameraTranslation = 12.0f;
+    constexpr float kMinForwardDot = 0.9990f; // ~2.6 degrees
+    return distSq <= kMaxCameraTranslation * kMaxCameraTranslation &&
+           facingDot >= kMinForwardDot;
+}
+
 // Per-object occlusion test. Returns true if the sphere can be culled.
 // Approximations (documented):
-//   - Sphere → screen AABB built from "radius / w" scaling per axis; this is
+//   - Sphere ??screen AABB built from "radius / w" scaling per axis; this is
 //     the standard tangent-plane bound, slightly conservative for far objects.
-//   - Sphere near-Z computed as (center clip-w − radius) projected into linear
+//   - Sphere near-Z computed as (center clip-w ??radius) projected into linear
 //     view-space using the snapshot's near/far. Bound to >= near_plane.
 //   - Hi-Z mip picked from the larger screen-space dim (in mip-0 texels).
-//   - Sampled max of 4 surrounding texels at that mip — conservative.
+//   - Sampled max of 4 surrounding texels at that mip ??conservative.
 //
 // Returns false (don't cull) on any edge case (sphere near camera, off-screen,
-// no snapshot, etc.) — these are passthrough cases.
+// no snapshot, etc.) ??these are passthrough cases.
 bool TestOccluded(const Snapshot& s, const float* worldBound)
 {
     const float wx = worldBound[0];
@@ -854,14 +1266,14 @@ bool TestOccluded(const Snapshot& s, const float* worldBound)
 
     // Decompose viewProj into the camera basis (right, up, forward) in world
     // space + focal lengths. Valid because the engine builds the matrix as
-    // (rotation-only-view × proj) with proj being a centred perspective —
+    // (rotation-only-view 횞 proj) with proj being a centred perspective ??
     // confirmed via Ghidra BSGraphics::State::CalculateCameraViewProj.
     //
     //   forward_world = (vp_r0[3], vp_r1[3], vp_r2[3])   (col 3 of viewProj)
     //   right_world   = (vp_r0[0], vp_r1[0], vp_r2[0]) / focal_x
     //   up_world      = (vp_r0[1], vp_r1[1], vp_r2[1]) / focal_y
-    //   focal_x       = |col 0 of viewProj 3×3|
-    //   focal_y       = |col 1 of viewProj 3×3|
+    //   focal_x       = |col 0 of viewProj 3횞3|
+    //   focal_y       = |col 1 of viewProj 3횞3|
     auto Sqr = [](float v) { return v * v; };
     const float fx = std::sqrt(Sqr(s.vp_r0[0]) + Sqr(s.vp_r1[0]) + Sqr(s.vp_r2[0]));
     const float fy = std::sqrt(Sqr(s.vp_r0[1]) + Sqr(s.vp_r1[1]) + Sqr(s.vp_r2[1]));
@@ -892,7 +1304,7 @@ bool TestOccluded(const Snapshot& s, const float* worldBound)
     if (!ProjectSphereAxisTight(camX, camZ, wr, fx, ndcMinX, ndcMaxX) ||
         !ProjectSphereAxisTight(camY, camZ, wr, fy, ndcMinY, ndcMaxY))
     {
-        // Camera inside sphere or sphere fully behind — passthrough.
+        // Camera inside sphere or sphere fully behind ??passthrough.
         s_stats.nearPlanePassthrough.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
@@ -918,6 +1330,21 @@ bool TestOccluded(const Snapshot& s, const float* worldBound)
     const float dy = (std::max)(0.0f, py1 - py0);
     const float maxDim = (std::max)(dx, dy);
 
+    // Very large screen-space bounds are poor Hi-Z candidates in this CPU
+    // integration because temporal reprojection error can move the edge by
+    // several low-res texels. Passing them through is cheap insurance for
+    // Boston precombines and near-camera weapon/body geometry.
+    constexpr float kMaxCullWidthFrac = 0.55f;
+    constexpr float kMaxCullHeightFrac = 0.55f;
+    constexpr float kMaxCullAreaFrac = 0.20f;
+    if (dx > kHiZWidth * kMaxCullWidthFrac ||
+        dy > kHiZHeight * kMaxCullHeightFrac ||
+        (dx * dy) > (kHiZWidth * kHiZHeight) * kMaxCullAreaFrac)
+    {
+        s_stats.largeFootprintPassthrough.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+
     // Mip pick: each mip halves dims, so a region of size maxDim mip-0 texels
     // is covered by 2x2 texels at mip = ceil(log2(maxDim)).
     int mip = 0;
@@ -937,8 +1364,8 @@ bool TestOccluded(const Snapshot& s, const float* worldBound)
     // texel positions; the rasterized object's pixels can fall on the texel
     // boundary). With Mara-McGuire-tight NDC bounds the screen footprint is
     // accurate, so a single-texel guard is sufficient. (Larger guards would
-    // over-sample → under-cull.)
-    constexpr int kGuard = 1;
+    // over-sample ??under-cull.)
+    constexpr int kGuard = 2;
     const float shiftScale = 1.0f / static_cast<float>(1 << mip);
     const int   mx0 = std::clamp(static_cast<int>(std::floor(px0 * shiftScale)) - kGuard,
                                  0, cm.width  - 1);
@@ -955,10 +1382,17 @@ bool TestOccluded(const Snapshot& s, const float* worldBound)
             sampledMax = (std::max)(sampledMax, row[x]);
         }
     }
+    if (sampledMax <= s.near_plane * 1.25f) {
+        s_stats.notCulledByHiZ.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
 
-    // Sphere's nearest view-space depth (= forward distance − radius).
+    // Sphere's nearest view-space depth (= forward distance ??radius).
     // Hi-Z stores view-space distance, so direct compare works.
-    if (nearestForward > sampledMax) {
+    const float radiusBias = wr * 0.10f;
+    const float distanceBias = nearestForward * 0.01f;
+    const float depthBias = (std::max)(64.0f, (std::max)(radiusBias, distanceBias));
+    if (nearestForward > sampledMax + depthBias) {
         s_stats.wouldCullByHiZ.fetch_add(1, std::memory_order_relaxed);
         return true;
     }
@@ -973,7 +1407,7 @@ std::atomic<bool> s_loggedFirstRegObjCall{ false };
 
 std::atomic<bool> s_loggedFirstProjection{ false };
 
-// Diagnostic — log the snapshot's VP matrix + the first geometry's projection,
+// Diagnostic ??log the snapshot's VP matrix + the first geometry's projection,
 // once. Helps verify the matrix layout (Risk R1) and the projected cw value
 // for a real object. Picked when the snapshot is valid and we have a sphere
 // with non-zero radius.
@@ -982,7 +1416,7 @@ void MaybeLogFirstProjection(const Snapshot& s, const float* bound,
 {
     if (s_loggedFirstProjection.exchange(true, std::memory_order_relaxed)) return;
 
-    // Also project the camera origin — expect (~0, ~0, ~something, ~tiny) in
+    // Also project the camera origin ??expect (~0, ~0, ~something, ~tiny) in
     // clip space. If projection works, the camera origin projects to itself.
     float ccx, ccy, ccz, ccw;
     ProjectWorld(s, s.cam_origin[0], s.cam_origin[1], s.cam_origin[2],
@@ -1002,9 +1436,9 @@ void MaybeLogFirstProjection(const Snapshot& s, const float* bound,
         "  r2={:.4f} {:.4f} {:.4f} {:.4f}\n"
         "  r3={:.4f} {:.4f} {:.4f} {:.4f}\n"
         "  cam={:.1f} {:.1f} {:.1f}  near={:.2f} far={:.2f}\n"
-        "  cam proj      → ({:.2f} {:.2f} {:.2f} {:.2f})\n"
-        "  cam+1000x proj→ ({:.2f} {:.2f} {:.2f} {:.2f})\n"
-        "  obj bound (w={:.1f} {:.1f} {:.1f}, r={:.1f}) proj→ "
+        "  cam proj      ??({:.2f} {:.2f} {:.2f} {:.2f})\n"
+        "  cam+1000x proj??({:.2f} {:.2f} {:.2f} {:.2f})\n"
+        "  obj bound (w={:.1f} {:.1f} {:.1f}, r={:.1f}) proj??"
         "({:.2f} {:.2f} {:.2f} {:.2f}); ndcXY=({:.3f} {:.3f}) "
         "nearestForward={:.2f}",
         s.vp_r0[0], s.vp_r0[1], s.vp_r0[2], s.vp_r0[3],
@@ -1022,6 +1456,68 @@ void MaybeLogFirstProjection(const Snapshot& s, const float* bound,
         cw - bound[3]);
 }
 
+bool IsStableOpaqueCandidate(void* geomSelf) noexcept
+{
+    if (!geomSelf) {
+        return false;
+    }
+
+    void* prop = nullptr;
+    std::memcpy(&prop, AsBytes(geomSelf) + kBSGeometry_property0Off, sizeof(prop));
+    if (!prop) {
+        return false;
+    }
+
+    std::uint64_t flags = 0;
+    std::memcpy(&flags, AsBytes(prop) + kBSShaderProperty_flagsOff, sizeof(flags));
+    constexpr auto Bit = [](unsigned n) constexpr noexcept -> std::uint64_t {
+        return 1ull << n;
+    };
+    constexpr std::uint64_t kRejectShaderFlags =
+        Bit(1)  |  // skinned
+        Bit(2)  |  // temp refraction
+        Bit(3)  |  // vertex alpha
+        Bit(10) |  // face
+        Bit(15) |  // refraction
+        Bit(16) |  // refraction falloff
+        Bit(17) |  // eye reflect
+        Bit(18) |  // hair tint
+        Bit(19) |  // screendoor alpha fade
+        Bit(21) |  // facegen RGB tint
+        Bit(26) |  // decal
+        Bit(27) |  // dynamic decal
+        Bit(28) |  // character light
+        Bit(30) |  // soft effect
+        Bit(40) |  // dismemberment meat cuff
+        Bit(47) |  // dismemberment
+        Bit(49) |  // weapon blood
+        Bit(55) |  // menu screen
+        Bit(57) |  // alpha test
+        Bit(60) |  // pipboy screen
+        Bit(61) |  // tree anim
+        Bit(62) |  // effect lighting
+        Bit(63);   // refraction writes depth
+    if ((flags & kRejectShaderFlags) != 0) {
+        return false;
+    }
+
+    float worldT[3]{};
+    float prevT[3]{};
+    std::memcpy(worldT, AsBytes(geomSelf) + kNiAVObject_worldTranslateOff, sizeof(worldT));
+    std::memcpy(prevT, AsBytes(geomSelf) + kNiAVObject_previousWorldTranslateOff, sizeof(prevT));
+    if (!std::isfinite(worldT[0]) || !std::isfinite(worldT[1]) || !std::isfinite(worldT[2]) ||
+        !std::isfinite(prevT[0]) || !std::isfinite(prevT[1]) || !std::isfinite(prevT[2]))
+    {
+        return false;
+    }
+
+    const float dx = worldT[0] - prevT[0];
+    const float dy = worldT[1] - prevT[1];
+    const float dz = worldT[2] - prevT[2];
+    constexpr float kMaxObjectMotion = 1.0f;
+    return (dx * dx + dy * dy + dz * dz) <= kMaxObjectMotion * kMaxObjectMotion;
+}
+
 // Returns true if the bound at (self + kNiAVObject_worldBoundOff) should be
 // treated as occluded.  Shared between HookedOnVisible and HookedRegisterObject.
 // `mode` and `s_inMainAccum` must already have been validated by the caller.
@@ -1035,6 +1531,18 @@ bool ShouldCullGeometry(void* geomSelf)
     const Snapshot& snap = s_snapshots[snapIdx];
     if (!snap.valid || snap.mips[0].pixels.empty()) {
         s_stats.snapshotMissing.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    if (s_forcePassthroughThisFrame.load(std::memory_order_relaxed) || !snap.temporalSafe) {
+        s_stats.temporalPassthrough.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    if (snap.hizMax <= snap.near_plane * 2.0f && snap.hizAvg <= snap.near_plane * 1.5f) {
+        s_stats.badDepthPassthrough.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    if (!IsStableOpaqueCandidate(geomSelf)) {
+        s_stats.candidatePassthrough.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
     float bound[4];
@@ -1069,6 +1577,10 @@ void HookedOnVisible(void* self, void* cullProc)
         return;
     }
     s_stats.onVisInMainAccum.fetch_add(1, std::memory_order_relaxed);
+    if (ShouldBypassHiZ(nullptr, self)) {
+        s_origOnVisible(self, cullProc);
+        return;
+    }
 
     const bool occluded = ShouldCullGeometry(self);
     if (mode == Mode::Cull && occluded) {
@@ -1079,7 +1591,7 @@ void HookedOnVisible(void* self, void* cullProc)
 }
 
 // Hooks BSShaderAccumulator::RegisterObject (vtable slot 45 / +0x168).
-// `geom` is a BSGeometry* — its worldBound lives at +0xB0 the same as any
+// `geom` is a BSGeometry* ??its worldBound lives at +0xB0 the same as any
 // NiAVObject. Return value is bool; v1 returns `false` on occluded-skip and
 // the original's return otherwise. The single observed call site
 // (AccumulatePassesFromArena) discards the return, so this is safe.
@@ -1104,6 +1616,9 @@ bool HookedRegisterObject(void* self, void* geom)
         return s_origRegisterObject(self, geom);
     }
     s_stats.regObjInMainAccum.fetch_add(1, std::memory_order_relaxed);
+    if (ShouldBypassHiZ(self, geom)) {
+        return s_origRegisterObject(self, geom);
+    }
 
     const bool occluded = ShouldCullGeometry(geom);
     if (mode == Mode::Cull && occluded) {
@@ -1118,9 +1633,10 @@ bool HookedRegisterObject(void* self, void* geom)
 void PopulateSnapshot(Snapshot& dst, ID3D11DeviceContext* ctx)
 {
     dst.valid = false;
+    dst.temporalSafe = false;
 
     // 1. Take VP matrix + posAdjust live from BSGraphics::State (current frame
-    //    at MainAccum entry). NOT from g_customBufferData — those are updated
+    //    at MainAccum entry). NOT from g_customBufferData ??those are updated
     //    in MyPresent (frame-end) and thus are frame N-1 by the time we run.
     float vpRows[4][4];
     float posAdjust[3];
@@ -1130,7 +1646,7 @@ void PopulateSnapshot(Snapshot& dst, ID3D11DeviceContext* ctx)
     const void* matchedRefCam = nullptr;
     if (!ReadLiveCameraVPAndOrigin(vpRows, posAdjust, &srcPath, &cacheSz,
                                    &worldCamPtr, &matchedRefCam)) {
-        // First frame / engine not initialised → bail.
+        // First frame / engine not initialised ??bail.
         return;
     }
     static std::atomic<bool> s_loggedFirstSource{ false };
@@ -1170,11 +1686,14 @@ void PopulateSnapshot(Snapshot& dst, ID3D11DeviceContext* ctx)
     if (!readbackOk) {
         // Mark valid for camera-only path (so OnVisible has VP; it'll bail
         // out on mip emptiness inside TestOccluded). On first frame this
-        // sets dst.valid=true but mips[0].pixels is empty → TestOccluded
-        // returns false → passthrough, counted as snapshotMissing.
+        // sets dst.valid=true but mips[0].pixels is empty ??TestOccluded
+        // returns false ??passthrough, counted as snapshotMissing.
+        ClearSnapshotMips(dst);
         dst.valid = true;
         return;
     }
+
+    dst.temporalSafe = IsTemporalReuseSafe(dst);
 
     // 5. Source resolution for diagnostic.
     dst.sourceW = s_renderW;
@@ -1207,6 +1726,11 @@ void MaybeLog()
     const auto snapMiss  = s_stats.snapshotMissing.load(std::memory_order_relaxed);
     const auto nearPlane = s_stats.nearPlanePassthrough.load(std::memory_order_relaxed);
     const auto offscreen = s_stats.offscreenSkipped.load(std::memory_order_relaxed);
+    const auto firstPerson = s_stats.firstPersonPassthrough.load(std::memory_order_relaxed);
+    const auto temporal = s_stats.temporalPassthrough.load(std::memory_order_relaxed);
+    const auto largeFootprint = s_stats.largeFootprintPassthrough.load(std::memory_order_relaxed);
+    const auto badDepth = s_stats.badDepthPassthrough.load(std::memory_order_relaxed);
+    const auto candidate = s_stats.candidatePassthrough.load(std::memory_order_relaxed);
     const auto skipped   = s_stats.cullActuallySkipped.load(std::memory_order_relaxed);
     const auto entries   = s_stats.mainAccumEnters.load(std::memory_order_relaxed);
 
@@ -1219,7 +1743,7 @@ void MaybeLog()
     REX::INFO(
         "HiZCull[{}]: MainAccum/s={:.1f}  OnVis/s={:.0f}(in={:.0f})  "
         "RegObj/s={:.0f}(in={:.0f})  testable={:.1f}%  wouldCull%={:.1f}%  "
-        "skipped/s={:.0f}  passthrough(snap={} near={} off={})  src={}x{}",
+        "skipped/s={:.0f}  passthrough(snap={} near={} off={} fp={} temporal={} large={} cand={} badDepth={})  src={}x{}",
         mode == Mode::Cull ? "cull" : (mode == Mode::Measure ? "measure" : "off"),
         entries / secs,
         onVisAll / secs, onVisGate / secs,
@@ -1229,7 +1753,7 @@ void MaybeLog()
             : 0.0,
         cullPct,
         skipped / secs,
-        snapMiss, nearPlane, offscreen,
+        snapMiss, nearPlane, offscreen, firstPerson, temporal, largeFootprint, candidate, badDepth,
         s_renderW, s_renderH);
 
     // Periodically dump the current snapshot matrix + camera origin so we can
@@ -1241,13 +1765,16 @@ void MaybeLog()
             REX::INFO("HiZCull VP: r0={:.4f} {:.4f} {:.4f} {:.4f}  r1={:.4f} {:.4f} "
                       "{:.4f} {:.4f}  r2={:.4f} {:.4f} {:.4f} {:.4f}  r3={:.4f} "
                       "{:.4f} {:.4f} {:.4f}  origin={:.1f} {:.1f} {:.1f}  "
-                      "near={:.2f} far={:.0f}",
+                      "near={:.2f} far={:.0f} temporalSafe={} camSource={} depthMode={} "
+                      "hiz(min/avg/max/zero%)={:.1f}/{:.1f}/{:.1f}/{:.1f}",
                       s.vp_r0[0], s.vp_r0[1], s.vp_r0[2], s.vp_r0[3],
                       s.vp_r1[0], s.vp_r1[1], s.vp_r1[2], s.vp_r1[3],
                       s.vp_r2[0], s.vp_r2[1], s.vp_r2[2], s.vp_r2[3],
                       s.vp_r3[0], s.vp_r3[1], s.vp_r3[2], s.vp_r3[3],
                       s.cam_origin[0], s.cam_origin[1], s.cam_origin[2],
-                      s.near_plane, s.far_plane);
+                      s.near_plane, s.far_plane, s.temporalSafe, s.cameraSource,
+                      s_depthMode.load(std::memory_order_relaxed) == 0 ? "forward" : "reverse",
+                      s.hizMin, s.hizAvg, s.hizMax, s.hizZeroPct);
         }
     }
 
@@ -1265,13 +1792,13 @@ bool Initialize()
     if (s_patchedAny) return true;
     const auto mode = g_mode.load(std::memory_order_relaxed);
     if (mode == Mode::Off) {
-        REX::INFO("HiZCull::Initialize: mode=off — vtables not patched (zero cost)");
+        REX::INFO("HiZCull::Initialize: mode=off ??vtables not patched (zero cost)");
         return true;
     }
 
     // Resolve engine addresses via REL::ID. OG IDs are from
     // tools/version-1-10-163-0-e.txt; AE IDs deliberately 0 (matches the
-    // PhaseTelemetry convention — runtime safety check will gate AE).
+    // PhaseTelemetry convention ??runtime safety check will gate AE).
     {
         REL::Relocation<std::uintptr_t> onVisible{ REL::ID{ 844915, 0 } };
         s_BSGeometryOnVisibleAddr = onVisible.address();
@@ -1284,7 +1811,7 @@ bool Initialize()
         !s_BSShaderAccumRegisterObjAddr) {
         REX::WARN("HiZCull::Initialize: REL::ID resolution failed "
                   "(BSGeometry::OnVisible={:#x}, RegisterObject={:#x}, "
-                  "worldCamera global={:#x}) — likely AE without mappings; "
+                  "worldCamera global={:#x}) ??likely AE without mappings; "
                   "module no-ops",
                   s_BSGeometryOnVisibleAddr, s_BSShaderAccumRegisterObjAddr,
                   s_worldCameraGlobalAddr);
@@ -1299,7 +1826,7 @@ bool Initialize()
         s_origOnVisible = REX::UNRESTRICTED_CAST<OnVisibleFn>(sharedOnVis);
         s_patchedAny    = true;
     }
-    REX::INFO("HiZCull::Initialize: BSGeometry-family OnVisible — {} of {} "
+    REX::INFO("HiZCull::Initialize: BSGeometry-family OnVisible ??{} of {} "
               "vtables patched (orig={:#x})",
               patched, kNumVtableTargets, sharedOnVis);
 
@@ -1371,7 +1898,7 @@ void OnMainAccumEnter()
     const auto mode = g_mode.load(std::memory_order_relaxed);
     if (mode == Mode::Off) return;
 
-    // Open the gate FIRST — even if the rest of this function early-returns
+    // Open the gate FIRST ??even if the rest of this function early-returns
     // (e.g. resources not ready yet), OnVisible should still consult the
     // most-recent snapshot during MainAccum's lifetime. The Exit hook always
     // closes it.
@@ -1383,49 +1910,31 @@ void OnMainAccumEnter()
 
     s_frame.fetch_add(1, std::memory_order_relaxed);
     s_stats.mainAccumEnters.fetch_add(1, std::memory_order_relaxed);
+    unsigned invalidate = s_invalidateFrames.load(std::memory_order_relaxed);
+    if (invalidate > 0) {
+        s_forcePassthroughThisFrame.store(true, std::memory_order_release);
+        while (invalidate > 0 &&
+               !s_invalidateFrames.compare_exchange_weak(invalidate, invalidate - 1,
+                                                          std::memory_order_relaxed)) {
+        }
+    } else {
+        s_forcePassthroughThisFrame.store(false, std::memory_order_release);
+    }
     MaybeLog();
 
     // --- Hi-Z build path ----------------------------------------------------
     // Both Measure and Cull modes run the full GPU pipeline so the test
     // outcomes (testable% / wouldCull%) are meaningful in measure mode.
     // The mode gate only affects whether we ACTUALLY skip the OnVisible /
-    // RegisterObject call when occluded — measure mode always passes through.
-    auto* device  = GetDevice();
+    // RegisterObject call when occluded ??measure mode always passes through.
     auto* context = GetContext();
-    auto* depthSrv = reinterpret_cast<ID3D11ShaderResourceView*>(g_depthSRV);
 
     Snapshot& dst = s_snapshots[(s_currentSnapshot.load(std::memory_order_relaxed) + 1) & 1];
     dst.valid = false;
+    dst.temporalSafe = false;
 
-    if (device && context && depthSrv) {
-        // Determine source dims from the depth SRV's resource.
-        ID3D11Resource* res = nullptr;
-        depthSrv->GetResource(&res);
-        int srcW = 0, srcH = 0;
-        if (res) {
-            ID3D11Texture2D* tex2d = nullptr;
-            if (SUCCEEDED(res->QueryInterface(__uuidof(ID3D11Texture2D),
-                                              reinterpret_cast<void**>(&tex2d)))) {
-                D3D11_TEXTURE2D_DESC td{};
-                tex2d->GetDesc(&td);
-                srcW = static_cast<int>(td.Width);
-                srcH = static_cast<int>(td.Height);
-                tex2d->Release();
-            }
-            res->Release();
-        }
-        if (srcW > 0 && srcH > 0 && EnsureResources(device, srcW, srcH)) {
-            // Need near/far for the linearisation CB.
-            float nearP = 0.0f, farP = 0.0f;
-            if (ReadNiFrustum(ReadWorldCamera(), nearP, farP)) {
-                auto* ctx = reinterpret_cast<ID3D11DeviceContext*>(context);
-                DispatchHiZBuild(ctx, depthSrv, srcW, srcH, nearP, farP);
-                CopyHiZToStaging(ctx);
-                PopulateSnapshot(dst, ctx);
-                // Advance the ring AFTER readback consumed (ringWriteIndex-1).
-                s_ringWriteIndex = (s_ringWriteIndex + 1) % kReadbackRing;
-            }
-        }
+    if (context) {
+        PopulateSnapshot(dst, reinterpret_cast<ID3D11DeviceContext*>(context));
     }
 
     // Flip the snapshot atomically (publish for OnVisible workers).
@@ -1434,26 +1943,73 @@ void OnMainAccumEnter()
 
     if (dst.valid && !s_loggedFirstSnapshot.exchange(true, std::memory_order_relaxed)) {
         REX::INFO("HiZCull: first snapshot ready (mode={}, src={}x{}, near={:.2f} far={:.2f}, "
-                  "mips[0]={}x{} primed={})",
+                  "mips[0]={}x{} primed={} temporalSafe={} camSource={} depthMode={} "
+                  "hiz(min/avg/max/zero%)={:.1f}/{:.1f}/{:.1f}/{:.1f})",
                   mode == Mode::Cull ? "cull" : "measure",
                   dst.sourceW, dst.sourceH, dst.near_plane, dst.far_plane,
                   dst.mips[0].width, dst.mips[0].height,
-                  !dst.mips[0].pixels.empty());
+                  !dst.mips[0].pixels.empty(), dst.temporalSafe, dst.cameraSource,
+                  s_depthMode.load(std::memory_order_relaxed) == 0 ? "forward" : "reverse",
+                  dst.hizMin, dst.hizAvg, dst.hizMax, dst.hizZeroPct);
     }
+}
+
+void OnWorldDepthReadyExit()
+{
+    const auto mode = g_mode.load(std::memory_order_relaxed);
+    if (mode == Mode::Off) return;
+
+    auto* device = GetDevice();
+    auto* context = GetContext();
+    auto* depthSrv = g_rendererData
+        ? reinterpret_cast<ID3D11ShaderResourceView*>(
+              g_rendererData->depthStencilTargets[RT::idx(RT::Depth::kMain)].srViewDepth)
+        : nullptr;
+    auto* cachedDepthSrv = reinterpret_cast<ID3D11ShaderResourceView*>(g_depthSRV);
+    if (!depthSrv) {
+        depthSrv = cachedDepthSrv;
+    }
+    if (!device || !context || !depthSrv) return;
+
+    int srcW = 0, srcH = 0;
+    if (!GetDepthSourceDims(depthSrv, srcW, srcH)) return;
+    static std::atomic<std::uintptr_t> s_loggedDepthSrv{ 0 };
+    const auto depthKey = reinterpret_cast<std::uintptr_t>(depthSrv);
+    if (s_loggedDepthSrv.exchange(depthKey, std::memory_order_relaxed) != depthKey) {
+        REX::INFO("HiZCull: depth source SRV={} cachedGlobal={} dims={}x{} source={}",
+                  static_cast<void*>(depthSrv),
+                  static_cast<void*>(cachedDepthSrv),
+                  srcW, srcH,
+                  depthSrv == cachedDepthSrv ? "g_depthSRV/main" : "rendererData.mainDepth");
+    }
+    if (!EnsureResources(device, srcW, srcH)) return;
+
+    CameraMeta writeMeta;
+    if (!CaptureRenderedDepthCameraMeta(writeMeta, 60)) return;
+
+    auto* ctx = reinterpret_cast<ID3D11DeviceContext*>(context);
+    DispatchHiZBuild(ctx, depthSrv, srcW, srcH,
+                      writeMeta.near_plane, writeMeta.far_plane);
+    CopyHiZToStaging(ctx);
+    s_stagingMeta[s_ringWriteIndex] = writeMeta;
+    s_ringWriteIndex = (s_ringWriteIndex + 1) % kReadbackRing;
 }
 
 void OnMainAccumExit()
 {
     // Always clear the gate; cheap relaxed write. The mode check is moot
-    // here — if the gate was never opened, this is a harmless redundant store.
+    // here ??if the gate was never opened, this is a harmless redundant store.
     s_inMainAccum.store(false, std::memory_order_release);
+    s_forcePassthroughThisFrame.store(false, std::memory_order_release);
 }
 
-void InvalidateForFrames(unsigned /*n*/)
+void InvalidateForFrames(unsigned n)
 {
-    // v1: no-op. Reserved for future cinematic-cut handling. The actual
-    // implementation would gate cull mode off for `n` calls and force every
-    // OnVisible to passthrough.
+    unsigned current = s_invalidateFrames.load(std::memory_order_relaxed);
+    while (n > current &&
+           !s_invalidateFrames.compare_exchange_weak(current, n,
+                                                     std::memory_order_relaxed)) {
+    }
 }
 
 }  // namespace HiZCull

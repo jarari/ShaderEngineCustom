@@ -470,7 +470,7 @@ int LoadShaderDefinitionsFromFile(const std::filesystem::path& shaderFolderPath,
                         def.textureDimensionMask = 0;
                     }
                 }
-                else if (lowerKey == "inputTextureCount") {
+                else if (lowerKey == "inputtexturecount") {
                     std::stringstream ss(value);
                     std::string segment;
                     while (std::getline(ss, segment, ',')) {

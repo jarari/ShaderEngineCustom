@@ -82,10 +82,14 @@ bool Initialize();
 void Shutdown();
 
 // Called from PhaseTelemetry's HookedMainAccum at the start of every
-// DrawWorld::MainAccum invocation. Builds Hi-Z from current main depth,
-// snapshots the world camera VP matrix, and rotates the readback ring.
-// Cheap when Mode == Off.
+// DrawWorld::MainAccum invocation. Publishes the most recent completed-world
+// Hi-Z readback for the enrollment hooks. Cheap when Mode == Off.
 void OnMainAccumEnter();
+
+// Called after the main world depth is fully populated for the current frame.
+// Builds and copies the GPU Hi-Z that the next MainAccum will consume. Cheap
+// when Mode == Off.
+void OnWorldDepthReadyExit();
 
 // Called from PhaseTelemetry's HookedMainAccum immediately after the
 // original MainAccum returns. Clears the "inside main accum" gate so

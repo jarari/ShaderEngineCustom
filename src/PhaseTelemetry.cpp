@@ -515,7 +515,11 @@ void HookedMainAccumCore()
 }
 void HookedMainAccum()          { HookedSubPhase<SubPhase::MainAccum         >(&HookedMainAccumCore); }
 void HookedMainRenderSetup()    { HookedSubPhase<SubPhase::MainRenderSetup   >(s_origMainRenderSetup); }
-void HookedDeferredPrePass()    { HookedSubPhase<SubPhase::DeferredPrePass   >(s_origDeferredPrePass); }
+void HookedDeferredPrePassCore()
+{
+    s_origDeferredPrePass();
+}
+void HookedDeferredPrePass()    { HookedSubPhase<SubPhase::DeferredPrePass   >(&HookedDeferredPrePassCore); }
 void HookedDeferredDecals()     { HookedSubPhase<SubPhase::DeferredDecals    >(s_origDeferredDecals); }
 void HookedNvidiaHBAO()         { HookedSubPhase<SubPhase::NvidiaHBAO        >(s_origNvidiaHBAO); }
 // Special-cased: wrap the original with LightSorter::OnEnter/OnExit so the
@@ -530,7 +534,12 @@ void HookedDeferredLightsImplCore()
 }
 void HookedDeferredLightsImpl() { HookedSubPhase<SubPhase::DeferredLightsImpl>(&HookedDeferredLightsImplCore); }
 void HookedDeferredComposite()  { HookedSubPhase<SubPhase::DeferredComposite >(s_origDeferredComposite); }
-void HookedForward()            { HookedSubPhase<SubPhase::Forward           >(s_origForward); }
+void HookedForwardCore()
+{
+    s_origForward();
+    HiZCull::OnWorldDepthReadyExit();
+}
+void HookedForward()            { HookedSubPhase<SubPhase::Forward           >(&HookedForwardCore); }
 // Tier 0 — installed via E9-5 + relocator.
 void HookedLightUpdate()        { HookedSubPhase<SubPhase::LightUpdate       >(s_origLightUpdate); }
 void HookedOpaqueWireframe()    { HookedSubPhase<SubPhase::OpaqueWireframe   >(s_origOpaqueWireframe); }
