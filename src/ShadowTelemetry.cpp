@@ -11,7 +11,10 @@
 #include <algorithm>
 #include <limits>
 #include <mutex>
+#include <sstream>
+#include <string>
 #include <unordered_map>
+#include <intrin.h>
 
 namespace ShadowTelemetry {
 
@@ -21,19 +24,75 @@ namespace {
 
 using RenderShadowMap_t = void (*)(void* light, void* shadowMapData);
 using RenderScene_t = void (*)(void* camera, void* accumulator, bool flag);
+using AccumulateFromLists_t = void (*)(void* light, void* cullingGroup);
+using RendererFlush_t = void (*)(void* renderer);
+using BSShaderAccumulatorCtor_t = void* (*)(void* accumulator, std::uint32_t mode);
+using BSShaderAccumulatorClearActivePasses_t = void (*)(void* accumulator, bool clearActiveLists);
+using BSShaderAccumulatorClearRenderPasses_t = void (*)(void* accumulator);
+using BSShaderAccumulatorSetRenderMode_t = void (*)(void* accumulator, std::uint32_t mode);
+using BSShaderAccumulatorSetShadowSceneNode_t = void (*)(void* accumulator, void* sceneNode);
+using BSShaderAccumulatorSetDepthPassIndex_t = void (*)(void* accumulator, std::uint32_t index);
+using BSShaderAccumulatorSetShadowLight_t = void (*)(void* accumulator, void* light);
+using RenderTargetManagerDestroyRenderTargets_t = void (*)(void* renderTargetManager);
+using SetDirtyRenderTargets_t = void (*)();
 
 RenderShadowMap_t s_origRenderShadowMap = nullptr;
 RenderScene_t     s_origRenderScene = nullptr;
+AccumulateFromLists_t s_origAccumulateFromLists = nullptr;
+RendererFlush_t s_origRenderShadowMapFlush = nullptr;
+RenderTargetManagerDestroyRenderTargets_t s_origDestroyRenderTargets = nullptr;
+SetDirtyRenderTargets_t s_origSetDirtyRenderTargets = nullptr;
 bool              s_installed = false;
 
 REL::Relocation<std::uintptr_t> ptr_ShadowDirectionalRender{ REL::ID{ 871921, 2319335 } };
 REL::Relocation<std::uintptr_t> ptr_RenderShadowMap{ REL::ID{ 1144068, 2319309 } };
+REL::Relocation<std::uintptr_t> ptr_AccumulateFromLists{ REL::ID{ 1390075, 0 } };
+REL::Relocation<BSShaderAccumulatorCtor_t> ptr_BSShaderAccumulatorCtor{ REL::ID{ 690952, 2317851 } };
+REL::Relocation<BSShaderAccumulatorClearActivePasses_t> ptr_ClearActivePasses{ REL::ID{ 596187, 0 } };
+REL::Relocation<BSShaderAccumulatorClearRenderPasses_t> ptr_ClearRenderPasses{ REL::ID{ 659, 0 } };
+REL::Relocation<BSShaderAccumulatorSetRenderMode_t> ptr_SetRenderMode{ REL::ID{ 320514, 0 } };
+REL::Relocation<BSShaderAccumulatorSetShadowSceneNode_t> ptr_SetShadowSceneNode{ REL::ID{ 1198275, 0 } };
+REL::Relocation<BSShaderAccumulatorSetDepthPassIndex_t> ptr_SetDepthPassIndex{ REL::ID{ 695248, 0 } };
+REL::Relocation<BSShaderAccumulatorSetShadowLight_t> ptr_SetShadowLight{ REL::ID{ 50100, 2317901 } };
+REL::Relocation<std::uintptr_t> ptr_DestroyRenderTargets{ REL::ID{ 456166, 0 } };
+REL::Relocation<std::uintptr_t> ptr_SetDirtyRenderTargets{ REL::ID{ 361475, 0 } };
+REL::Relocation<std::uint32_t*> ptr_BSGraphicsTLSIndex{ REL::Offset{ 0x67337B4 } };
+REL::Relocation<void**> ptr_BSGraphicsDefaultContext{ REL::Offset{ 0x61DDC68 } };
 
 constexpr std::uintptr_t kDirectionalRenderShadowMapCallOffsetOG = 0x48;  // 0x1428CA758 - 0x1428CA710
+constexpr std::uintptr_t kRenderShadowMapFlushCallOffsetOG = 0xDE;        // 0x1428C98DE - 0x1428C9800
 constexpr std::uintptr_t kRenderSceneCallOffsetOG = 0xFE;                 // 0x1428C98FE - 0x1428C9800
 
 constexpr std::uintptr_t kDirectionalReturnOffsetOG = 0x4D;               // 0x1428CA75D - 0x1428CA710
-constexpr std::uint32_t kDirectionalCacheMapSlot = 1;
+constexpr std::uint32_t kMaxDirectionalCacheSplits = 4;
+constexpr std::uint32_t kInvalidSplitIndex = (std::numeric_limits<std::uint32_t>::max)();
+constexpr std::size_t kShadowMapDataArrayOffset = 0x198;
+constexpr std::size_t kShadowMapDataCountOffset = 0x190;
+constexpr std::size_t kShadowMapDataStride = 0xF0;
+constexpr std::size_t kShadowMapAccumulatorOffset = 0x48;
+constexpr std::size_t kShadowMapDepthTargetOffset = 0x50;
+constexpr std::size_t kShadowMapMapSlotOffset = 0x54;
+constexpr std::size_t kAccumulatorBatchRendererOffset = 0xC8;
+constexpr std::size_t kAccumulatorSize = 0x590;
+constexpr std::size_t kAccumulatorRefCountOffset = 0x08;
+constexpr std::size_t kAccumulatorActiveShadowSceneNodeOffset = 0x558;
+constexpr std::size_t kAccumulatorRenderModeOffset = 0x560;
+constexpr std::size_t kAccumulatorDepthPassIndexOffset = 0x580;
+constexpr std::uint32_t kShadowAccumulatorCtorMode = 0x63;
+constexpr std::uint32_t kShadowRenderMode = 0x10;
+constexpr std::size_t kAccumulateFromListsPrologueSizeOG = 15;
+constexpr std::size_t kDestroyRenderTargetsPrologueSizeOG = 5;
+constexpr std::size_t kSetDirtyRenderTargetsPrologueSizeOG = 12;
+constexpr std::size_t kBSGraphicsTLSD3DContextOffset = 0xB18;
+constexpr std::size_t kBSGraphicsTLSContextOffset = 0xB20;
+constexpr std::size_t kBSGraphicsContextShadowStateOffset = 0x1B70;
+constexpr std::size_t kRendererStateDepthPlatformTargetOffset = 0x4C;
+constexpr std::size_t kRendererStateDepthMapSlotOffset = 0x50;
+constexpr std::size_t kRendererStateDepthModeOffset = 0x7C;
+constexpr std::size_t kRendererStateDepthLogicalTargetOffset = 0x88;
+constexpr std::uint32_t kRenderTargetModeClear = 0;
+constexpr std::uint32_t kFirstCacheableDirectionalMapSlot = 1;
+constexpr bool kShadowCacheLogEnabled = false;
 
 constexpr double kLogIntervalSecs = 2.0;
 constexpr std::size_t kMaxLoggedKeys = 8;
@@ -125,6 +184,8 @@ std::int32_t QuantizeFloat(float value, float step) noexcept
     return static_cast<std::int32_t>(q);
 }
 
+void* ActiveRendererShadowState() noexcept;
+
 std::uint64_t ShadowCameraSignature(void* camera) noexcept
 {
     if (!camera) {
@@ -188,8 +249,6 @@ std::uint32_t ShadowMapDataIndex(void* light, void* shadowMapData) noexcept
         return (std::numeric_limits<std::uint32_t>::max)();
     }
 
-    constexpr std::size_t kShadowMapDataArrayOffset = 0x198;
-    constexpr std::size_t kShadowMapDataStride = 0xF0;
     auto* base = ReadField<std::byte*>(light, kShadowMapDataArrayOffset);
     auto* cur = static_cast<std::byte*>(shadowMapData);
     if (!base || cur < base) {
@@ -218,6 +277,8 @@ struct ViewportSig {
 struct Key {
     void* light = nullptr;
     void* accumulator = nullptr;
+    void* activeDepthStencilView = nullptr;
+    void* activeDepthTexture = nullptr;
     std::uint64_t cameraSig = 0;
     std::uint64_t dominantLightSig = 0;
     std::uint32_t depthTarget = 0;
@@ -262,12 +323,106 @@ struct KeyHash {
 REX::W32::ID3D11DepthStencilView* ActiveShadowDSV(const Key& key) noexcept
 {
     if (!g_rendererData ||
-        key.depthTarget >= static_cast<std::uint32_t>(std::size(g_rendererData->depthStencilTargets)) ||
         key.mapSlot >= 4) {
         return nullptr;
     }
 
-    return g_rendererData->depthStencilTargets[key.depthTarget].dsView[key.mapSlot];
+    const auto renderTargetManager = RE::BSGraphics::RenderTargetManager::GetSingleton();
+    if (key.depthTarget >= static_cast<std::uint32_t>(std::size(renderTargetManager.depthStencilTargetID))) {
+        return nullptr;
+    }
+
+    const std::uint32_t platformDepthTarget = renderTargetManager.depthStencilTargetID[key.depthTarget];
+    if (platformDepthTarget >= static_cast<std::uint32_t>(std::size(g_rendererData->depthStencilTargets))) {
+        return nullptr;
+    }
+
+    return g_rendererData->depthStencilTargets[platformDepthTarget].dsView[key.mapSlot];
+}
+
+REX::W32::ID3D11DeviceContext* ActiveD3DContext() noexcept
+{
+    void* context = nullptr;
+    if (ptr_BSGraphicsTLSIndex.address() >= 0x140000000ull) {
+        const auto tlsIndex = *ptr_BSGraphicsTLSIndex;
+        auto** tlsSlots = reinterpret_cast<void**>(__readgsqword(0x58));
+        auto* tlsBase = tlsSlots ? static_cast<std::byte*>(tlsSlots[tlsIndex]) : nullptr;
+        context = ReadField<void*>(tlsBase, kBSGraphicsTLSD3DContextOffset);
+    }
+
+    if (context) {
+        return static_cast<REX::W32::ID3D11DeviceContext*>(context);
+    }
+
+    return g_rendererData ? g_rendererData->context : nullptr;
+}
+
+REX::W32::ID3D11DepthStencilView* RendererStateDepthStencilView(
+    std::uint32_t platformDepthTarget,
+    std::uint32_t mapSlot) noexcept
+{
+    if (!g_rendererData ||
+        platformDepthTarget >= static_cast<std::uint32_t>(std::size(g_rendererData->depthStencilTargets)) ||
+        mapSlot >= 4) {
+        return nullptr;
+    }
+
+    return g_rendererData->depthStencilTargets[platformDepthTarget].dsView[mapSlot];
+}
+
+REX::W32::ID3D11DepthStencilView* ActiveShadowDSVFromRendererState(const Key& key) noexcept
+{
+    if (auto* dsv = ActiveShadowDSV(key)) {
+        return dsv;
+    }
+
+    auto* state = ActiveRendererShadowState();
+    if (!state || key.mapSlot >= 4) {
+        return nullptr;
+    }
+
+    const std::uint32_t logicalDepthTarget =
+        ReadField<std::uint32_t>(state, kRendererStateDepthLogicalTargetOffset, kInvalidSplitIndex);
+    const std::uint32_t platformDepthTarget =
+        ReadField<std::uint32_t>(state, kRendererStateDepthPlatformTargetOffset, kInvalidSplitIndex);
+    const std::uint32_t mapSlot =
+        ReadField<std::uint32_t>(state, kRendererStateDepthMapSlotOffset, kInvalidSplitIndex);
+
+    if (mapSlot != key.mapSlot) {
+        return nullptr;
+    }
+
+    const auto renderTargetManager = RE::BSGraphics::RenderTargetManager::GetSingleton();
+    const bool logicalMatches = logicalDepthTarget == key.depthTarget;
+    const bool platformMatches =
+        key.depthTarget < static_cast<std::uint32_t>(std::size(renderTargetManager.depthStencilTargetID)) &&
+        renderTargetManager.depthStencilTargetID[key.depthTarget] == platformDepthTarget;
+    if (!logicalMatches && !platformMatches) {
+        return nullptr;
+    }
+
+    return RendererStateDepthStencilView(platformDepthTarget, mapSlot);
+}
+
+void* ActiveRendererShadowState() noexcept
+{
+    void* context = nullptr;
+    if (ptr_BSGraphicsTLSIndex.address() >= 0x140000000ull) {
+        const auto tlsIndex = *ptr_BSGraphicsTLSIndex;
+        auto** tlsSlots = reinterpret_cast<void**>(__readgsqword(0x58));
+        auto* tlsBase = tlsSlots ? static_cast<std::byte*>(tlsSlots[tlsIndex]) : nullptr;
+        context = ReadField<void*>(tlsBase, kBSGraphicsTLSContextOffset);
+    }
+
+    if (!context && ptr_BSGraphicsDefaultContext.address() >= 0x140000000ull) {
+        context = *ptr_BSGraphicsDefaultContext;
+    }
+
+    if (context) {
+        return static_cast<std::byte*>(context) + kBSGraphicsContextShadowStateOffset;
+    }
+
+    return g_rendererData ? g_rendererData->shadowState : nullptr;
 }
 
 struct Aggregate {
@@ -289,7 +444,6 @@ struct ShadowCacheState {
     std::uint32_t skipsSinceUpdate = 0;
     std::uint32_t stableKeyHits = 0;
     std::uint32_t pendingBuildKeyHits = 0;
-    std::uint32_t lastDynamicMaxSkip = 0;
     std::uint64_t eligible = 0;
     std::uint64_t updates = 0;
     std::uint64_t skips = 0;
@@ -306,16 +460,17 @@ struct ShadowCacheState {
     std::uint64_t overlaySkipped = 0;
     std::uint64_t shadowMapOrMaskHookCalls = 0;
     std::uint64_t shadowMapOrMaskHookActiveCalls = 0;
-    std::array<std::uint64_t, 4> shadowMapOrMaskHookCallsByPass{};
-    std::array<std::uint64_t, 4> shadowMapOrMaskHookActiveCallsByPass{};
+    std::array<std::uint64_t, 5> shadowMapOrMaskHookCallsByPass{};
+    std::array<std::uint64_t, 5> shadowMapOrMaskHookActiveCallsByPass{};
     bool valid = false;
 };
 
 enum class ShadowCachePass : std::uint8_t {
     None,
     Passthrough,
-    StaticBuild,
-    DynamicOverlay,
+    BuildBoth,
+    StaticRender,
+    DynamicRender,
 };
 
 struct StaticDepthCache {
@@ -323,6 +478,34 @@ struct StaticDepthCache {
     REX::W32::D3D11_TEXTURE2D_DESC desc{};
     std::uint64_t validSubresources = 0;
     bool valid = false;
+};
+
+struct DirectionalSplitContext {
+    void* sunLight = nullptr;
+    void* shadowMapData = nullptr;
+    void* vanillaAccumulator = nullptr;
+    void* staticAccumulator = nullptr;
+    void* dynamicAccumulator = nullptr;
+    Key key{};
+    std::uint32_t slotIndex = kInvalidSplitIndex;
+    ShadowCachePass phase = ShadowCachePass::None;
+    bool eligible = false;
+    bool cacheHit = false;
+    bool buildBoth = false;
+    bool hitRouted = false;
+    bool suppressStaticOnHit = false;
+    bool staticRenderedThisFrame = false;
+    bool staticCaptureSucceeded = false;
+    bool staticCaptureAttempted = false;
+    bool restoreFailedThisFrame = false;
+    bool fullFallbackThisFrame = false;
+    bool dynamicRestoreAttempted = false;
+    bool dynamicRestoreSucceeded = false;
+    bool splitFailed = false;
+    bool splitEmpty = false;
+    std::uint32_t passthroughCooldown = 0;
+    std::uint32_t buildStaticRouted = 0;
+    REX::W32::ID3D11DepthStencilView* activeDepthStencilView = nullptr;
 };
 
 struct WorkAggregate {
@@ -447,17 +630,39 @@ std::array<WorkAggregate, kWorkKindCount> s_workTotals{};
 std::unordered_map<WorkKey, WorkAggregate, WorkKeyHash> s_workByKey;
 std::chrono::steady_clock::time_point s_lastLogTime;
 std::chrono::steady_clock::time_point s_lastCacheLogTime;
-ShadowCacheState s_directionalMapSlot1Cache;
-StaticDepthCache s_staticDepthCache;
-std::vector<REX::W32::ID3D11DepthStencilView*> s_staticBuildDSVs;
+std::array<ShadowCacheState, kMaxDirectionalCacheSplits> s_directionalSplitCaches{};
+std::array<StaticDepthCache, kMaxDirectionalCacheSplits> s_staticDepthCaches{};
+std::array<DirectionalSplitContext, kMaxDirectionalCacheSplits> s_directionalSplitContexts{};
+struct alignas(16) AccumulatorStorage {
+    std::byte bytes[kAccumulatorSize]{};
+};
+std::array<AccumulatorStorage, kMaxDirectionalCacheSplits> s_staticAccumulatorStorage{};
+std::array<AccumulatorStorage, kMaxDirectionalCacheSplits> s_dynamicAccumulatorStorage{};
+std::array<bool, kMaxDirectionalCacheSplits> s_staticAccumulatorConstructed{};
+std::array<bool, kMaxDirectionalCacheSplits> s_dynamicAccumulatorConstructed{};
 thread_local ShadowCachePass tl_shadowCachePass = ShadowCachePass::None;
+thread_local std::uint32_t tl_shadowCacheRenderSplit = kInvalidSplitIndex;
+thread_local std::uint32_t tl_lastRegistrationSplit = kInvalidSplitIndex;
+thread_local std::uint32_t tl_dirtyRenderTargetsSplit = kInvalidSplitIndex;
+thread_local ShadowCachePass tl_dirtyRenderTargetsPass = ShadowCachePass::None;
+thread_local REX::W32::ID3D11DepthStencilView* tl_dirtyRenderTargetsDSV = nullptr;
 std::atomic<ShadowCachePass> g_registrationShadowCachePass{ ShadowCachePass::None };
 std::atomic_bool g_registrationShadowCacheActive{ false };
-std::atomic_uint32_t g_registrationStaticKeepCount{ 0 };
-std::atomic<void*> g_registrationShadowCacheAccumulator{ nullptr };
+std::atomic_bool g_registrationSuppressStatic{ false };
+std::array<std::atomic_uint32_t, kMaxDirectionalCacheSplits> g_registrationStaticKeepCounts{};
+std::array<std::atomic_uint32_t, kMaxDirectionalCacheSplits> g_registrationDynamicKeepCounts{};
+std::array<std::atomic<void*>, kMaxDirectionalCacheSplits> g_registrationShadowCacheAccumulators{};
+std::array<std::atomic<void*>, kMaxDirectionalCacheSplits> g_registrationStaticAccumulators{};
+std::array<std::atomic<void*>, kMaxDirectionalCacheSplits> g_registrationDynamicAccumulators{};
+std::array<std::atomic_bool, kMaxDirectionalCacheSplits> g_registrationSuppressStaticBySplit{};
+std::array<std::atomic_bool, kMaxDirectionalCacheSplits> g_registrationBuildBothBySplit{};
 std::atomic_bool g_shadowCacheTargetActive{ false };
 std::atomic<std::uint32_t> g_shadowCacheTargetMapSlot{ (std::numeric_limits<std::uint32_t>::max)() };
 std::atomic<std::uint32_t> g_shadowCacheTargetDepthTarget{ (std::numeric_limits<std::uint32_t>::max)() };
+std::atomic<std::uint32_t> g_shadowCacheTargetSplit{ kInvalidSplitIndex };
+std::atomic_uint64_t g_shadowCacheClearRejectTargetInactive{ 0 };
+std::atomic_uint64_t g_shadowCacheClearRejectSplitInvalid{ 0 };
+std::atomic_uint64_t g_shadowCacheClearRejectDSVMismatch{ 0 };
 
 class ScopedOMUnbind
 {
@@ -542,33 +747,34 @@ void ResetWindow()
     s_byKey.clear();
     s_workTotals = {};
     s_workByKey.clear();
-    s_directionalMapSlot1Cache.updates = 0;
-    s_directionalMapSlot1Cache.skips = 0;
-    s_directionalMapSlot1Cache.invalidations = 0;
-    s_directionalMapSlot1Cache.hits = 0;
-    s_directionalMapSlot1Cache.misses = 0;
-    s_directionalMapSlot1Cache.staticBuilds = 0;
-    s_directionalMapSlot1Cache.restoreFailures = 0;
-    s_directionalMapSlot1Cache.captured = 0;
-    s_directionalMapSlot1Cache.emptyStaticBuilds = 0;
-    s_directionalMapSlot1Cache.staticKept = 0;
-    s_directionalMapSlot1Cache.staticSkipped = 0;
-    s_directionalMapSlot1Cache.overlayKept = 0;
-    s_directionalMapSlot1Cache.overlaySkipped = 0;
-    s_directionalMapSlot1Cache.shadowMapOrMaskHookCalls = 0;
-    s_directionalMapSlot1Cache.shadowMapOrMaskHookActiveCalls = 0;
-    s_directionalMapSlot1Cache.shadowMapOrMaskHookCallsByPass = {};
-    s_directionalMapSlot1Cache.shadowMapOrMaskHookActiveCallsByPass = {};
+    for (auto& cache : s_directionalSplitCaches) {
+        cache.updates = 0;
+        cache.skips = 0;
+        cache.invalidations = 0;
+        cache.hits = 0;
+        cache.misses = 0;
+        cache.staticBuilds = 0;
+        cache.restoreFailures = 0;
+        cache.captured = 0;
+        cache.emptyStaticBuilds = 0;
+        cache.staticKept = 0;
+        cache.staticSkipped = 0;
+        cache.overlayKept = 0;
+        cache.overlaySkipped = 0;
+        cache.shadowMapOrMaskHookCalls = 0;
+        cache.shadowMapOrMaskHookActiveCalls = 0;
+        cache.shadowMapOrMaskHookCallsByPass = {};
+        cache.shadowMapOrMaskHookActiveCallsByPass = {};
+    }
 }
 
 void SetRegistrationShadowCachePass(ShadowCachePass pass) noexcept;
 void IncrementRegistrationCounter(std::uint64_t& counter) noexcept;
-std::uint32_t ShadowCacheDynamicMaxSkips(bool stableCamera) noexcept;
 
 std::size_t PassIndex(ShadowCachePass pass) noexcept
 {
     const auto idx = static_cast<std::size_t>(pass);
-    return idx < 4 ? idx : 0;
+    return idx < 5 ? idx : 0;
 }
 
 const char* PassShortName(ShadowCachePass pass) noexcept
@@ -576,22 +782,91 @@ const char* PassShortName(ShadowCachePass pass) noexcept
     switch (pass) {
     case ShadowCachePass::None: return "n";
     case ShadowCachePass::Passthrough: return "p";
-    case ShadowCachePass::StaticBuild: return "s";
-    case ShadowCachePass::DynamicOverlay: return "d";
+    case ShadowCachePass::BuildBoth: return "b";
+    case ShadowCachePass::StaticRender: return "s";
+    case ShadowCachePass::DynamicRender: return "d";
     default: return "?";
     }
 }
 
+bool ValidSplitIndex(std::uint32_t splitIndex) noexcept
+{
+    return splitIndex < kMaxDirectionalCacheSplits;
+}
+
+ShadowCacheState& CacheForSplit(std::uint32_t splitIndex) noexcept
+{
+    return s_directionalSplitCaches[(std::min)(splitIndex, kMaxDirectionalCacheSplits - 1)];
+}
+
+StaticDepthCache& DepthCacheForSplit(std::uint32_t splitIndex) noexcept
+{
+    return s_staticDepthCaches[(std::min)(splitIndex, kMaxDirectionalCacheSplits - 1)];
+}
+
+DirectionalSplitContext& ContextForSplit(std::uint32_t splitIndex) noexcept
+{
+    return s_directionalSplitContexts[(std::min)(splitIndex, kMaxDirectionalCacheSplits - 1)];
+}
+
+bool DSVSliceMatchesMapSlot(REX::W32::ID3D11DepthStencilView* dsv, std::uint32_t mapSlot) noexcept;
+
+std::uint32_t FindDirtyRenderTargetsRestoreSplit(
+    std::uint32_t platformDepthTarget,
+    std::uint32_t mapSlot,
+    REX::W32::ID3D11DepthStencilView* dsv) noexcept
+{
+    if (!dsv || !ValidSplitIndex(mapSlot)) {
+        return kInvalidSplitIndex;
+    }
+
+    const auto renderTargetManager = RE::BSGraphics::RenderTargetManager::GetSingleton();
+    for (std::uint32_t i = 0; i < kMaxDirectionalCacheSplits; ++i) {
+        auto& ctx = ContextForSplit(i);
+        if (!ctx.cacheHit ||
+            !ctx.hitRouted ||
+            ctx.key.mapSlot != mapSlot ||
+            !DepthCacheForSplit(i).valid) {
+            continue;
+        }
+
+        if (ctx.key.depthTarget >= static_cast<std::uint32_t>(std::size(renderTargetManager.depthStencilTargetID)) ||
+            renderTargetManager.depthStencilTargetID[ctx.key.depthTarget] != platformDepthTarget) {
+            continue;
+        }
+
+        if (dsv == ActiveShadowDSV(ctx.key) || DSVSliceMatchesMapSlot(dsv, mapSlot)) {
+            return i;
+        }
+    }
+
+    return kInvalidSplitIndex;
+}
+
 bool IsRegistrationFilteringPass(ShadowCachePass pass) noexcept
 {
-    return pass == ShadowCachePass::StaticBuild ||
-           pass == ShadowCachePass::DynamicOverlay;
+    return pass == ShadowCachePass::BuildBoth ||
+           pass == ShadowCachePass::DynamicRender;
+}
+
+std::uint32_t FindRegistrationSplitForAccumulator(void* accumulator) noexcept
+{
+    if (!accumulator) {
+        return kInvalidSplitIndex;
+    }
+
+    for (std::uint32_t i = 0; i < kMaxDirectionalCacheSplits; ++i) {
+        void* expected = g_registrationShadowCacheAccumulators[i].load(std::memory_order_acquire);
+        if (expected && expected == accumulator) {
+            return i;
+        }
+    }
+    return kInvalidSplitIndex;
 }
 
 bool RegistrationAccumulatorMatches(void* accumulator) noexcept
 {
-    void* expected = g_registrationShadowCacheAccumulator.load(std::memory_order_acquire);
-    return expected == nullptr || expected == accumulator;
+    return ValidSplitIndex(FindRegistrationSplitForAccumulator(accumulator));
 }
 
 ShadowCachePass CurrentResolvedRegistrationPass() noexcept
@@ -599,41 +874,22 @@ ShadowCachePass CurrentResolvedRegistrationPass() noexcept
     return g_registrationShadowCachePass.load(std::memory_order_acquire);
 }
 
-void ReleaseStaticDepthCache() noexcept
+void ReleaseStaticDepthCache(StaticDepthCache& cache) noexcept
 {
-    if (s_staticDepthCache.texture) {
-        s_staticDepthCache.texture->Release();
-        s_staticDepthCache.texture = nullptr;
+    if (cache.texture) {
+        cache.texture->Release();
+        cache.texture = nullptr;
     }
-    s_staticDepthCache.desc = {};
-    s_staticDepthCache.validSubresources = 0;
-    s_staticDepthCache.valid = false;
+    cache.desc = {};
+    cache.validSubresources = 0;
+    cache.valid = false;
 }
 
-void ReleaseStaticBuildDSVs() noexcept
+void ReleaseStaticDepthCaches() noexcept
 {
-    for (auto* dsv : s_staticBuildDSVs) {
-        if (dsv) {
-            dsv->Release();
-        }
+    for (auto& cache : s_staticDepthCaches) {
+        ReleaseStaticDepthCache(cache);
     }
-    s_staticBuildDSVs.clear();
-}
-
-void RememberStaticBuildDSV(REX::W32::ID3D11DepthStencilView* dsv) noexcept
-{
-    if (!dsv) {
-        return;
-    }
-
-    for (auto* existing : s_staticBuildDSVs) {
-        if (existing == dsv) {
-            return;
-        }
-    }
-
-    dsv->AddRef();
-    s_staticBuildDSVs.push_back(dsv);
 }
 
 bool SameTextureDesc(const REX::W32::D3D11_TEXTURE2D_DESC& a,
@@ -716,7 +972,53 @@ bool QueryTextureFromDSV(REX::W32::ID3D11DepthStencilView* dsv,
     return true;
 }
 
-bool EnsureStaticDepthCacheTexture(REX::W32::ID3D11Texture2D* activeTexture)
+bool DSVSliceMatchesMapSlot(REX::W32::ID3D11DepthStencilView* dsv, std::uint32_t mapSlot) noexcept
+{
+    REX::W32::ID3D11Texture2D* texture = nullptr;
+    REX::W32::D3D11_DEPTH_STENCIL_VIEW_DESC dsvDesc{};
+    std::uint32_t subresource = 0;
+    if (!QueryTextureFromDSV(dsv, &texture, &dsvDesc, &subresource)) {
+        return false;
+    }
+
+    REX::W32::D3D11_TEXTURE2D_DESC texDesc{};
+    texture->GetDesc(&texDesc);
+    texture->Release();
+
+    if (texDesc.mipLevels == 0) {
+        return false;
+    }
+
+    switch (dsvDesc.viewDimension) {
+    case REX::W32::D3D11_DSV_DIMENSION_TEXTURE2D:
+    case REX::W32::D3D11_DSV_DIMENSION_TEXTURE2DMS:
+        return false;
+    case REX::W32::D3D11_DSV_DIMENSION_TEXTURE2DARRAY:
+        return dsvDesc.texture2DArray.arraySize == 1 &&
+               dsvDesc.texture2DArray.firstArraySlice == mapSlot &&
+               subresource == dsvDesc.texture2DArray.mipSlice + mapSlot * texDesc.mipLevels;
+    case REX::W32::D3D11_DSV_DIMENSION_TEXTURE2DMSARRAY:
+        return dsvDesc.texture2DMSArray.arraySize == 1 &&
+               dsvDesc.texture2DMSArray.firstArraySlice == mapSlot &&
+               subresource == mapSlot * texDesc.mipLevels;
+    default:
+        return false;
+    }
+}
+
+void* ActiveShadowTextureIdentity(REX::W32::ID3D11DepthStencilView* dsv) noexcept
+{
+    REX::W32::ID3D11Texture2D* texture = nullptr;
+    if (!QueryTextureFromDSV(dsv, &texture, nullptr, nullptr)) {
+        return nullptr;
+    }
+
+    void* identity = texture;
+    texture->Release();
+    return identity;
+}
+
+bool EnsureStaticDepthCacheTexture(StaticDepthCache& cache, REX::W32::ID3D11Texture2D* activeTexture)
 {
     if (!activeTexture || !g_rendererData || !g_rendererData->device) {
         return false;
@@ -727,21 +1029,21 @@ bool EnsureStaticDepthCacheTexture(REX::W32::ID3D11Texture2D* activeTexture)
     desc.usage = REX::W32::D3D11_USAGE_DEFAULT;
     desc.cpuAccessFlags = 0;
 
-    if (s_staticDepthCache.texture && SameTextureDesc(s_staticDepthCache.desc, desc)) {
+    if (cache.texture && SameTextureDesc(cache.desc, desc)) {
         return true;
     }
 
-    ReleaseStaticDepthCache();
+    ReleaseStaticDepthCache(cache);
     auto* device = g_rendererData->device;
-    HRESULT hr = device->CreateTexture2D(&desc, nullptr, &s_staticDepthCache.texture);
-    if (FAILED(hr) || !s_staticDepthCache.texture) {
+    HRESULT hr = device->CreateTexture2D(&desc, nullptr, &cache.texture);
+    if (FAILED(hr) || !cache.texture) {
         REX::WARN("ShadowCache: CreateTexture2D static depth cache failed 0x{:08X}", static_cast<unsigned>(hr));
         return false;
     }
 
-    s_staticDepthCache.desc = desc;
-    s_staticDepthCache.validSubresources = 0;
-    s_staticDepthCache.valid = false;
+    cache.desc = desc;
+    cache.validSubresources = 0;
+    cache.valid = false;
     return true;
 }
 
@@ -755,7 +1057,8 @@ std::uint64_t SubresourceMask(std::uint32_t subresource) noexcept
     return IsCacheableSubresource(subresource) ? (1ull << subresource) : 0ull;
 }
 
-bool CopyDSVToStaticCache(REX::W32::ID3D11DeviceContext* context,
+bool CopyDSVToStaticCache(StaticDepthCache& cache,
+                          REX::W32::ID3D11DeviceContext* context,
                           REX::W32::ID3D11DepthStencilView* dsv)
 {
     if (!context || !dsv) {
@@ -772,36 +1075,156 @@ bool CopyDSVToStaticCache(REX::W32::ID3D11DeviceContext* context,
         return false;
     }
 
-    const bool ok = EnsureStaticDepthCacheTexture(activeTexture);
+    const bool ok = EnsureStaticDepthCacheTexture(cache, activeTexture);
     if (ok) {
         ScopedOMUnbind unbind(context);
         context->CopySubresourceRegion(
-            s_staticDepthCache.texture, subresource, 0, 0, 0,
+            cache.texture, subresource, 0, 0, 0,
             activeTexture, subresource, nullptr);
-        s_staticDepthCache.validSubresources |= SubresourceMask(subresource);
-        s_staticDepthCache.valid = true;
+        cache.validSubresources |= SubresourceMask(subresource);
+        cache.valid = true;
     }
     activeTexture->Release();
     return ok;
 }
 
-bool RestoreStaticCacheToDSV(REX::W32::ID3D11DeviceContext* context,
-                             REX::W32::ID3D11DepthStencilView* dsv)
+void LogRestoreFailure(
+    const char* reason,
+    std::uint32_t splitIndex,
+    const Key& key,
+    const StaticDepthCache& cache,
+    REX::W32::ID3D11DepthStencilView* dsv,
+    REX::W32::ID3D11Texture2D* activeTexture,
+    const REX::W32::D3D11_TEXTURE2D_DESC* activeDesc,
+    std::uint32_t subresource,
+    bool subresourceKnown)
 {
-    if (!context || !dsv || !s_staticDepthCache.texture || !s_staticDepthCache.valid) {
+    if constexpr (!kShadowCacheLogEnabled) {
+        return;
+    }
+
+    const auto mask = subresourceKnown ? SubresourceMask(subresource) : 0ull;
+    REX::W32::D3D11_TEXTURE2D_DESC cacheDesc = cache.desc;
+    REX::W32::D3D11_TEXTURE2D_DESC fallbackActiveDesc{};
+    if (!activeDesc && activeTexture) {
+        activeTexture->GetDesc(&fallbackActiveDesc);
+        activeDesc = &fallbackActiveDesc;
+    }
+
+    const auto activeWidth = activeDesc ? activeDesc->width : 0u;
+    const auto activeHeight = activeDesc ? activeDesc->height : 0u;
+    const auto activeMipLevels = activeDesc ? activeDesc->mipLevels : 0u;
+    const auto activeArraySize = activeDesc ? activeDesc->arraySize : 0u;
+    const auto activeFormat = activeDesc ? static_cast<unsigned>(activeDesc->format) : 0u;
+    const auto activeBindFlags = activeDesc ? activeDesc->bindFlags : 0u;
+    const auto activeMiscFlags = activeDesc ? activeDesc->miscFlags : 0u;
+    const auto activeSampleCount = activeDesc ? activeDesc->sampleDesc.count : 0u;
+    const auto activeSampleQuality = activeDesc ? activeDesc->sampleDesc.quality : 0u;
+
+    REX::WARN(
+        "ShadowCacheRestoreFail[split={} mapSlot={} reason={}]: dsv={} activeTex={} keyDSV={} keyTex={} cacheTex={} "
+        "subresource={}/{} mask={:#x} validMask={:#x} cacheValid={} "
+        "activeDesc(w/h/mips/arr/fmt/bind/misc/sample={}/{}/{}/{}/{:#x}/{:#x}/{:#x}/{}:{}) "
+        "cacheDesc(w/h/mips/arr/fmt/bind/misc/sample={}/{}/{}/{}/{:#x}/{:#x}/{:#x}/{}:{})",
+        splitIndex,
+        key.mapSlot,
+        reason ? reason : "?",
+        static_cast<void*>(dsv),
+        static_cast<void*>(activeTexture),
+        key.activeDepthStencilView,
+        key.activeDepthTexture,
+        static_cast<void*>(cache.texture),
+        subresourceKnown ? subresource : 0u,
+        subresourceKnown,
+        mask,
+        cache.validSubresources,
+        cache.valid,
+        activeWidth,
+        activeHeight,
+        activeMipLevels,
+        activeArraySize,
+        activeFormat,
+        activeBindFlags,
+        activeMiscFlags,
+        activeSampleCount,
+        activeSampleQuality,
+        cacheDesc.width,
+        cacheDesc.height,
+        cacheDesc.mipLevels,
+        cacheDesc.arraySize,
+        static_cast<unsigned>(cacheDesc.format),
+        cacheDesc.bindFlags,
+        cacheDesc.miscFlags,
+        cacheDesc.sampleDesc.count,
+        cacheDesc.sampleDesc.quality);
+}
+
+bool RestoreStaticCacheToDSV(const StaticDepthCache& cache,
+                             REX::W32::ID3D11DeviceContext* context,
+                             REX::W32::ID3D11DepthStencilView* dsv,
+                             std::uint32_t splitIndex,
+                             const Key& key)
+{
+    if (!context || !dsv || !cache.texture || !cache.valid) {
+        LogRestoreFailure(
+            !context ? "missing-context" :
+            !dsv ? "missing-dsv" :
+            !cache.texture ? "missing-cache-texture" :
+            "cache-invalid",
+            splitIndex,
+            key,
+            cache,
+            dsv,
+            nullptr,
+            nullptr,
+            0,
+            false);
         return false;
     }
 
     REX::W32::ID3D11Texture2D* activeTexture = nullptr;
     std::uint32_t subresource = 0;
     if (!QueryTextureFromDSV(dsv, &activeTexture, nullptr, &subresource)) {
+        LogRestoreFailure(
+            "query-dsv-failed",
+            splitIndex,
+            key,
+            cache,
+            dsv,
+            nullptr,
+            nullptr,
+            0,
+            false);
         return false;
     }
 
     REX::W32::D3D11_TEXTURE2D_DESC activeDesc{};
     activeTexture->GetDesc(&activeDesc);
-    if (!SameTextureDesc(activeDesc, s_staticDepthCache.desc) ||
-        (s_staticDepthCache.validSubresources & SubresourceMask(subresource)) == 0) {
+    if (!SameTextureDesc(activeDesc, cache.desc)) {
+        LogRestoreFailure(
+            "desc-mismatch",
+            splitIndex,
+            key,
+            cache,
+            dsv,
+            activeTexture,
+            &activeDesc,
+            subresource,
+            true);
+        activeTexture->Release();
+        return false;
+    }
+    if ((cache.validSubresources & SubresourceMask(subresource)) == 0) {
+        LogRestoreFailure(
+            "missing-subresource",
+            splitIndex,
+            key,
+            cache,
+            dsv,
+            activeTexture,
+            &activeDesc,
+            subresource,
+            true);
         activeTexture->Release();
         return false;
     }
@@ -810,31 +1233,253 @@ bool RestoreStaticCacheToDSV(REX::W32::ID3D11DeviceContext* context,
         ScopedOMUnbind unbind(context);
         context->CopySubresourceRegion(
             activeTexture, subresource, 0, 0, 0,
-            s_staticDepthCache.texture, subresource, nullptr);
+            cache.texture, subresource, nullptr);
     }
     activeTexture->Release();
     return true;
 }
 
-bool CaptureStaticCacheFromBuildDSV()
+bool CaptureStaticCacheFromBuildDSV(std::uint32_t splitIndex, REX::W32::ID3D11DepthStencilView* dsv)
 {
     auto* context = g_rendererData ? g_rendererData->context : nullptr;
-    bool ok = context && !s_staticBuildDSVs.empty();
+    bool ok = context && dsv;
     if (ok) {
-        s_staticDepthCache.validSubresources = 0;
-        s_staticDepthCache.valid = false;
-        for (auto* dsv : s_staticBuildDSVs) {
-            if (!CopyDSVToStaticCache(context, dsv)) {
-                ok = false;
-                break;
-            }
-        }
+        auto& depthCache = DepthCacheForSplit(splitIndex);
+        depthCache.validSubresources = 0;
+        depthCache.valid = false;
+        ok = CopyDSVToStaticCache(depthCache, context, dsv);
     }
-    ReleaseStaticBuildDSVs();
     if (ok) {
-        ++s_directionalMapSlot1Cache.captured;
+        ++CacheForSplit(splitIndex).captured;
     }
     return ok;
+}
+
+void* ConstructScratchAccumulator(std::byte* storage, bool& constructed, std::uint32_t splitIndex)
+{
+    if (constructed) {
+        return storage;
+    }
+
+    if (ptr_BSShaderAccumulatorCtor.address() < 0x140000000ull) {
+        return nullptr;
+    }
+
+    std::memset(storage, 0, kAccumulatorSize);
+    void* accumulator = ptr_BSShaderAccumulatorCtor(storage, kShadowAccumulatorCtorMode);
+    if (!accumulator) {
+        return nullptr;
+    }
+
+    // The engine temporarily stores accumulators in NiPointer fields while
+    // rendering. Keep one plugin-owned reference so SetAccumulator(nullptr)
+    // cannot drive the count to zero and call DeleteThis on our static storage.
+    WriteField<std::uint32_t>(accumulator, kAccumulatorRefCountOffset, 1);
+    if (ptr_SetRenderMode.address() >= 0x140000000ull) {
+        ptr_SetRenderMode(accumulator, kShadowRenderMode);
+    } else {
+        WriteField<std::uint32_t>(accumulator, kAccumulatorRenderModeOffset, kShadowRenderMode);
+    }
+    if (ptr_SetDepthPassIndex.address() >= 0x140000000ull) {
+        ptr_SetDepthPassIndex(accumulator, splitIndex);
+    } else {
+        WriteField<std::uint32_t>(accumulator, kAccumulatorDepthPassIndexOffset, splitIndex);
+    }
+    constructed = true;
+    return accumulator;
+}
+
+bool EnsureScratchAccumulators(DirectionalSplitContext& ctx) noexcept
+{
+    if (!ValidSplitIndex(ctx.slotIndex)) {
+        return false;
+    }
+    void* staticAccumulator = ConstructScratchAccumulator(
+        s_staticAccumulatorStorage[ctx.slotIndex].bytes,
+        s_staticAccumulatorConstructed[ctx.slotIndex],
+        ctx.slotIndex);
+    void* dynamicAccumulator = ConstructScratchAccumulator(
+        s_dynamicAccumulatorStorage[ctx.slotIndex].bytes,
+        s_dynamicAccumulatorConstructed[ctx.slotIndex],
+        ctx.slotIndex);
+    ctx.staticAccumulator = staticAccumulator;
+    ctx.dynamicAccumulator = dynamicAccumulator;
+    return staticAccumulator && dynamicAccumulator;
+}
+
+void ClearScratchAccumulator(void* accumulator) noexcept
+{
+    if (!accumulator) {
+        return;
+    }
+
+    if (ptr_ClearActivePasses.address() >= 0x140000000ull) {
+        ptr_ClearActivePasses(accumulator, true);
+    }
+    if (ptr_ClearRenderPasses.address() >= 0x140000000ull) {
+        ptr_ClearRenderPasses(accumulator);
+    }
+    if (ptr_SetShadowSceneNode.address() >= 0x140000000ull) {
+        ptr_SetShadowSceneNode(accumulator, nullptr);
+    } else {
+        WriteField<void*>(accumulator, kAccumulatorActiveShadowSceneNodeOffset, nullptr);
+    }
+    if (ptr_SetShadowLight.address() >= 0x140000000ull) {
+        ptr_SetShadowLight(accumulator, nullptr);
+    }
+}
+
+void ConfigureScratchAccumulator(void* scratch, void* vanilla, std::uint32_t slotIndex) noexcept
+{
+    if (!scratch || !vanilla) {
+        return;
+    }
+
+    ClearScratchAccumulator(scratch);
+    const auto renderMode = ReadField<std::uint32_t>(vanilla, kAccumulatorRenderModeOffset, kShadowRenderMode);
+    if (ptr_SetRenderMode.address() >= 0x140000000ull) {
+        ptr_SetRenderMode(scratch, renderMode);
+    } else {
+        WriteField<std::uint32_t>(scratch, kAccumulatorRenderModeOffset, renderMode);
+    }
+
+    auto* shadowSceneNode = ReadField<void*>(vanilla, kAccumulatorActiveShadowSceneNodeOffset);
+    if (ptr_SetShadowSceneNode.address() >= 0x140000000ull) {
+        ptr_SetShadowSceneNode(scratch, shadowSceneNode);
+    } else {
+        WriteField<void*>(scratch, kAccumulatorActiveShadowSceneNodeOffset, shadowSceneNode);
+    }
+
+    if (ptr_SetDepthPassIndex.address() >= 0x140000000ull) {
+        ptr_SetDepthPassIndex(scratch, slotIndex);
+    } else {
+        WriteField<std::uint32_t>(scratch, kAccumulatorDepthPassIndexOffset, slotIndex);
+    }
+
+    // Copy the small render-flag/silhouette block, but leave owned containers
+    // and renderer internals on the scratch accumulator's own storage.
+    std::memcpy(
+        static_cast<std::byte*>(scratch) + 0xB0,
+        static_cast<std::byte*>(vanilla) + 0xB0,
+        0x18);
+}
+
+bool PrepareScratchAccumulators(DirectionalSplitContext& ctx, void* vanillaAccumulator) noexcept
+{
+    if (!vanillaAccumulator || !EnsureScratchAccumulators(ctx)) {
+        return false;
+    }
+
+    ConfigureScratchAccumulator(ctx.staticAccumulator, vanillaAccumulator, ctx.slotIndex);
+    ConfigureScratchAccumulator(ctx.dynamicAccumulator, vanillaAccumulator, ctx.slotIndex);
+    g_registrationStaticAccumulators[ctx.slotIndex].store(ctx.staticAccumulator, std::memory_order_release);
+    g_registrationDynamicAccumulators[ctx.slotIndex].store(ctx.dynamicAccumulator, std::memory_order_release);
+    return true;
+}
+
+void ClearScratchAccumulators(DirectionalSplitContext& ctx) noexcept
+{
+    ClearScratchAccumulator(ctx.staticAccumulator);
+    ClearScratchAccumulator(ctx.dynamicAccumulator);
+}
+
+void ClearAllScratchAccumulators() noexcept
+{
+    for (auto& ctx : s_directionalSplitContexts) {
+        ClearScratchAccumulators(ctx);
+    }
+}
+
+std::byte* ShadowMapDataForSlot(void* light, std::uint32_t slotIndex) noexcept
+{
+    if (!light) {
+        return nullptr;
+    }
+
+    const auto count = ReadField<std::uint32_t>(light, kShadowMapDataCountOffset);
+    if (slotIndex >= count) {
+        return nullptr;
+    }
+
+    auto* base = ReadField<std::byte*>(light, kShadowMapDataArrayOffset);
+    if (!base) {
+        return nullptr;
+    }
+    return base + static_cast<std::size_t>(slotIndex) * kShadowMapDataStride;
+}
+
+Scope MakeScope(void* light, void* shadowMapData, LightKind kind) noexcept
+{
+    Scope scope;
+    scope.shadowMapData = shadowMapData;
+    scope.key.light = light;
+    scope.key.kind = kind;
+    scope.shadowMapDataIndex = ShadowMapDataIndex(light, shadowMapData);
+    scope.camera = ReadField<void*>(shadowMapData, 0x40);
+    scope.key.cameraSig = ShadowCameraSignature(scope.camera);
+    scope.key.dominantLightSig = DominantLightDirectionSignature();
+    scope.key.accumulator = ReadField<void*>(shadowMapData, kShadowMapAccumulatorOffset);
+    scope.key.depthTarget = ReadField<std::uint32_t>(shadowMapData, kShadowMapDepthTargetOffset);
+    scope.key.mapSlot = ReadField<std::uint32_t>(shadowMapData, kShadowMapMapSlotOffset);
+    scope.key.activeDepthStencilView = ActiveShadowDSV(scope.key);
+    scope.key.activeDepthTexture = ActiveShadowTextureIdentity(
+        static_cast<REX::W32::ID3D11DepthStencilView*>(scope.key.activeDepthStencilView));
+    scope.key.viewport.d0 = ReadField<std::uint32_t>(shadowMapData, 0xD0);
+    scope.key.viewport.d4 = ReadField<std::uint32_t>(shadowMapData, 0xD4);
+    scope.key.viewport.d8 = ReadField<std::uint32_t>(shadowMapData, 0xD8);
+    scope.key.viewport.dc = ReadField<std::uint32_t>(shadowMapData, 0xDC);
+    scope.cullingProcess = ReadField<void*>(shadowMapData, 0xE0);
+    scope.inDeferredLights = PhaseTelemetry::IsInDeferredLightsImpl();
+    scope.start = std::chrono::steady_clock::now();
+    return scope;
+}
+
+void PublishRegistrationTarget(
+    const Scope& scope,
+    DirectionalSplitContext& ctx,
+    ShadowCachePass pass,
+    bool suppressStatic) noexcept
+{
+    if (!ValidSplitIndex(ctx.slotIndex)) {
+        return;
+    }
+    if (pass == ShadowCachePass::BuildBoth) {
+        g_registrationStaticKeepCounts[ctx.slotIndex].store(0, std::memory_order_relaxed);
+        g_registrationDynamicKeepCounts[ctx.slotIndex].store(0, std::memory_order_relaxed);
+    }
+    tl_shadowCachePass = pass;
+    g_registrationShadowCacheAccumulators[ctx.slotIndex].store(scope.key.accumulator, std::memory_order_release);
+    g_registrationShadowCachePass.store(pass, std::memory_order_release);
+    g_registrationSuppressStatic.store(suppressStatic, std::memory_order_release);
+    g_registrationShadowCacheActive.store(pass == ShadowCachePass::BuildBoth || suppressStatic, std::memory_order_release);
+    g_registrationSuppressStaticBySplit[ctx.slotIndex].store(suppressStatic, std::memory_order_release);
+    g_registrationBuildBothBySplit[ctx.slotIndex].store(pass == ShadowCachePass::BuildBoth, std::memory_order_release);
+    g_shadowCacheTargetMapSlot.store(scope.key.mapSlot, std::memory_order_release);
+    g_shadowCacheTargetDepthTarget.store(scope.key.depthTarget, std::memory_order_release);
+    g_shadowCacheTargetSplit.store(ctx.slotIndex, std::memory_order_release);
+    g_shadowCacheTargetActive.store(true, std::memory_order_release);
+}
+
+void ClearRegistrationTarget() noexcept
+{
+    g_registrationShadowCachePass.store(ShadowCachePass::None, std::memory_order_release);
+    g_registrationShadowCacheActive.store(false, std::memory_order_release);
+    g_registrationSuppressStatic.store(false, std::memory_order_release);
+    for (std::uint32_t i = 0; i < kMaxDirectionalCacheSplits; ++i) {
+        g_registrationShadowCacheAccumulators[i].store(nullptr, std::memory_order_release);
+        g_registrationStaticAccumulators[i].store(nullptr, std::memory_order_release);
+        g_registrationDynamicAccumulators[i].store(nullptr, std::memory_order_release);
+        g_registrationSuppressStaticBySplit[i].store(false, std::memory_order_release);
+        g_registrationBuildBothBySplit[i].store(false, std::memory_order_release);
+        g_registrationStaticKeepCounts[i].store(0, std::memory_order_release);
+        g_registrationDynamicKeepCounts[i].store(0, std::memory_order_release);
+    }
+    g_shadowCacheTargetActive.store(false, std::memory_order_release);
+    g_shadowCacheTargetMapSlot.store((std::numeric_limits<std::uint32_t>::max)(), std::memory_order_release);
+    g_shadowCacheTargetDepthTarget.store((std::numeric_limits<std::uint32_t>::max)(), std::memory_order_release);
+    g_shadowCacheTargetSplit.store(kInvalidSplitIndex, std::memory_order_release);
+    tl_shadowCacheRenderSplit = kInvalidSplitIndex;
+    tl_lastRegistrationSplit = kInvalidSplitIndex;
 }
 
 bool IsClose(std::uint32_t a, std::uint32_t b, std::uint32_t tolerance) noexcept
@@ -861,18 +1506,10 @@ bool CacheKeyStable(const Key& cached, const Key& current) noexcept
            ViewportClose(cached.viewport, current.viewport);
 }
 
-std::uint32_t ShadowCacheDynamicMaxSkips(bool stableCamera) noexcept
-{
-    if (!stableCamera) {
-        return 1u;
-    }
-
-    const std::uint32_t configured = (std::max)(1u, SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_MAX_SKIP);
-    return (std::min<std::uint32_t>)(8u, configured);
-}
-
 void MaybeLogShadowCache(
     const Scope& scope,
+    ShadowCacheState& cache,
+    const StaticDepthCache& depthCache,
     const char* decision,
     bool cacheEligible,
     bool cacheHit,
@@ -880,11 +1517,14 @@ void MaybeLogShadowCache(
     bool preDepthValid,
     bool preStableKey)
 {
+    if constexpr (!kShadowCacheLogEnabled) {
+        return;
+    }
+
     if (!SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON) {
         return;
     }
 
-    auto& cache = s_directionalMapSlot1Cache;
     const bool hasActivity =
         cache.eligible != 0 ||
         cache.hits != 0 ||
@@ -906,6 +1546,8 @@ void MaybeLogShadowCache(
     const auto cachedKeyHash = static_cast<std::uint64_t>(KeyHash{}(cache.key));
     const auto currentKeyHash = static_cast<std::uint64_t>(KeyHash{}(scope.key));
     const bool keyLightEq = cache.key.light == scope.key.light;
+    const bool keyDSVEq = cache.key.activeDepthStencilView == scope.key.activeDepthStencilView;
+    const bool keyTexEq = cache.key.activeDepthTexture == scope.key.activeDepthTexture;
     const bool keyCameraEq = cache.key.cameraSig == scope.key.cameraSig;
     const bool keySunEq = cache.key.dominantLightSig == scope.key.dominantLightSig;
     const bool keyDepthEq = cache.key.depthTarget == scope.key.depthTarget;
@@ -914,18 +1556,18 @@ void MaybeLogShadowCache(
     const bool keyViewportEq = ViewportClose(cache.key.viewport, scope.key.viewport);
 
     REX::INFO(
-        "ShadowCache[directional idx={} mapSlot={} targetSlot={}]: decision={} eligibleNow={} hitNow={} "
+        "ShadowCache[directional idx={} mapSlot={} targetSplit={}]: decision={} eligibleNow={} hitNow={} "
         "pre(valid/depth/stable)={}/{}/{} "
         "post(valid/depth/stableHits/skips)={}/{}/{}/{} "
-        "key(cur/cache)={:#x}/{:#x} keyEq(l/cam/sun/depth/slot/kind/vp)={}/{}/{}/{}/{}/{}/{} viewport=({},{},{},{}) "
+        "key(cur/cache)={:#x}/{:#x} keyEq(l/dsv/tex/cam/sun/depth/slot/kind/vp)={}/{}/{}/{}/{}/{}/{}/{}/{} viewport=({},{},{},{}) "
         "dsv(validMask={:#x}) pass={}/{} "
         "eligible={} hits={} misses={} staticBuilds={} captures={} "
         "emptyStatic={} restoreFailures={} staticKeep={} staticSkip={} overlayKeep={} overlaySkip={} "
-        "regSM={}/{} smPass(n/p/s/d={}/{}/{}/{}, active={}/{}/{}/{}) "
+        "regSM={}/{} smPass(n/p/b/s/d={}/{}/{}/{}/{}, active={}/{}/{}/{}/{}) "
         "updates={} skips={} invalidations={}",
         scope.shadowMapDataIndex,
         scope.key.mapSlot,
-        kDirectionalCacheMapSlot,
+        scope.shadowMapDataIndex,
         decision ? decision : "?",
         cacheEligible,
         cacheHit,
@@ -933,12 +1575,14 @@ void MaybeLogShadowCache(
         preDepthValid,
         preStableKey,
         cache.valid,
-        s_staticDepthCache.valid,
+        depthCache.valid,
         cache.stableKeyHits,
         cache.skipsSinceUpdate,
         currentKeyHash,
         cachedKeyHash,
         keyLightEq,
+        keyDSVEq,
+        keyTexEq,
         keyCameraEq,
         keySunEq,
         keyDepthEq,
@@ -949,7 +1593,7 @@ void MaybeLogShadowCache(
         scope.key.viewport.d4,
         scope.key.viewport.d8,
         scope.key.viewport.dc,
-        s_staticDepthCache.validSubresources,
+        depthCache.validSubresources,
         PassShortName(registrationPass),
         registrationActive,
         cache.eligible,
@@ -967,12 +1611,14 @@ void MaybeLogShadowCache(
         cache.shadowMapOrMaskHookCalls,
         cache.shadowMapOrMaskHookCallsByPass[PassIndex(ShadowCachePass::None)],
         cache.shadowMapOrMaskHookCallsByPass[PassIndex(ShadowCachePass::Passthrough)],
-        cache.shadowMapOrMaskHookCallsByPass[PassIndex(ShadowCachePass::StaticBuild)],
-        cache.shadowMapOrMaskHookCallsByPass[PassIndex(ShadowCachePass::DynamicOverlay)],
+        cache.shadowMapOrMaskHookCallsByPass[PassIndex(ShadowCachePass::BuildBoth)],
+        cache.shadowMapOrMaskHookCallsByPass[PassIndex(ShadowCachePass::StaticRender)],
+        cache.shadowMapOrMaskHookCallsByPass[PassIndex(ShadowCachePass::DynamicRender)],
         cache.shadowMapOrMaskHookActiveCallsByPass[PassIndex(ShadowCachePass::None)],
         cache.shadowMapOrMaskHookActiveCallsByPass[PassIndex(ShadowCachePass::Passthrough)],
-        cache.shadowMapOrMaskHookActiveCallsByPass[PassIndex(ShadowCachePass::StaticBuild)],
-        cache.shadowMapOrMaskHookActiveCallsByPass[PassIndex(ShadowCachePass::DynamicOverlay)],
+        cache.shadowMapOrMaskHookActiveCallsByPass[PassIndex(ShadowCachePass::BuildBoth)],
+        cache.shadowMapOrMaskHookActiveCallsByPass[PassIndex(ShadowCachePass::StaticRender)],
+        cache.shadowMapOrMaskHookActiveCallsByPass[PassIndex(ShadowCachePass::DynamicRender)],
         cache.updates,
         cache.skips,
         cache.invalidations);
@@ -996,24 +1642,69 @@ void MaybeLogShadowCache(
     cache.shadowMapOrMaskHookActiveCallsByPass = {};
 }
 
-bool IsDirectionalMapSlot1CacheEligible(const Scope& scope) noexcept
+void MaybeLogDirectionalAccumulation(std::uint32_t liveCount)
 {
-    return SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON &&
-           SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_MAX_SKIP != 0 &&
-           scope.key.kind == LightKind::Directional &&
-           scope.key.mapSlot == kDirectionalCacheMapSlot &&
-           scope.key.light != nullptr &&
-           scope.key.accumulator != nullptr;
+    if constexpr (!kShadowCacheLogEnabled) {
+        return;
+    }
+
+    if (!SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON) {
+        return;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    const double secs = std::chrono::duration<double>(now - s_lastCacheLogTime).count();
+    if (secs < kLogIntervalSecs) {
+        return;
+    }
+    s_lastCacheLogTime = now;
+
+    std::ostringstream splits;
+    for (std::uint32_t i = 0; i < liveCount; ++i) {
+        const auto& ctx = ContextForSplit(i);
+        const auto& cache = CacheForSplit(i);
+        const auto& depth = DepthCacheForSplit(i);
+        if (i != 0) {
+            splits << ' ';
+        }
+        splits << "[idx=" << i
+               << " mapSlot=" << ctx.key.mapSlot
+               << " eligible=" << ctx.eligible
+               << " hit=" << ctx.cacheHit
+               << " build=" << ctx.buildBoth
+               << " empty=" << ctx.splitEmpty
+               << " valid/depth=" << cache.valid << '/' << depth.valid
+               << " routedS/D=" << ctx.buildStaticRouted << '/'
+               << g_registrationDynamicKeepCounts[i].load(std::memory_order_relaxed)
+               << ']';
+    }
+
+    REX::INFO("ShadowCacheAccum[directional liveSplits={} capped={}]: {}",
+              liveCount,
+              kMaxDirectionalCacheSplits,
+              splits.str());
 }
 
-bool DirectionalMapSlot1CacheHit(const Scope& scope) noexcept
+bool IsDirectionalSplitCacheEligible(const Scope& scope) noexcept
 {
-    auto& cache = s_directionalMapSlot1Cache;
+    if (!SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON ||
+        scope.key.kind != LightKind::Directional ||
+        !ValidSplitIndex(scope.shadowMapDataIndex) ||
+        scope.key.mapSlot < kFirstCacheableDirectionalMapSlot ||
+        !scope.key.light ||
+        !scope.key.accumulator) {
+        return false;
+    }
+
+    return true;
+}
+
+bool DirectionalSplitCacheHit(const Scope& scope, ShadowCacheState& cache, StaticDepthCache& depthCache) noexcept
+{
     const bool stableKey = CacheKeyStable(cache.key, scope.key);
     if (!cache.valid ||
-        !s_staticDepthCache.valid) {
+        !depthCache.valid) {
         cache.stableKeyHits = 0;
-        cache.lastDynamicMaxSkip = ShadowCacheDynamicMaxSkips(false);
         return false;
     }
 
@@ -1022,17 +1713,7 @@ bool DirectionalMapSlot1CacheHit(const Scope& scope) noexcept
         cache.valid = false;
         cache.skipsSinceUpdate = 0;
         cache.stableKeyHits = 0;
-        cache.lastDynamicMaxSkip = ShadowCacheDynamicMaxSkips(false);
-        ReleaseStaticDepthCache();
-        return false;
-    }
-
-    const bool stableCamera = cache.stableKeyHits >= 2;
-    const std::uint32_t dynamicMaxSkips = ShadowCacheDynamicMaxSkips(stableCamera);
-    cache.lastDynamicMaxSkip = dynamicMaxSkips;
-    if (!stableCamera && cache.skipsSinceUpdate >= dynamicMaxSkips) {
-        cache.skipsSinceUpdate = 0;
-        cache.stableKeyHits = 0;
+        ReleaseStaticDepthCache(depthCache);
         return false;
     }
 
@@ -1043,11 +1724,10 @@ bool DirectionalMapSlot1CacheHit(const Scope& scope) noexcept
     return true;
 }
 
-bool DirectionalMapSlot1StaticBuildReady(const Scope& scope) noexcept
+bool DirectionalSplitStaticBuildReady(const Scope& scope, ShadowCacheState& cache, const StaticDepthCache& depthCache) noexcept
 {
-    auto& cache = s_directionalMapSlot1Cache;
     if (cache.valid &&
-        s_staticDepthCache.valid &&
+        depthCache.valid &&
         CacheKeyStable(cache.key, scope.key)) {
         cache.pendingBuildKey = {};
         cache.pendingBuildKeyHits = 0;
@@ -1066,15 +1746,15 @@ bool DirectionalMapSlot1StaticBuildReady(const Scope& scope) noexcept
     return cache.pendingBuildKeyHits >= 2;
 }
 
-void MarkDirectionalMapSlot1CacheUpdated(const Scope& scope) noexcept
+void MarkDirectionalSplitCacheUpdated(const Scope& scope) noexcept
 {
     if (!SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON ||
         scope.key.kind != LightKind::Directional ||
-        scope.key.mapSlot != kDirectionalCacheMapSlot) {
+        !ValidSplitIndex(scope.shadowMapDataIndex)) {
         return;
     }
 
-    ++s_directionalMapSlot1Cache.updates;
+    ++CacheForSplit(scope.shadowMapDataIndex).updates;
 }
 
 void MaybeLog()
@@ -1111,11 +1791,13 @@ void MaybeLog()
     for (std::size_t i = 0; i < n; ++i) {
         const auto& [key, b] = rows[i];
         REX::INFO(
-            "  Shadow[{}] light={} accum={} depthTarget={} mapSlot={} viewport=({},{},{},{}) "
+            "  Shadow[{}] light={} accum={} dsv={} tex={} depthTarget={} mapSlot={} viewport=({},{},{},{}) "
             "calls={} totalMs/s={:.2f} avgUs={:.1f} d3dDraws/call={:.1f} bsDraws/call={:.1f}",
             LightKindName(key.kind),
             key.light,
             key.accumulator,
+            key.activeDepthStencilView,
+            key.activeDepthTexture,
             key.depthTarget,
             key.mapSlot,
             key.viewport.d0, key.viewport.d4, key.viewport.d8, key.viewport.dc,
@@ -1209,61 +1891,39 @@ void HookedRenderScene(void* camera, void* accumulator, bool flag)
 
 void SetRegistrationShadowCachePass(ShadowCachePass pass) noexcept
 {
-    const bool active = pass == ShadowCachePass::StaticBuild ||
-                        pass == ShadowCachePass::DynamicOverlay;
-    if (pass == ShadowCachePass::StaticBuild) {
-        g_registrationStaticKeepCount.store(0, std::memory_order_relaxed);
-    }
+    const bool active = pass == ShadowCachePass::BuildBoth;
+    tl_shadowCachePass = pass;
     g_registrationShadowCachePass.store(pass, std::memory_order_release);
     g_registrationShadowCacheActive.store(active, std::memory_order_release);
 }
-
-class ScopedShadowCacheAccumulator
-{
-public:
-    explicit ScopedShadowCacheAccumulator(const Scope& scope) noexcept :
-        previousThreadPass_(tl_shadowCachePass),
-        previousAccumulator_(g_registrationShadowCacheAccumulator.load(std::memory_order_acquire)),
-        previousTargetActive_(g_shadowCacheTargetActive.load(std::memory_order_acquire)),
-        previousTargetMapSlot_(g_shadowCacheTargetMapSlot.load(std::memory_order_acquire)),
-        previousTargetDepthTarget_(g_shadowCacheTargetDepthTarget.load(std::memory_order_acquire))
-    {
-        g_registrationShadowCacheAccumulator.store(scope.key.accumulator, std::memory_order_release);
-        g_shadowCacheTargetMapSlot.store(scope.key.mapSlot, std::memory_order_release);
-        g_shadowCacheTargetDepthTarget.store(scope.key.depthTarget, std::memory_order_release);
-        g_shadowCacheTargetActive.store(true, std::memory_order_release);
-    }
-
-    ~ScopedShadowCacheAccumulator()
-    {
-        tl_shadowCachePass = previousThreadPass_;
-        g_registrationShadowCacheAccumulator.store(previousAccumulator_, std::memory_order_release);
-        g_shadowCacheTargetMapSlot.store(previousTargetMapSlot_, std::memory_order_release);
-        g_shadowCacheTargetDepthTarget.store(previousTargetDepthTarget_, std::memory_order_release);
-        g_shadowCacheTargetActive.store(previousTargetActive_, std::memory_order_release);
-        SetRegistrationShadowCachePass(previousThreadPass_);
-    }
-
-    ScopedShadowCacheAccumulator(const ScopedShadowCacheAccumulator&) = delete;
-    ScopedShadowCacheAccumulator& operator=(const ScopedShadowCacheAccumulator&) = delete;
-
-private:
-    ShadowCachePass previousThreadPass_ = ShadowCachePass::None;
-    void* previousAccumulator_ = nullptr;
-    bool previousTargetActive_ = false;
-    std::uint32_t previousTargetMapSlot_ = (std::numeric_limits<std::uint32_t>::max)();
-    std::uint32_t previousTargetDepthTarget_ = (std::numeric_limits<std::uint32_t>::max)();
-};
 
 void IncrementRegistrationCounter(std::uint64_t& counter) noexcept
 {
     std::atomic_ref<std::uint64_t>(counter).fetch_add(1, std::memory_order_relaxed);
 }
 
-void BeginShadowCachePass(ShadowCachePass pass) noexcept
+void BeginShadowCachePass(DirectionalSplitContext* ctx, ShadowCachePass pass) noexcept
 {
-    tl_shadowCachePass = pass;
+    if (ctx) {
+        ctx->phase = pass;
+        tl_shadowCacheRenderSplit = ctx->slotIndex;
+    } else {
+        tl_shadowCacheRenderSplit = kInvalidSplitIndex;
+    }
     SetRegistrationShadowCachePass(pass);
+    if (pass == ShadowCachePass::Passthrough || pass == ShadowCachePass::None) {
+        g_registrationSuppressStatic.store(false, std::memory_order_release);
+        g_registrationShadowCacheActive.store(false, std::memory_order_release);
+    }
+    g_shadowCacheTargetActive.store(pass == ShadowCachePass::StaticRender ||
+                                        pass == ShadowCachePass::DynamicRender ||
+                                        (ctx && ctx->suppressStaticOnHit),
+                                    std::memory_order_release);
+    g_shadowCacheTargetSplit.store(ctx ? ctx->slotIndex : kInvalidSplitIndex, std::memory_order_release);
+    if (ctx) {
+        g_shadowCacheTargetMapSlot.store(ctx->key.mapSlot, std::memory_order_release);
+        g_shadowCacheTargetDepthTarget.store(ctx->key.depthTarget, std::memory_order_release);
+    }
 }
 
 bool RunOriginalRenderShadowMap(void* light, void* shadowMapData)
@@ -1276,68 +1936,501 @@ bool RunOriginalRenderShadowMap(void* light, void* shadowMapData)
     return true;
 }
 
-bool RunCustomDirectionalMapSlot1ShadowMap(void* light,
-                                           void* shadowMapData,
-                                           const Scope& scope,
-                                           bool buildStatic,
-                                           bool& outStaticCaptured)
+class ScopedShadowMapAccumulatorSwap
 {
-    outStaticCaptured = false;
-
-    if (buildStatic) {
-        ReleaseStaticBuildDSVs();
-        RememberStaticBuildDSV(ActiveShadowDSV(scope.key));
-
-        BeginShadowCachePass(ShadowCachePass::StaticBuild);
-        if (!RunOriginalRenderShadowMap(light, shadowMapData)) {
-            return false;
+public:
+    ScopedShadowMapAccumulatorSwap(void* shadowMapData, void* replacement) :
+        shadowMapData_(shadowMapData),
+        original_(ReadField<void*>(shadowMapData, kShadowMapAccumulatorOffset))
+    {
+        if (!shadowMapData_ || !replacement) {
+            return;
         }
 
-        const std::uint32_t kept = g_registrationStaticKeepCount.load(std::memory_order_acquire);
-        const bool hasStaticRegistrations = kept != 0;
-        if (hasStaticRegistrations && CaptureStaticCacheFromBuildDSV()) {
-            s_directionalMapSlot1Cache.valid = true;
-            s_directionalMapSlot1Cache.key = scope.key;
-            s_directionalMapSlot1Cache.skipsSinceUpdate = 0;
-            s_directionalMapSlot1Cache.stableKeyHits = 0;
-            s_directionalMapSlot1Cache.pendingBuildKey = {};
-            s_directionalMapSlot1Cache.pendingBuildKeyHits = 0;
-            s_directionalMapSlot1Cache.lastDynamicMaxSkip = ShadowCacheDynamicMaxSkips(false);
-            outStaticCaptured = true;
-        } else {
-            s_directionalMapSlot1Cache.valid = false;
-            ReleaseStaticDepthCache();
-            ReleaseStaticBuildDSVs();
-            if (!hasStaticRegistrations) {
-                ++s_directionalMapSlot1Cache.emptyStaticBuilds;
-            }
+        WriteField<void*>(shadowMapData_, kShadowMapAccumulatorOffset, replacement);
+        active_ = true;
+    }
 
-            // Static cache build failed. Re-render the same shadow map without
-            // filtering so the visible frame is complete.
-            BeginShadowCachePass(ShadowCachePass::Passthrough);
-            RunOriginalRenderShadowMap(light, shadowMapData);
-            return true;
-        }
-    } else {
-        if (!s_staticDepthCache.valid) {
-            s_directionalMapSlot1Cache.valid = false;
-            BeginShadowCachePass(ShadowCachePass::Passthrough);
-            if (!RunOriginalRenderShadowMap(light, shadowMapData)) {
-                return false;
-            }
-            return true;
+    ~ScopedShadowMapAccumulatorSwap()
+    {
+        if (active_) {
+            WriteField<void*>(shadowMapData_, kShadowMapAccumulatorOffset, original_);
         }
     }
 
-    // DynamicOverlay uses the vanilla RenderShadowMap lifetime. The clear hook
-    // restores the cached static depth into the just-bound DSV and suppresses
-    // the original clear before dynamic/unknown casters are registered.
-    BeginShadowCachePass(ShadowCachePass::DynamicOverlay);
-    if (!RunOriginalRenderShadowMap(light, shadowMapData)) {
+    bool Active() const noexcept { return active_; }
+
+    ScopedShadowMapAccumulatorSwap(const ScopedShadowMapAccumulatorSwap&) = delete;
+    ScopedShadowMapAccumulatorSwap& operator=(const ScopedShadowMapAccumulatorSwap&) = delete;
+
+private:
+    void* shadowMapData_ = nullptr;
+    void* original_ = nullptr;
+    bool active_ = false;
+};
+
+void ResetDirectionalSplitFrameContexts() noexcept
+{
+    for (std::uint32_t i = 0; i < kMaxDirectionalCacheSplits; ++i) {
+        void* staticAccumulator = s_directionalSplitContexts[i].staticAccumulator;
+        void* dynamicAccumulator = s_directionalSplitContexts[i].dynamicAccumulator;
+        const std::uint32_t passthroughCooldown = s_directionalSplitContexts[i].passthroughCooldown;
+        s_directionalSplitContexts[i] = {};
+        s_directionalSplitContexts[i].staticAccumulator = staticAccumulator;
+        s_directionalSplitContexts[i].dynamicAccumulator = dynamicAccumulator;
+        s_directionalSplitContexts[i].slotIndex = i;
+        s_directionalSplitContexts[i].passthroughCooldown = passthroughCooldown > 0 ? passthroughCooldown - 1 : 0;
+    }
+}
+
+bool ContextMatchesScope(const DirectionalSplitContext& ctx, const Scope& scope) noexcept
+{
+    return ctx.sunLight == scope.key.light &&
+           ctx.shadowMapData == scope.shadowMapData &&
+           ctx.vanillaAccumulator == scope.key.accumulator &&
+           ctx.key.depthTarget == scope.key.depthTarget &&
+           ctx.key.mapSlot == scope.key.mapSlot &&
+           ctx.key.kind == scope.key.kind &&
+           CacheKeyStable(ctx.key, scope.key);
+}
+
+REX::W32::ID3D11DepthStencilView* ResolveShadowDSV(const DirectionalSplitContext& ctx, const Scope& scope) noexcept
+{
+    auto* active = ActiveShadowDSVFromRendererState(scope.key);
+    if (active) {
+        return active;
+    }
+
+    if (ctx.activeDepthStencilView &&
+        DSVSliceMatchesMapSlot(ctx.activeDepthStencilView, scope.key.mapSlot)) {
+        return ctx.activeDepthStencilView;
+    }
+    return nullptr;
+}
+
+bool ShadowPassDSVMatches(const DirectionalSplitContext& ctx, REX::W32::ID3D11DepthStencilView* dsv) noexcept
+{
+    if (!dsv) {
         return false;
     }
 
+    if (auto* active = ActiveShadowDSVFromRendererState(ctx.key)) {
+        return dsv == active;
+    }
+
+    return DSVSliceMatchesMapSlot(dsv, ctx.key.mapSlot);
+}
+
+void MaybeLogShadowCacheClearReject(
+    const char* reason,
+    std::atomic_uint64_t& counter,
+    REX::W32::ID3D11DepthStencilView* dsv,
+    std::uint32_t clearFlags,
+    float depth,
+    std::uint8_t stencil) noexcept
+{
+    if constexpr (!kShadowCacheLogEnabled) {
+        return;
+    }
+
+    const std::uint64_t count = counter.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (count > 16 && (count % 128) != 0) {
+        return;
+    }
+
+    const auto split = ValidSplitIndex(tl_shadowCacheRenderSplit) ?
+        tl_shadowCacheRenderSplit :
+        tl_dirtyRenderTargetsSplit;
+    const bool validSplit = ValidSplitIndex(split);
+    const DirectionalSplitContext* ctx = validSplit ? &ContextForSplit(split) : nullptr;
+    const Key* key = ctx ? &ctx->key : nullptr;
+    auto* expected = key ? ActiveShadowDSV(*key) : nullptr;
+    void* incomingTex = ActiveShadowTextureIdentity(dsv);
+    void* expectedTex = ActiveShadowTextureIdentity(expected);
+    const bool incomingSlotMatches = key && DSVSliceMatchesMapSlot(dsv, key->mapSlot);
+    const bool expectedSlotMatches = key && DSVSliceMatchesMapSlot(expected, key->mapSlot);
+
+    REX::WARN(
+        "ShadowCacheClearReject[{} #{}]: pass={} targetActive={} split={} validSplit={} "
+        "incomingDSV={} incomingTex={} incomingSlotMatch={} expectedDSV={} expectedTex={} expectedSlotMatch={} "
+        "keyDSV={} keyTex={} depthTarget={} mapSlot={} targetDepth={} targetSlot={} flags={:#x} depth={} stencil={}",
+        reason ? reason : "?",
+        count,
+        PassShortName(ValidSplitIndex(tl_dirtyRenderTargetsSplit) ?
+            tl_dirtyRenderTargetsPass :
+            CurrentResolvedRegistrationPass()),
+        g_shadowCacheTargetActive.load(std::memory_order_acquire),
+        split,
+        validSplit,
+        static_cast<void*>(dsv),
+        incomingTex,
+        incomingSlotMatches,
+        static_cast<void*>(expected),
+        expectedTex,
+        expectedSlotMatches,
+        key ? key->activeDepthStencilView : nullptr,
+        key ? key->activeDepthTexture : nullptr,
+        key ? key->depthTarget : 0,
+        key ? key->mapSlot : 0,
+        g_shadowCacheTargetDepthTarget.load(std::memory_order_acquire),
+        g_shadowCacheTargetMapSlot.load(std::memory_order_acquire),
+        clearFlags,
+        depth,
+        stencil);
+}
+
+void MarkStaticCachePublished(DirectionalSplitContext& ctx, ShadowCacheState& cache, const Scope& scope) noexcept
+{
+    cache.valid = true;
+    cache.key = scope.key;
+    if (ctx.activeDepthStencilView) {
+        cache.key.activeDepthStencilView = ctx.activeDepthStencilView;
+        cache.key.activeDepthTexture = ActiveShadowTextureIdentity(ctx.activeDepthStencilView);
+    }
+    cache.skipsSinceUpdate = 0;
+    cache.stableKeyHits = 0;
+    cache.pendingBuildKey = {};
+    cache.pendingBuildKeyHits = 0;
+    ctx.cacheHit = false;
+}
+
+bool CaptureAndPublishStaticCache(DirectionalSplitContext& ctx)
+{
+    if (!ValidSplitIndex(ctx.slotIndex)) {
+        return false;
+    }
+
+    auto& cache = CacheForSplit(ctx.slotIndex);
+    auto& depthCache = DepthCacheForSplit(ctx.slotIndex);
+    auto* dsv = ctx.activeDepthStencilView &&
+            DSVSliceMatchesMapSlot(ctx.activeDepthStencilView, ctx.key.mapSlot) ?
+        ctx.activeDepthStencilView :
+        ActiveShadowDSVFromRendererState(ctx.key);
+
+    ctx.staticCaptureAttempted = true;
+    if (!CaptureStaticCacheFromBuildDSV(ctx.slotIndex, dsv)) {
+        cache.valid = false;
+        ReleaseStaticDepthCache(depthCache);
+        return false;
+    }
+
+    ctx.staticCaptureSucceeded = true;
+    cache.valid = true;
+    cache.key = ctx.key;
+    if (dsv) {
+        cache.key.activeDepthStencilView = dsv;
+        cache.key.activeDepthTexture = ActiveShadowTextureIdentity(dsv);
+    }
+    cache.skipsSinceUpdate = 0;
+    cache.stableKeyHits = 0;
+    cache.pendingBuildKey = {};
+    cache.pendingBuildKeyHits = 0;
+    ctx.cacheHit = false;
+    ctx.passthroughCooldown = 0;
     return true;
+}
+
+void InvalidateStaticCache(std::uint32_t splitIndex) noexcept
+{
+    if (!ValidSplitIndex(splitIndex)) {
+        return;
+    }
+    auto& cache = CacheForSplit(splitIndex);
+    ++cache.invalidations;
+    cache.valid = false;
+    cache.skipsSinceUpdate = 0;
+    cache.stableKeyHits = 0;
+    ReleaseStaticDepthCache(DepthCacheForSplit(splitIndex));
+}
+
+bool RunRenderShadowMapWithAccumulator(
+    DirectionalSplitContext& ctx,
+    void* light,
+    void* shadowMapData,
+    void* accumulator,
+    ShadowCachePass pass)
+{
+    ScopedShadowMapAccumulatorSwap swap(shadowMapData, accumulator);
+    if (!swap.Active()) {
+        return false;
+    }
+
+    BeginShadowCachePass(&ctx, pass);
+    const bool ok = RunOriginalRenderShadowMap(light, shadowMapData);
+    BeginShadowCachePass(&ctx, ShadowCachePass::None);
+    return ok;
+}
+
+void RunPassthroughShadowMap(void* light, void* shadowMapData)
+{
+    BeginShadowCachePass(nullptr, ShadowCachePass::Passthrough);
+    RunOriginalRenderShadowMap(light, shadowMapData);
+    BeginShadowCachePass(nullptr, ShadowCachePass::None);
+}
+
+bool RunRoutedPassthroughShadowMap(DirectionalSplitContext& ctx, void* light, void* shadowMapData)
+{
+    if (!ctx.dynamicAccumulator) {
+        return false;
+    }
+
+    ctx.restoreFailedThisFrame = false;
+    ctx.activeDepthStencilView = nullptr;
+    return RunRenderShadowMapWithAccumulator(
+        ctx,
+        light,
+        shadowMapData,
+        ctx.dynamicAccumulator,
+        ShadowCachePass::Passthrough);
+}
+
+bool RunScratchFullFallbackShadowMap(DirectionalSplitContext& ctx, void* light, void* shadowMapData)
+{
+    if (!ctx.staticAccumulator || !ctx.dynamicAccumulator) {
+        return false;
+    }
+
+    ctx.fullFallbackThisFrame = true;
+    ctx.restoreFailedThisFrame = false;
+    ctx.dynamicRestoreAttempted = false;
+    ctx.dynamicRestoreSucceeded = false;
+    ctx.activeDepthStencilView = nullptr;
+
+    if (!RunRenderShadowMapWithAccumulator(
+            ctx,
+            light,
+            shadowMapData,
+            ctx.staticAccumulator,
+            ShadowCachePass::StaticRender)) {
+        return false;
+    }
+
+    ctx.staticRenderedThisFrame = true;
+    ctx.staticCaptureSucceeded = false;
+    CaptureAndPublishStaticCache(ctx);
+
+    return RunRenderShadowMapWithAccumulator(
+        ctx,
+        light,
+        shadowMapData,
+        ctx.dynamicAccumulator,
+        ShadowCachePass::DynamicRender);
+}
+
+bool RunSplitBuildShadowMap(DirectionalSplitContext& ctx, void* light, void* shadowMapData, const Scope& scope)
+{
+    auto& cache = CacheForSplit(ctx.slotIndex);
+    auto& depthCache = DepthCacheForSplit(ctx.slotIndex);
+    if (!ctx.staticAccumulator || !ctx.dynamicAccumulator) {
+        InvalidateStaticCache(ctx.slotIndex);
+        return false;
+    }
+
+    ctx.restoreFailedThisFrame = false;
+    ctx.staticRenderedThisFrame = false;
+    ctx.staticCaptureSucceeded = false;
+    ctx.staticCaptureAttempted = false;
+    ctx.dynamicRestoreAttempted = false;
+    ctx.dynamicRestoreSucceeded = false;
+    ctx.activeDepthStencilView = nullptr;
+
+    if (!RunRenderShadowMapWithAccumulator(
+            ctx,
+            light,
+            shadowMapData,
+            ctx.staticAccumulator,
+            ShadowCachePass::StaticRender)) {
+        InvalidateStaticCache(ctx.slotIndex);
+        return false;
+    }
+
+    ctx.staticRenderedThisFrame = true;
+    auto* staticDSV = ResolveShadowDSV(ctx, scope);
+
+    const std::uint32_t staticCount = (std::max)(
+        ctx.buildStaticRouted,
+        g_registrationStaticKeepCounts[ctx.slotIndex].load(std::memory_order_acquire));
+    const bool hasStaticRegistrations = staticCount != 0;
+    if (!hasStaticRegistrations) {
+        ++cache.emptyStaticBuilds;
+    }
+
+    ctx.staticCaptureAttempted = hasStaticRegistrations;
+    if (hasStaticRegistrations &&
+        CaptureStaticCacheFromBuildDSV(ctx.slotIndex, staticDSV)) {
+        ctx.staticCaptureSucceeded = true;
+        MarkStaticCachePublished(ctx, cache, scope);
+    } else {
+        cache.valid = false;
+        ReleaseStaticDepthCache(depthCache);
+    }
+
+    if (!RunRenderShadowMapWithAccumulator(
+            ctx,
+            light,
+            shadowMapData,
+            ctx.dynamicAccumulator,
+            ShadowCachePass::DynamicRender)) {
+        InvalidateStaticCache(ctx.slotIndex);
+        return false;
+    }
+
+    if (ctx.restoreFailedThisFrame) {
+        InvalidateStaticCache(ctx.slotIndex);
+        return false;
+    }
+    return true;
+}
+
+bool RunCachedDynamicShadowMap(DirectionalSplitContext& ctx, void* light, void* shadowMapData, const Scope&)
+{
+    if (!DepthCacheForSplit(ctx.slotIndex).valid || !ctx.dynamicAccumulator) {
+        InvalidateStaticCache(ctx.slotIndex);
+        return false;
+    }
+
+    ctx.restoreFailedThisFrame = false;
+    ctx.fullFallbackThisFrame = false;
+    ctx.staticRenderedThisFrame = false;
+    ctx.staticCaptureSucceeded = false;
+    ctx.dynamicRestoreAttempted = false;
+    ctx.dynamicRestoreSucceeded = false;
+    ctx.activeDepthStencilView = nullptr;
+    if (!RunRenderShadowMapWithAccumulator(
+            ctx,
+            light,
+            shadowMapData,
+            ctx.dynamicAccumulator,
+            ShadowCachePass::DynamicRender)) {
+        InvalidateStaticCache(ctx.slotIndex);
+        return false;
+    }
+
+    if (ctx.restoreFailedThisFrame) {
+        InvalidateStaticCache(ctx.slotIndex);
+        return RunScratchFullFallbackShadowMap(ctx, light, shadowMapData);
+    }
+    if (!ctx.dynamicRestoreSucceeded) {
+        if constexpr (kShadowCacheLogEnabled) {
+            REX::WARN(
+                "ShadowCacheRestoreMissed[split={} mapSlot={}]: attempted={} activeDSV={} expectedDSV={} keyDSV={} keyTex={} cacheTex={} validMask={:#x} cacheValid={} phase={}",
+                ctx.slotIndex,
+                ctx.key.mapSlot,
+                ctx.dynamicRestoreAttempted,
+                static_cast<void*>(ctx.activeDepthStencilView),
+                static_cast<void*>(ActiveShadowDSV(ctx.key)),
+                ctx.key.activeDepthStencilView,
+                ctx.key.activeDepthTexture,
+                static_cast<void*>(DepthCacheForSplit(ctx.slotIndex).texture),
+                DepthCacheForSplit(ctx.slotIndex).validSubresources,
+                DepthCacheForSplit(ctx.slotIndex).valid,
+                PassShortName(CurrentResolvedRegistrationPass()));
+        }
+        ++CacheForSplit(ctx.slotIndex).restoreFailures;
+        InvalidateStaticCache(ctx.slotIndex);
+        ctx.passthroughCooldown = 8;
+        return RunScratchFullFallbackShadowMap(ctx, light, shadowMapData);
+    }
+    return true;
+}
+
+void HookedAccumulateFromLists(void* light, void* cullingGroup)
+{
+    if (!s_origAccumulateFromLists) {
+        return;
+    }
+
+    if (!SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON) {
+        s_origAccumulateFromLists(light, cullingGroup);
+        return;
+    }
+
+    ResetDirectionalSplitFrameContexts();
+    ClearRegistrationTarget();
+
+    const auto liveCount = (std::min<std::uint32_t>)(
+        ReadField<std::uint32_t>(light, kShadowMapDataCountOffset),
+        kMaxDirectionalCacheSplits);
+    for (std::uint32_t splitIndex = 0; splitIndex < liveCount; ++splitIndex) {
+        auto* shadowMapData = ShadowMapDataForSlot(light, splitIndex);
+        if (!shadowMapData) {
+            continue;
+        }
+
+        Scope scope = MakeScope(light, shadowMapData, LightKind::Directional);
+        auto& cache = CacheForSplit(splitIndex);
+        auto& depthCache = DepthCacheForSplit(splitIndex);
+        auto& ctx = ContextForSplit(splitIndex);
+        const bool cacheEligible = IsDirectionalSplitCacheEligible(scope);
+        bool cacheHit = false;
+        bool buildReady = false;
+
+        if (!cacheEligible) {
+            continue;
+        }
+
+        ++cache.eligible;
+        cacheHit = DirectionalSplitCacheHit(scope, cache, depthCache);
+        buildReady = !cacheHit && DirectionalSplitStaticBuildReady(scope, cache, depthCache);
+
+        ctx.sunLight = light;
+        ctx.shadowMapData = shadowMapData;
+        ctx.vanillaAccumulator = scope.key.accumulator;
+        ctx.key = scope.key;
+        ctx.eligible = true;
+        ctx.cacheHit = cacheHit;
+        ctx.suppressStaticOnHit = false;
+
+        if (ctx.passthroughCooldown != 0) {
+            ctx.cacheHit = false;
+            cacheHit = false;
+        } else if (cacheHit) {
+            if (PrepareScratchAccumulators(ctx, scope.key.accumulator)) {
+                ctx.hitRouted = true;
+                PublishRegistrationTarget(scope, ctx, ShadowCachePass::BuildBoth, false);
+            } else {
+                ctx.cacheHit = false;
+                ctx.splitFailed = true;
+                InvalidateStaticCache(splitIndex);
+            }
+        } else if (buildReady) {
+            ++cache.misses;
+            ++cache.staticBuilds;
+            if (PrepareScratchAccumulators(ctx, scope.key.accumulator)) {
+                ctx.buildBoth = true;
+                PublishRegistrationTarget(scope, ctx, ShadowCachePass::BuildBoth, false);
+            } else {
+                ctx.splitFailed = true;
+                InvalidateStaticCache(splitIndex);
+            }
+        } else {
+            ++cache.misses;
+        }
+    }
+
+    s_origAccumulateFromLists(light, cullingGroup);
+
+    for (std::uint32_t splitIndex = 0; splitIndex < liveCount; ++splitIndex) {
+        auto& ctx = ContextForSplit(splitIndex);
+        if (!ctx.buildBoth && !ctx.hitRouted) {
+            continue;
+        }
+        const auto staticRouted = g_registrationStaticKeepCounts[splitIndex].load(std::memory_order_acquire);
+        ctx.buildStaticRouted = staticRouted;
+        if (ctx.buildBoth && staticRouted == 0) {
+            ++CacheForSplit(splitIndex).emptyStaticBuilds;
+            ctx.buildBoth = false;
+            ctx.splitEmpty = true;
+            auto& cache = CacheForSplit(splitIndex);
+            cache.valid = false;
+            cache.skipsSinceUpdate = 0;
+            cache.stableKeyHits = 0;
+            ReleaseStaticDepthCache(DepthCacheForSplit(splitIndex));
+            ClearScratchAccumulator(ctx.staticAccumulator);
+        }
+    }
+    MaybeLogDirectionalAccumulation(liveCount);
+    ClearRegistrationTarget();
 }
 
 void HookedRenderShadowMap(void* light, void* shadowMapData)
@@ -1348,65 +2441,52 @@ void HookedRenderShadowMap(void* light, void* shadowMapData)
         return;
     }
 
-    Scope scope;
-    scope.shadowMapData = shadowMapData;
-    scope.key.light = light;
-    scope.key.kind = ClassifyCaller(_ReturnAddress());
-    scope.shadowMapDataIndex = ShadowMapDataIndex(light, shadowMapData);
-    scope.camera = ReadField<void*>(shadowMapData, 0x40);
-    scope.key.cameraSig = ShadowCameraSignature(scope.camera);
-    scope.key.dominantLightSig = DominantLightDirectionSignature();
-    scope.key.accumulator = ReadField<void*>(shadowMapData, 0x48);
-    scope.key.depthTarget = ReadField<std::uint32_t>(shadowMapData, 0x50);
-    scope.key.mapSlot = ReadField<std::uint32_t>(shadowMapData, 0x54);
-    scope.key.viewport.d0 = ReadField<std::uint32_t>(shadowMapData, 0xD0);
-    scope.key.viewport.d4 = ReadField<std::uint32_t>(shadowMapData, 0xD4);
-    scope.key.viewport.d8 = ReadField<std::uint32_t>(shadowMapData, 0xD8);
-    scope.key.viewport.dc = ReadField<std::uint32_t>(shadowMapData, 0xDC);
-    scope.cullingProcess = ReadField<void*>(shadowMapData, 0xE0);
-    scope.inDeferredLights = PhaseTelemetry::IsInDeferredLightsImpl();
-    scope.start = std::chrono::steady_clock::now();
+    Scope scope = MakeScope(light, shadowMapData, ClassifyCaller(_ReturnAddress()));
 
-    auto& cache = s_directionalMapSlot1Cache;
+    const bool validSplit = ValidSplitIndex(scope.shadowMapDataIndex);
+    auto& cache = CacheForSplit(validSplit ? scope.shadowMapDataIndex : 0);
+    auto& depthCache = DepthCacheForSplit(validSplit ? scope.shadowMapDataIndex : 0);
+    auto& ctx = ContextForSplit(validSplit ? scope.shadowMapDataIndex : 0);
     const bool preCacheValid = cache.valid;
-    const bool preDepthValid = s_staticDepthCache.valid;
+    const bool preDepthValid = depthCache.valid;
     const bool preStableKey = CacheKeyStable(cache.key, scope.key);
-    const bool cacheEligible = IsDirectionalMapSlot1CacheEligible(scope);
-    const bool cacheHit = cacheEligible && DirectionalMapSlot1CacheHit(scope);
-    if (cacheEligible) {
-        ++s_directionalMapSlot1Cache.eligible;
-    }
+    const bool cacheEligible = IsDirectionalSplitCacheEligible(scope);
+    const bool contextMatches = cacheEligible && ContextMatchesScope(ctx, scope);
+    const bool cacheHit = contextMatches && ctx.cacheHit;
 
     tl_scopes.push_back(scope);
-    ScopedShadowCacheAccumulator accumulatorScope(scope);
 
     const char* decision = "unknown";
-    const bool staticBuildReady = cacheEligible && !cacheHit && DirectionalMapSlot1StaticBuildReady(scope);
-    if (cacheEligible && !cacheHit && staticBuildReady) {
-        decision = "rebuild-overlay";
-        ++s_directionalMapSlot1Cache.misses;
-        ++s_directionalMapSlot1Cache.staticBuilds;
-
-        bool captured = false;
-        if (!RunCustomDirectionalMapSlot1ShadowMap(light, shadowMapData, scope, true, captured)) {
-            BeginShadowCachePass(ShadowCachePass::Passthrough);
-            RunOriginalRenderShadowMap(light, shadowMapData);
+    if (contextMatches && ctx.buildBoth) {
+        decision = "build-split-overlay";
+        if (!RunSplitBuildShadowMap(ctx, light, shadowMapData, scope)) {
+            decision = "fallback-split-failed";
+            if (!RunScratchFullFallbackShadowMap(ctx, light, shadowMapData) &&
+                !RunRoutedPassthroughShadowMap(ctx, light, shadowMapData)) {
+                RunPassthroughShadowMap(light, shadowMapData);
+            }
         }
-    } else if (cacheEligible && !cacheHit) {
-        decision = "passthrough-unstable";
-        ++s_directionalMapSlot1Cache.misses;
-        BeginShadowCachePass(ShadowCachePass::Passthrough);
-        RunOriginalRenderShadowMap(light, shadowMapData);
-    } else if (cacheEligible && cacheHit) {
+    } else if (contextMatches && ctx.cacheHit) {
         decision = "dynamic-overlay";
-        bool captured = false;
-        if (!RunCustomDirectionalMapSlot1ShadowMap(light, shadowMapData, scope, false, captured)) {
-            BeginShadowCachePass(ShadowCachePass::Passthrough);
-            RunOriginalRenderShadowMap(light, shadowMapData);
+        if (!RunCachedDynamicShadowMap(ctx, light, shadowMapData, scope)) {
+            decision = "fallback-restore-failed";
+            RunPassthroughShadowMap(light, shadowMapData);
+        } else if (ctx.fullFallbackThisFrame) {
+            decision = "dynamic-overlay-full-fallback";
+        }
+    } else if (cacheEligible) {
+        decision = ctx.splitEmpty ? "passthrough-routed-empty" :
+                   ctx.splitFailed ? "passthrough-split-setup-failed" :
+                   "passthrough-unstable";
+        if (contextMatches && ctx.splitEmpty) {
+            if (!RunRoutedPassthroughShadowMap(ctx, light, shadowMapData)) {
+                RunPassthroughShadowMap(light, shadowMapData);
+            }
+        } else {
+            RunPassthroughShadowMap(light, shadowMapData);
         }
     } else {
         decision = "passthrough";
-        BeginShadowCachePass(ShadowCachePass::Passthrough);
         RunOriginalRenderShadowMap(light, shadowMapData);
     }
 
@@ -1421,10 +2501,12 @@ void HookedRenderShadowMap(void* light, void* shadowMapData)
         AddToAggregate(s_byKey[finished.key], finished, ns);
     }
     if (!cacheEligible) {
-        MarkDirectionalMapSlot1CacheUpdated(finished);
+        MarkDirectionalSplitCacheUpdated(finished);
     }
     MaybeLogShadowCache(
         finished,
+        cache,
+        depthCache,
         decision,
         cacheEligible,
         cacheHit,
@@ -1437,7 +2519,123 @@ void HookedRenderShadowMap(void* light, void* shadowMapData)
 
     tl_scopes.pop_back();
     tl_shadowCachePass = ShadowCachePass::None;
-    SetRegistrationShadowCachePass(ShadowCachePass::None);
+    tl_shadowCacheRenderSplit = kInvalidSplitIndex;
+}
+
+void HookedDestroyRenderTargets(void* renderTargetManager)
+{
+    if (SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON) {
+        REX::INFO("ShadowCache: RenderTargetManager::DestroyRenderTargets invalidating static depth caches");
+        ResetShadowCacheState();
+    }
+
+    if (s_origDestroyRenderTargets) {
+        s_origDestroyRenderTargets(renderTargetManager);
+    }
+}
+
+void RestoreStaticCacheAfterVanillaFlush()
+{
+    if (!SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON ||
+        !ValidSplitIndex(tl_shadowCacheRenderSplit)) {
+        return;
+    }
+
+    const ShadowCachePass pass = tl_shadowCachePass;
+    if (pass != ShadowCachePass::StaticRender &&
+        pass != ShadowCachePass::DynamicRender) {
+        return;
+    }
+
+    auto& ctx = ContextForSplit(tl_shadowCacheRenderSplit);
+    auto* dsv = ActiveShadowDSVFromRendererState(ctx.key);
+    if (dsv) {
+        ctx.activeDepthStencilView = dsv;
+    }
+
+    if (pass == ShadowCachePass::StaticRender) {
+        return;
+    }
+
+    auto& depthCache = DepthCacheForSplit(ctx.slotIndex);
+    if (ctx.dynamicRestoreSucceeded ||
+        (ctx.staticRenderedThisFrame && !ctx.staticCaptureSucceeded && !depthCache.valid)) {
+        return;
+    }
+
+    ctx.dynamicRestoreAttempted = true;
+    auto& cache = CacheForSplit(ctx.slotIndex);
+    const bool restored = RestoreStaticCacheToDSV(
+        depthCache,
+        ActiveD3DContext(),
+        dsv,
+        ctx.slotIndex,
+        ctx.key);
+    if (!restored) {
+        ++cache.restoreFailures;
+        ctx.restoreFailedThisFrame = true;
+        cache.valid = false;
+        ReleaseStaticDepthCache(depthCache);
+        return;
+    }
+
+    ctx.dynamicRestoreSucceeded = true;
+}
+
+void HookedRenderShadowMapFlush(void* renderer)
+{
+    if (s_origRenderShadowMapFlush) {
+        s_origRenderShadowMapFlush(renderer);
+    }
+    RestoreStaticCacheAfterVanillaFlush();
+}
+
+void HookedSetDirtyRenderTargets()
+{
+    const auto oldSplit = tl_dirtyRenderTargetsSplit;
+    const auto oldPass = tl_dirtyRenderTargetsPass;
+    auto* oldDSV = tl_dirtyRenderTargetsDSV;
+
+    tl_dirtyRenderTargetsSplit = kInvalidSplitIndex;
+    tl_dirtyRenderTargetsPass = ShadowCachePass::None;
+    tl_dirtyRenderTargetsDSV = nullptr;
+
+    if (SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON && g_rendererData) {
+        auto* state = ActiveRendererShadowState();
+        if (!state) {
+            if (s_origSetDirtyRenderTargets) {
+                s_origSetDirtyRenderTargets();
+            }
+            tl_dirtyRenderTargetsSplit = oldSplit;
+            tl_dirtyRenderTargetsPass = oldPass;
+            tl_dirtyRenderTargetsDSV = oldDSV;
+            return;
+        }
+        const std::uint32_t platformDepthTarget =
+            ReadField<std::uint32_t>(state, kRendererStateDepthPlatformTargetOffset, kInvalidSplitIndex);
+        const std::uint32_t mapSlot =
+            ReadField<std::uint32_t>(state, kRendererStateDepthMapSlotOffset, kInvalidSplitIndex);
+        const std::uint32_t mode =
+            ReadField<std::uint32_t>(state, kRendererStateDepthModeOffset, 3u);
+        auto* dsv = RendererStateDepthStencilView(platformDepthTarget, mapSlot);
+
+        if (mode == kRenderTargetModeClear && dsv) {
+            const std::uint32_t split = FindDirtyRenderTargetsRestoreSplit(platformDepthTarget, mapSlot, dsv);
+            if (ValidSplitIndex(split)) {
+                tl_dirtyRenderTargetsSplit = split;
+                tl_dirtyRenderTargetsPass = ShadowCachePass::DynamicRender;
+                tl_dirtyRenderTargetsDSV = dsv;
+            }
+        }
+    }
+
+    if (s_origSetDirtyRenderTargets) {
+        s_origSetDirtyRenderTargets();
+    }
+
+    tl_dirtyRenderTargetsSplit = oldSplit;
+    tl_dirtyRenderTargetsPass = oldPass;
+    tl_dirtyRenderTargetsDSV = oldDSV;
 }
 
 bool PatchCall(const char* label, std::uintptr_t callSite, void* hook, std::uintptr_t* outOriginal)
@@ -1454,6 +2652,50 @@ bool PatchCall(const char* label, std::uintptr_t callSite, void* hook, std::uint
     REX::INFO("ShadowTelemetry::Initialize: patched {} call site @ {:#x} -> original {:#x}",
               label, callSite, original);
     return true;
+}
+
+template <class T>
+T CreateBranchGateway5(REL::Relocation<std::uintptr_t>& target, std::size_t prologueSize, void* hook)
+{
+    const auto targetAddress = target.address();
+    if (targetAddress < 0x140000000ull) {
+        return nullptr;
+    }
+
+    auto& trampoline = REL::GetTrampoline();
+    auto* gateway = static_cast<std::byte*>(trampoline.allocate(prologueSize + sizeof(REL::ASM::JMP14)));
+    if (!gateway) {
+        return nullptr;
+    }
+
+    std::memcpy(gateway, reinterpret_cast<void*>(targetAddress), prologueSize);
+
+    if (prologueSize >= 5 && gateway[0] == std::byte{ 0xE9 }) {
+        std::int32_t oldRel32 = 0;
+        std::memcpy(&oldRel32, gateway + 1, sizeof(oldRel32));
+        const auto absoluteDest = static_cast<std::int64_t>(targetAddress) + 5 + oldRel32;
+        const auto newRel64 = absoluteDest - (reinterpret_cast<std::int64_t>(gateway) + 5);
+        if (newRel64 < (std::numeric_limits<std::int32_t>::min)() ||
+            newRel64 > (std::numeric_limits<std::int32_t>::max)()) {
+            REX::WARN(
+                "ShadowTelemetry::CreateBranchGateway5: captured JMP destination {:#x} is unreachable from gateway {} via rel32",
+                static_cast<std::uintptr_t>(absoluteDest),
+                static_cast<void*>(gateway));
+            return nullptr;
+        }
+        const auto newRel32 = static_cast<std::int32_t>(newRel64);
+        std::memcpy(gateway + 1, &newRel32, sizeof(newRel32));
+    } else if (prologueSize >= 5 && gateway[0] == std::byte{ 0xE8 }) {
+        REX::WARN(
+            "ShadowTelemetry::CreateBranchGateway5: captured CALL rel32 at target {:#x} cannot be safely relocated",
+            targetAddress);
+        return nullptr;
+    }
+
+    const REL::ASM::JMP14 jumpBack{ targetAddress + prologueSize };
+    std::memcpy(gateway + prologueSize, &jumpBack, sizeof(jumpBack));
+    trampoline.write_jmp5(targetAddress, reinterpret_cast<std::uintptr_t>(hook));
+    return reinterpret_cast<T>(gateway);
 }
 
 }  // anonymous namespace
@@ -1546,77 +2788,130 @@ bool IsInShadowMap()
     return !tl_scopes.empty();
 }
 
-bool IsDirectionalMapSlot1Shadow()
+bool IsDirectionalSplitShadow()
 {
     return g_shadowCacheTargetActive.load(std::memory_order_acquire) &&
-           g_shadowCacheTargetMapSlot.load(std::memory_order_acquire) == kDirectionalCacheMapSlot;
+           ValidSplitIndex(g_shadowCacheTargetSplit.load(std::memory_order_acquire));
 }
 
 bool IsShadowCacheActiveForCurrentShadow()
 {
     return SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON &&
-           IsDirectionalMapSlot1Shadow();
+           IsDirectionalSplitShadow();
 }
 
 bool IsShadowCacheStaticBuildPass()
 {
     return IsShadowCacheActiveForCurrentShadow() &&
-           CurrentResolvedRegistrationPass() == ShadowCachePass::StaticBuild;
+           CurrentResolvedRegistrationPass() == ShadowCachePass::StaticRender;
 }
 
 bool IsShadowCacheDynamicOverlayPass()
 {
     return IsShadowCacheActiveForCurrentShadow() &&
-           CurrentResolvedRegistrationPass() == ShadowCachePass::DynamicOverlay;
+           CurrentResolvedRegistrationPass() == ShadowCachePass::DynamicRender;
 }
 
 bool IsShadowCacheRegistrationFilterActive(void* accumulator, void* geometry)
 {
     (void)geometry;
-    return g_registrationShadowCacheActive.load(std::memory_order_acquire) &&
-           RegistrationAccumulatorMatches(accumulator);
+    const auto splitIndex = FindRegistrationSplitForAccumulator(accumulator);
+    if (!ValidSplitIndex(splitIndex)) {
+        return false;
+    }
+    return g_registrationBuildBothBySplit[splitIndex].load(std::memory_order_acquire) ||
+           g_registrationSuppressStaticBySplit[splitIndex].load(std::memory_order_acquire);
+}
+
+bool IsShadowCacheObjectSuppressionActive(void* accumulator)
+{
+    const auto splitIndex = FindRegistrationSplitForAccumulator(accumulator);
+    return SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON &&
+           ValidSplitIndex(splitIndex) &&
+           g_registrationSuppressStaticBySplit[splitIndex].load(std::memory_order_acquire);
+}
+
+bool ShouldSuppressShadowCacheObject(void* accumulator, bool isStaticCaster)
+{
+    const auto splitIndex = FindRegistrationSplitForAccumulator(accumulator);
+    tl_lastRegistrationSplit = splitIndex;
+    return isStaticCaster &&
+           ValidSplitIndex(splitIndex) &&
+           g_registrationSuppressStaticBySplit[splitIndex].load(std::memory_order_acquire);
+}
+
+bool IsShadowCacheRegisterPassSplitActive(void* accumulator)
+{
+    const auto splitIndex = FindRegistrationSplitForAccumulator(accumulator);
+    return SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON &&
+           ValidSplitIndex(splitIndex) &&
+           g_registrationBuildBothBySplit[splitIndex].load(std::memory_order_acquire);
+}
+
+void* GetShadowCacheSplitBatchRenderer(void* accumulator, bool isStaticCaster)
+{
+    const auto splitIndex = FindRegistrationSplitForAccumulator(accumulator);
+    tl_lastRegistrationSplit = splitIndex;
+    if (!ValidSplitIndex(splitIndex) ||
+        !g_registrationBuildBothBySplit[splitIndex].load(std::memory_order_acquire)) {
+        return nullptr;
+    }
+
+    void* targetAccumulator = isStaticCaster ?
+        g_registrationStaticAccumulators[splitIndex].load(std::memory_order_acquire) :
+        g_registrationDynamicAccumulators[splitIndex].load(std::memory_order_acquire);
+    if (!targetAccumulator) {
+        return nullptr;
+    }
+
+    return static_cast<std::byte*>(targetAccumulator) + kAccumulatorBatchRendererOffset;
 }
 
 void NoteShadowCacheShadowMapOrMaskHook(bool active)
 {
     const ShadowCachePass pass = CurrentResolvedRegistrationPass();
     const std::size_t passIdx = PassIndex(pass);
-    IncrementRegistrationCounter(s_directionalMapSlot1Cache.shadowMapOrMaskHookCalls);
-    IncrementRegistrationCounter(s_directionalMapSlot1Cache.shadowMapOrMaskHookCallsByPass[passIdx]);
+    if (!ValidSplitIndex(tl_lastRegistrationSplit)) {
+        return;
+    }
+    auto& cache = CacheForSplit(tl_lastRegistrationSplit);
+    IncrementRegistrationCounter(cache.shadowMapOrMaskHookCalls);
+    IncrementRegistrationCounter(cache.shadowMapOrMaskHookCallsByPass[passIdx]);
     if (active) {
-        IncrementRegistrationCounter(s_directionalMapSlot1Cache.shadowMapOrMaskHookActiveCalls);
-        IncrementRegistrationCounter(s_directionalMapSlot1Cache.shadowMapOrMaskHookActiveCallsByPass[passIdx]);
+        IncrementRegistrationCounter(cache.shadowMapOrMaskHookActiveCalls);
+        IncrementRegistrationCounter(cache.shadowMapOrMaskHookActiveCallsByPass[passIdx]);
     }
 }
 
 void NoteShadowCacheShadowMapOrMaskHookDetail(bool active, void* accumulator)
 {
+    tl_lastRegistrationSplit = FindRegistrationSplitForAccumulator(accumulator);
     NoteShadowCacheShadowMapOrMaskHook(active);
-    (void)accumulator;
 }
 
 void NoteShadowCacheRenderPassSplit(bool kept, bool isStaticCaster)
 {
     if (!SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON ||
         !g_shadowCacheTargetActive.load(std::memory_order_acquire) ||
-        g_shadowCacheTargetMapSlot.load(std::memory_order_acquire) != kDirectionalCacheMapSlot) {
+        !ValidSplitIndex(tl_shadowCacheRenderSplit)) {
         return;
     }
 
+    auto& cache = CacheForSplit(tl_shadowCacheRenderSplit);
     switch (CurrentResolvedRegistrationPass()) {
-    case ShadowCachePass::StaticBuild:
+    case ShadowCachePass::BuildBoth:
         if (kept && isStaticCaster) {
-            IncrementRegistrationCounter(s_directionalMapSlot1Cache.staticKept);
-            g_registrationStaticKeepCount.fetch_add(1, std::memory_order_relaxed);
+            IncrementRegistrationCounter(cache.staticKept);
+            g_registrationStaticKeepCounts[tl_shadowCacheRenderSplit].fetch_add(1, std::memory_order_relaxed);
         } else {
-            IncrementRegistrationCounter(s_directionalMapSlot1Cache.staticSkipped);
+            IncrementRegistrationCounter(cache.staticSkipped);
         }
         break;
-    case ShadowCachePass::DynamicOverlay:
+    case ShadowCachePass::DynamicRender:
         if (kept) {
-            IncrementRegistrationCounter(s_directionalMapSlot1Cache.overlayKept);
+            IncrementRegistrationCounter(cache.overlayKept);
         } else {
-            IncrementRegistrationCounter(s_directionalMapSlot1Cache.overlaySkipped);
+            IncrementRegistrationCounter(cache.overlaySkipped);
         }
         break;
     default:
@@ -1624,57 +2919,114 @@ void NoteShadowCacheRenderPassSplit(bool kept, bool isStaticCaster)
     }
 }
 
+void NoteShadowCacheObjectSuppressed(bool isStaticCaster)
+{
+    if (!isStaticCaster) {
+        return;
+    }
+    if (ValidSplitIndex(tl_lastRegistrationSplit)) {
+        IncrementRegistrationCounter(CacheForSplit(tl_lastRegistrationSplit).overlaySkipped);
+    }
+}
+
+void NoteShadowCachePassRouted(bool isStaticCaster)
+{
+    if (!ValidSplitIndex(tl_lastRegistrationSplit)) {
+        return;
+    }
+    auto& cache = CacheForSplit(tl_lastRegistrationSplit);
+    if (isStaticCaster) {
+        IncrementRegistrationCounter(cache.staticKept);
+        g_registrationStaticKeepCounts[tl_lastRegistrationSplit].fetch_add(1, std::memory_order_relaxed);
+    } else {
+        IncrementRegistrationCounter(cache.overlayKept);
+        g_registrationDynamicKeepCounts[tl_lastRegistrationSplit].fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
 void ResetShadowCacheState()
 {
-    ReleaseStaticDepthCache();
-    ReleaseStaticBuildDSVs();
-    s_directionalMapSlot1Cache.valid = false;
-    s_directionalMapSlot1Cache.skipsSinceUpdate = 0;
-    s_directionalMapSlot1Cache.stableKeyHits = 0;
-    s_directionalMapSlot1Cache.pendingBuildKey = {};
-    s_directionalMapSlot1Cache.pendingBuildKeyHits = 0;
-    s_directionalMapSlot1Cache.lastDynamicMaxSkip = 0;
-    s_directionalMapSlot1Cache.key = {};
-    g_registrationShadowCacheAccumulator.store(nullptr, std::memory_order_release);
-    g_shadowCacheTargetActive.store(false, std::memory_order_release);
-    g_shadowCacheTargetMapSlot.store((std::numeric_limits<std::uint32_t>::max)(), std::memory_order_release);
-    g_shadowCacheTargetDepthTarget.store((std::numeric_limits<std::uint32_t>::max)(), std::memory_order_release);
-    SetRegistrationShadowCachePass(ShadowCachePass::None);
+    ReleaseStaticDepthCaches();
+    ClearAllScratchAccumulators();
+    ResetDirectionalSplitFrameContexts();
+    for (auto& cache : s_directionalSplitCaches) {
+        cache.valid = false;
+        cache.skipsSinceUpdate = 0;
+        cache.stableKeyHits = 0;
+        cache.pendingBuildKey = {};
+        cache.pendingBuildKeyHits = 0;
+        cache.key = {};
+    }
+    ClearRegistrationTarget();
     ResetWindow();
 }
 
 bool HandleShadowCacheClearDepthStencilView(
     REX::W32::ID3D11DeviceContext* context,
     REX::W32::ID3D11DepthStencilView* dsv,
-    std::uint32_t,
-    float,
-    std::uint8_t)
+    std::uint32_t clearFlags,
+    float depth,
+    std::uint8_t stencil)
 {
-    if (!SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON ||
-        !g_shadowCacheTargetActive.load(std::memory_order_acquire) ||
-        g_shadowCacheTargetMapSlot.load(std::memory_order_acquire) != kDirectionalCacheMapSlot) {
+    (void)context;
+    if (!SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON) {
+        return false;
+    }
+    const bool scopedTargetActive = g_shadowCacheTargetActive.load(std::memory_order_acquire) &&
+        ValidSplitIndex(tl_shadowCacheRenderSplit);
+    const bool dirtyTargetActive = ValidSplitIndex(tl_dirtyRenderTargetsSplit);
+    if (!scopedTargetActive && !dirtyTargetActive) {
+        MaybeLogShadowCacheClearReject(
+            "target-inactive",
+            g_shadowCacheClearRejectTargetInactive,
+            dsv,
+            clearFlags,
+            depth,
+            stencil);
+        return false;
+    }
+    const std::uint32_t activeSplit = scopedTargetActive ? tl_shadowCacheRenderSplit : tl_dirtyRenderTargetsSplit;
+    const ShadowCachePass activePass = scopedTargetActive ?
+        tl_shadowCachePass :
+        tl_dirtyRenderTargetsPass;
+    if (!ValidSplitIndex(activeSplit)) {
+        MaybeLogShadowCacheClearReject(
+            "split-invalid",
+            g_shadowCacheClearRejectSplitInvalid,
+            dsv,
+            clearFlags,
+            depth,
+            stencil);
         return false;
     }
 
-    if (CurrentResolvedRegistrationPass() == ShadowCachePass::StaticBuild) {
-        RememberStaticBuildDSV(dsv);
+    auto& ctx = ContextForSplit(activeSplit);
+    auto& depthCache = DepthCacheForSplit(activeSplit);
+    if (!ShadowPassDSVMatches(ctx, dsv)) {
+        MaybeLogShadowCacheClearReject(
+            "dsv-mismatch",
+            g_shadowCacheClearRejectDSVMismatch,
+            dsv,
+            clearFlags,
+            depth,
+            stencil);
+        return false;
+    }
+    ctx.activeDepthStencilView = dsv;
+
+    if (activePass == ShadowCachePass::StaticRender) {
         return false;
     }
 
-    if (CurrentResolvedRegistrationPass() != ShadowCachePass::DynamicOverlay) {
+    if (activePass != ShadowCachePass::DynamicRender) {
         return false;
     }
 
-    const bool restored = RestoreStaticCacheToDSV(context, dsv);
-    if (!restored) {
-        ++s_directionalMapSlot1Cache.restoreFailures;
-        s_directionalMapSlot1Cache.valid = false;
-        ReleaseStaticDepthCache();
-        SetRegistrationShadowCachePass(ShadowCachePass::Passthrough);
-        return false;
+    if (ctx.staticRenderedThisFrame && !ctx.staticCaptureSucceeded && !depthCache.valid) {
+        return true;
     }
 
-    return true;
+    return false;
 }
 
 bool Initialize()
@@ -1697,13 +3049,72 @@ bool Initialize()
 
     bool ok = true;
     std::uintptr_t originalShadow = 0;
+    std::uintptr_t originalFlush = 0;
     std::uintptr_t originalScene = 0;
+
+    if (SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON && !s_origDestroyRenderTargets) {
+        if (ptr_DestroyRenderTargets.address() < 0x140000000ull) {
+            REX::WARN("ShadowTelemetry::Initialize: RenderTargetManager::DestroyRenderTargets REL::ID failed to resolve");
+            return false;
+        }
+
+        s_origDestroyRenderTargets = CreateBranchGateway5<RenderTargetManagerDestroyRenderTargets_t>(
+            ptr_DestroyRenderTargets,
+            kDestroyRenderTargetsPrologueSizeOG,
+            reinterpret_cast<void*>(&HookedDestroyRenderTargets));
+        if (!s_origDestroyRenderTargets) {
+            REX::WARN("ShadowTelemetry::Initialize: failed to install RenderTargetManager::DestroyRenderTargets hook");
+            return false;
+        }
+        REX::INFO("ShadowTelemetry::Initialize: RenderTargetManager::DestroyRenderTargets hook installed");
+    }
+
+    if (SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON && !s_origAccumulateFromLists) {
+        if (ptr_AccumulateFromLists.address() < 0x140000000ull) {
+            REX::WARN("ShadowTelemetry::Initialize: BSShadowDirectionalLight::AccumulateFromLists REL::ID failed to resolve");
+            return false;
+        }
+
+        s_origAccumulateFromLists = CreateBranchGateway5<AccumulateFromLists_t>(
+            ptr_AccumulateFromLists,
+            kAccumulateFromListsPrologueSizeOG,
+            reinterpret_cast<void*>(&HookedAccumulateFromLists));
+        if (!s_origAccumulateFromLists) {
+            REX::WARN("ShadowTelemetry::Initialize: failed to install BSShadowDirectionalLight::AccumulateFromLists hook");
+            return false;
+        }
+        REX::INFO("ShadowTelemetry::Initialize: BSShadowDirectionalLight::AccumulateFromLists hook installed");
+    }
+
+    if (SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON && !s_origSetDirtyRenderTargets) {
+        if (ptr_SetDirtyRenderTargets.address() < 0x140000000ull) {
+            REX::WARN("ShadowTelemetry::Initialize: BSGraphics::SetDirtyRenderTargets REL::ID failed to resolve");
+            return false;
+        }
+
+        s_origSetDirtyRenderTargets = CreateBranchGateway5<SetDirtyRenderTargets_t>(
+            ptr_SetDirtyRenderTargets,
+            kSetDirtyRenderTargetsPrologueSizeOG,
+            reinterpret_cast<void*>(&HookedSetDirtyRenderTargets));
+        if (!s_origSetDirtyRenderTargets) {
+            REX::WARN("ShadowTelemetry::Initialize: failed to install BSGraphics::SetDirtyRenderTargets hook");
+            return false;
+        }
+        REX::INFO("ShadowTelemetry::Initialize: BSGraphics::SetDirtyRenderTargets hook installed");
+    }
 
     const bool needsRenderSceneHook =
         g_mode.load(std::memory_order_relaxed) == Mode::On ||
         SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON;
     if (needsRenderSceneHook) {
         const auto renderShadowMapAddr = ptr_RenderShadowMap.address();
+        if (SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON) {
+            ok &= PatchCall("BSShadowLight::RenderShadowMap -> Renderer::Flush",
+                            renderShadowMapAddr + kRenderShadowMapFlushCallOffsetOG,
+                            reinterpret_cast<void*>(&HookedRenderShadowMapFlush),
+                            &originalFlush);
+            s_origRenderShadowMapFlush = reinterpret_cast<RendererFlush_t>(originalFlush);
+        }
         ok &= PatchCall("BSShadowLight::RenderShadowMap -> BSShaderUtil::RenderScene",
                         renderShadowMapAddr + kRenderSceneCallOffsetOG,
                         reinterpret_cast<void*>(&HookedRenderScene),
@@ -1718,10 +3129,15 @@ bool Initialize()
     s_origRenderShadowMap = reinterpret_cast<RenderShadowMap_t>(originalShadow);
 
     if (!s_origRenderShadowMap ||
-        (needsRenderSceneHook && !s_origRenderScene)) {
-        REX::WARN("ShadowTelemetry::Initialize: original function capture failed (RenderShadowMap={}, RenderScene={}, telemetryMode={})",
+        (needsRenderSceneHook && !s_origRenderScene) ||
+        (SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON && (!s_origAccumulateFromLists || !s_origRenderShadowMapFlush || !s_origDestroyRenderTargets || !s_origSetDirtyRenderTargets))) {
+        REX::WARN("ShadowTelemetry::Initialize: original function capture failed (RenderShadowMap={}, RenderScene={}, Flush={}, AccumulateFromLists={}, DestroyRenderTargets={}, SetDirtyRenderTargets={}, telemetryMode={})",
                   reinterpret_cast<void*>(s_origRenderShadowMap),
                   reinterpret_cast<void*>(s_origRenderScene),
+                  reinterpret_cast<void*>(s_origRenderShadowMapFlush),
+                  reinterpret_cast<void*>(s_origAccumulateFromLists),
+                  reinterpret_cast<void*>(s_origDestroyRenderTargets),
+                  reinterpret_cast<void*>(s_origSetDirtyRenderTargets),
                   static_cast<int>(g_mode.load(std::memory_order_relaxed)));
         return false;
     }

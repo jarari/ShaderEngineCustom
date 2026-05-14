@@ -12,13 +12,11 @@ CUSTOMBUFFER_ON=true
 ; Enable/disable pass-level cached occlusion for render-pass A/B testing
 PASS_LEVEL_OCCLUSION_ON=false
 ; --- SHADOW STATIC CACHE (behavioral, experimental) ---
-; Directional mapSlot=1 only. Builds a precombine-only static depth cache,
-; restores that depth on cache hits, then replays dynamic/unknown casters.
+; Directional sun splits up to the live iDirShadowSplits count. Builds
+; precombine-only static depth caches, restores depth on cache hits, then
+; replays dynamic/unknown casters.
 ; Requires slot-safe DSV access; otherwise it falls back to vanilla rendering.
 SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON=false
-; Maximum consecutive dynamic-overlay cache hits before rebuilding static depth.
-; 1 = rebuild every other eligible call. 0 disables the cache even if enabled.
-SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_MAX_SKIP=1
 ; Custom resource view slot in shader (beyond what the game uses, default t31)
 CUSTOMBUFFER_SLOT=31
 ; Per-draw classification tag resource view slot

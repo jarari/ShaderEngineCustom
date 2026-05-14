@@ -86,7 +86,6 @@ bool CUSTOMBUFFER_ON = true;
 bool PASS_LEVEL_OCCLUSION_ON = false;
 // Experimental directional shadow-map static-depth cache benchmark
 bool SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON = false;
-std::uint32_t SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_MAX_SKIP = 1;
 // Custom resource view slot in shader
 UINT CUSTOMBUFFER_SLOT = 31;
 UINT DRAWTAG_SLOT = 26;
@@ -271,7 +270,7 @@ bool SaveShaderEngineConfig(std::string* errorMessage)
                 lines.emplace_back();
             }
             lines.emplace_back("; --- SHADOW STATIC CACHE ---");
-            lines.emplace_back("; Directional mapSlot=1 precombine static-depth cache A/B toggle.");
+            lines.emplace_back("; Directional sun split static-depth cache A/B toggle.");
             lines.emplace_back(std::string("SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON=") + (SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON ? "true" : "false"));
         }
 
@@ -902,13 +901,7 @@ void LoadConfig(HMODULE hModule) {
             continue;
         }
         else if (lowerKey == "shadow_cache_directional_mapslot1_max_skip") {
-            try {
-                const int parsed = std::stoi(value);
-                SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_MAX_SKIP = static_cast<std::uint32_t>((std::max)(0, (std::min)(parsed, 8)));
-                REX::INFO("LoadConfig: SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_MAX_SKIP set to {}", SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_MAX_SKIP);
-            } catch (...) {
-                REX::WARN("LoadConfig: Invalid SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_MAX_SKIP value: {}. Using default: {}", value, SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_MAX_SKIP);
-            }
+            REX::WARN("LoadConfig: SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_MAX_SKIP is deprecated and ignored");
             continue;
         }
         else if (lowerKey == "custombuffer_slot") {

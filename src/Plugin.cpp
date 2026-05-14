@@ -95,6 +95,8 @@ std::atomic<REX::W32::ID3D11PixelShader*> g_currentOriginalPixelShader{ nullptr 
 // Global custom buffer data structure instance for updating CB13
 GFXBoosterAccessData g_customBufferData = {};
 DrawTagData g_drawTagData = {};
+static std::atomic<std::uint64_t> g_d3dDrawCallsThisFrame{ 0 };
+static std::atomic<std::uint64_t> g_d3dDrawCallsLastFrame{ 0 };
 // Global custom resource to pass data to shaders
 REX::W32::ID3D11Buffer* g_customSRVBuffer = nullptr;
 REX::W32::ID3D11ShaderResourceView* g_customSRV = nullptr;
@@ -724,6 +726,7 @@ namespace
     }
 
     constexpr unsigned int kShadowCacheBatchPassGroup = 1;
+    constexpr std::size_t kAccumulatorBatchRendererOffset = 0xC8;
     constexpr std::uintptr_t kInvalidBatchNode = 0xFFFFu;
     constexpr std::size_t kBatchRendererGroupStride = 0x18;
     constexpr std::size_t kBatchRendererGroupArrayOffset = 0x08;
@@ -739,10 +742,7 @@ namespace
 
     bool IsShadowCacheRenderSplitActive() noexcept
     {
-        return SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON &&
-               ShadowTelemetry::IsShadowCacheActiveForCurrentShadow() &&
-               (ShadowTelemetry::IsShadowCacheStaticBuildPass() ||
-                ShadowTelemetry::IsShadowCacheDynamicOverlayPass());
+        return false;
     }
 
     bool ShouldSplitRenderBatchesCall(unsigned int passGroupIdx, unsigned int filter) noexcept
@@ -1395,10 +1395,7 @@ namespace
         explicit ScopedShadowPassChainFilter(BSRenderPassLayout* head)
         {
             if (IsFinishLevelShadowSplitActive() ||
-                !SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON ||
-                !ShadowTelemetry::IsShadowCacheActiveForCurrentShadow() ||
-                (!ShadowTelemetry::IsShadowCacheStaticBuildPass() &&
-                 !ShadowTelemetry::IsShadowCacheDynamicOverlayPass())) {
+                !IsShadowCacheRenderSplitActive()) {
                 filteredHead_ = head;
                 return;
             }
@@ -1632,10 +1629,7 @@ namespace
             originalTail_ = list_[1];
 
             if (IsFinishLevelShadowSplitActive() ||
-                !SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON ||
-                !ShadowTelemetry::IsShadowCacheActiveForCurrentShadow() ||
-                (!ShadowTelemetry::IsShadowCacheStaticBuildPass() &&
-                 !ShadowTelemetry::IsShadowCacheDynamicOverlayPass())) {
+                !IsShadowCacheRenderSplitActive()) {
                 return;
             }
 
@@ -1806,6 +1800,7 @@ namespace
     REL::Relocation<std::uintptr_t> ptr_FinishAccumulatingShadowMapOrMask{ REL::ID{ 1358523, 2317874 } };
     constexpr std::uintptr_t kFinishShadowRenderBatchesCallOffsetOG = 0x38;       // 0x14282E4A8 - 0x14282E470
     constexpr std::uintptr_t kFinishShadowRenderGeometryGroupCallOffsetOG = 0x51; // 0x14282E4C1 - 0x14282E470
+    constexpr bool kInstallFinishShadowRenderSplitHooks = false;
 
     using RenderCommandBufferPassesImpl_t = void (*)(void* this_, int passGroupIdx, void* cbData, unsigned int subIdx, bool allowAlpha);
     RenderCommandBufferPassesImpl_t OriginalRenderCommandBufferPassesImpl = nullptr;
@@ -1828,6 +1823,9 @@ namespace
     using RenderPassImpl_t = void (*)(void* this_, BSRenderPassLayout* head, std::uint32_t techniqueID, bool allowAlpha);
     RenderPassImpl_t OriginalRenderPassImpl = nullptr;
     REL::Relocation<std::uintptr_t> ptr_RenderPassImpl{ REL::ID{ 1543785, 2318710 } };
+
+    using BSShaderAccumulatorRegisterObject_t = bool (*)(void* accumulator, RE::BSGeometry* geometry);
+    BSShaderAccumulatorRegisterObject_t OriginalBSShaderAccumulatorRegisterObject = nullptr;
 
     using RegisterObjectShadowMapOrMask_t = bool (*)(void* accumulator, RE::BSGeometry* geometry, void* shaderProperty);
     RegisterObjectShadowMapOrMask_t OriginalRegisterObjectShadowMapOrMask = nullptr;
@@ -3223,7 +3221,6 @@ namespace
                     OriginalRenderBatches(this_, passGroupIdx, allowAlpha, filter);
                 }
             } else {
-                ScopedStaticRenderBatchesRestore staticBuildRestore(this_, passGroupIdx);
                 OriginalRenderBatches(this_, passGroupIdx, allowAlpha, filter);
             }
         }
@@ -3335,8 +3332,7 @@ namespace
             }
 
             std::optional<ScopedProcessCommandBufferTarget> processTarget;
-            if (IsShadowWorkTelemetryActive() ||
-                ShadowTelemetry::IsShadowCacheActiveForCurrentShadow()) {
+            if (IsShadowWorkTelemetryActive()) {
                 processTarget.emplace(MakeShadowPassWorkTarget(
                     this_,
                     shadowSelection ? shadowSelection->head : head,
@@ -3395,11 +3391,33 @@ namespace
         return OriginalRegisterObjectShadowMapOrMask(accumulator, geometry, shaderProperty);
     }
 
+    bool HookedBSShaderAccumulatorRegisterObject(void* accumulator, RE::BSGeometry* geometry)
+    {
+        if (SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON &&
+            ShadowTelemetry::IsShadowCacheObjectSuppressionActive(accumulator)) {
+            const bool isStaticCaster = IsPrecombineShadowGeometry(geometry);
+            if (ShadowTelemetry::ShouldSuppressShadowCacheObject(accumulator, isStaticCaster)) {
+                ShadowTelemetry::NoteShadowCacheObjectSuppressed(isStaticCaster);
+                return true;
+            }
+        }
+
+        return OriginalBSShaderAccumulatorRegisterObject(accumulator, geometry);
+    }
+
     void HookedRegisterPassGeometryGroup(void* batchRenderer, BSRenderPassLayout* pass, int group, bool appendOrUnk)
     {
-        if (SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON && pass) {
+        if (SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON && batchRenderer && pass) {
+            auto* sourceAccumulator = static_cast<void*>(
+                static_cast<std::byte*>(batchRenderer) - kAccumulatorBatchRendererOffset);
             const bool isStaticCaster = IsPrecombineShadowGeometry(pass->geometry);
             RememberShadowPassClassification(pass, isStaticCaster);
+            if (auto* splitBatchRenderer =
+                    ShadowTelemetry::GetShadowCacheSplitBatchRenderer(sourceAccumulator, isStaticCaster)) {
+                ShadowTelemetry::NoteShadowCachePassRouted(isStaticCaster);
+                OriginalRegisterPassGeometryGroup(splitBatchRenderer, pass, group, appendOrUnk);
+                return;
+            }
         }
 
         OriginalRegisterPassGeometryGroup(batchRenderer, pass, group, appendOrUnk);
@@ -4124,6 +4142,7 @@ static void ApplyShadowCacheDirectionalMapSlot1Setting(bool enabled)
     SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON = enabled;
     ShadowTelemetry::ResetShadowCacheState();
     if (SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON) {
+        InstallDrawTaggingHooks_Internal();
         ShadowTelemetry::Initialize();
     }
     REX::INFO("ShaderEngine Settings: SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON set to {}", SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON);
@@ -4296,6 +4315,9 @@ HRESULT STDMETHODCALLTYPE MyPresent(
     UINT SyncInterval,
     UINT Flags) {
     EnsureD3DDrawHooksPresent();
+    g_d3dDrawCallsLastFrame.store(
+        g_d3dDrawCallsThisFrame.exchange(0, std::memory_order_relaxed),
+        std::memory_order_relaxed);
 
     // Light-tracker frame boundary: finalize the previous capture (if any),
     // poll Numpad * for new arms, open the next capture file. No-op when
@@ -4440,6 +4462,7 @@ void STDMETHODCALLTYPE MyDrawIndexed(
     UINT StartIndexLocation,
     INT BaseVertexLocation)
 {
+    g_d3dDrawCallsThisFrame.fetch_add(1, std::memory_order_relaxed);
     PhaseTelemetry::OnD3DDraw();
     ShadowTelemetry::OnD3DDraw();
     BindDrawTagForCurrentDraw(This);
@@ -4461,6 +4484,7 @@ void STDMETHODCALLTYPE MyDraw(
     UINT VertexCount,
     UINT StartVertexLocation)
 {
+    g_d3dDrawCallsThisFrame.fetch_add(1, std::memory_order_relaxed);
     PhaseTelemetry::OnD3DDraw();
     ShadowTelemetry::OnD3DDraw();
     BindDrawTagForCurrentDraw(This);
@@ -4486,6 +4510,7 @@ void STDMETHODCALLTYPE MyDrawIndexedInstanced(
     INT BaseVertexLocation,
     UINT StartInstanceLocation)
 {
+    g_d3dDrawCallsThisFrame.fetch_add(1, std::memory_order_relaxed);
     PhaseTelemetry::OnD3DDraw();
     ShadowTelemetry::OnD3DDraw();
     BindDrawTagForCurrentDraw(This);
@@ -4509,6 +4534,7 @@ void STDMETHODCALLTYPE MyDrawInstanced(
     UINT StartVertexLocation,
     UINT StartInstanceLocation)
 {
+    g_d3dDrawCallsThisFrame.fetch_add(1, std::memory_order_relaxed);
     PhaseTelemetry::OnD3DDraw();
     ShadowTelemetry::OnD3DDraw();
     BindDrawTagForCurrentDraw(This);
@@ -5531,7 +5557,7 @@ void UIDrawShaderSettingsOverlay() {
         ApplyPassLevelOcclusionSetting(passLevelOcclusionOn);
     }
     bool shadowCacheDirectionalMapSlot1On = SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON;
-    if (ImGui::Checkbox("Cache directional shadow cascade", &shadowCacheDirectionalMapSlot1On)) {
+    if (ImGui::Checkbox("Cache directional shadow splits", &shadowCacheDirectionalMapSlot1On)) {
         ApplyShadowCacheDirectionalMapSlot1Setting(shadowCacheDirectionalMapSlot1On);
     }
     ImGui::Separator();
@@ -5928,10 +5954,12 @@ void UIDrawShaderDebugOverlay() {
 void UIDrawCustomBufferMonitorOverlay() {
     static GFXBoosterAccessData previousData{};
     static DrawTagData previousDrawTag{};
+    static std::uint64_t previousDrawCalls = 0;
     static bool hasPreviousData = false;
 
     const GFXBoosterAccessData data = g_customBufferData;
     const DrawTagData drawTag = g_drawTagData;
+    const std::uint64_t drawCalls = g_d3dDrawCallsLastFrame.load(std::memory_order_relaxed);
 
     ImGui::SetNextWindowPos(ImVec2(10, 320), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSize(ImVec2(560, 640), ImGuiCond_FirstUseEver);
@@ -6006,6 +6034,19 @@ void UIDrawCustomBufferMonitorOverlay() {
         }
     };
 
+    auto renderUInt64Dec = [&](const char* label, std::uint64_t value, std::uint64_t previous) {
+        const bool changed = hasPreviousData && value != previous;
+        ImGui::TableNextRow();
+        ImGui::TableNextColumn(); ImGui::TextUnformatted(label);
+        ImGui::TableNextColumn(); ImGui::TextColored(changed ? ImVec4(1.0f, 0.8f, 0.1f, 1.0f) : ImVec4(1.0f, 1.0f, 1.0f, 1.0f), "%llu", static_cast<unsigned long long>(value));
+        ImGui::TableNextColumn();
+        if (hasPreviousData) {
+            ImGui::Text("%+lld", static_cast<long long>(value) - static_cast<long long>(previous));
+        } else {
+            ImGui::TextDisabled("-");
+        }
+    };
+
     auto renderFloat4 = [&](const char* label, const DirectX::XMFLOAT4& value, const DirectX::XMFLOAT4& previous, float warnDelta = 0.25f) {
         renderFloat((std::string(label) + ".x").c_str(), value.x, previous.x, warnDelta);
         renderFloat((std::string(label) + ".y").c_str(), value.y, previous.y, warnDelta);
@@ -6018,6 +6059,7 @@ void UIDrawCustomBufferMonitorOverlay() {
             renderFloat("time", data.time, previousData.time, 1.0f);
             renderFloat("delta", data.delta, previousData.delta, 0.05f);
             renderFloat("frame", data.frame, previousData.frame, 2.0f);
+            renderUInt64Dec("drawCalls", drawCalls, previousDrawCalls);
             renderFloat("fps", data.fps, previousData.fps, 10.0f);
             renderFloat("random", data.random, previousData.random, 0.9f);
             endColumns();
@@ -6118,6 +6160,7 @@ void UIDrawCustomBufferMonitorOverlay() {
 
     previousData = data;
     previousDrawTag = drawTag;
+    previousDrawCalls = drawCalls;
     hasPreviousData = true;
 
     ImGui::End();
@@ -7038,7 +7081,8 @@ bool InstallDrawTaggingHooks_Internal()
         OriginalUpdate3DModel &&
         OriginalReset3D &&
         OriginalRenderBatches &&
-        (REX::FModule::GetRuntimeIndex() != REX::FModule::Runtime::kOG ||
+        (!kInstallFinishShadowRenderSplitHooks ||
+            REX::FModule::GetRuntimeIndex() != REX::FModule::Runtime::kOG ||
             (OriginalFinishShadowRenderBatches && OriginalFinishShadowRenderGeometryGroup)) &&
         OriginalRenderCommandBufferPassesImpl &&
         OriginalRenderPersistentPassListImpl &&
@@ -7046,6 +7090,7 @@ bool InstallDrawTaggingHooks_Internal()
         OriginalRegisterObjectShadowMapOrMask &&
         (REX::FModule::GetRuntimeIndex() != REX::FModule::Runtime::kOG || OriginalRegisterPassGeometryGroup) &&
         OriginalRenderPassImpl &&
+        (!SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON || OriginalBSShaderAccumulatorRegisterObject) &&
         OriginalBuildCommandBuffer &&
         OriginalReplaceHeadTaskRun &&
         OriginalBSLightTestFrustumCull &&
@@ -7106,6 +7151,19 @@ bool InstallDrawTaggingHooks_Internal()
 
             REX::INFO("InstallDrawTaggingHooks_Internal: BSEffectShader::RestoreGeometry hook installed");
         }
+    }
+
+    if (SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON && !OriginalBSShaderAccumulatorRegisterObject) {
+        REL::Relocation<std::uintptr_t> accumulatorVTable{ RE::VTABLE::BSShaderAccumulator[0] };
+        OriginalBSShaderAccumulatorRegisterObject = reinterpret_cast<BSShaderAccumulatorRegisterObject_t>(
+            accumulatorVTable.write_vfunc(0x2D, reinterpret_cast<void*>(&HookedBSShaderAccumulatorRegisterObject)));
+
+        if (!OriginalBSShaderAccumulatorRegisterObject) {
+            REX::WARN("InstallDrawTaggingHooks_Internal: Failed to install BSShaderAccumulator::RegisterObject hook");
+            return false;
+        }
+
+        REX::INFO("InstallDrawTaggingHooks_Internal: BSShaderAccumulator::RegisterObject hook installed");
     }
 
     if (!OriginalBSBatchRendererDraw) {
@@ -7195,7 +7253,8 @@ bool InstallDrawTaggingHooks_Internal()
         return true;
     };
 
-    if (REX::FModule::GetRuntimeIndex() == REX::FModule::Runtime::kOG &&
+    if (kInstallFinishShadowRenderSplitHooks &&
+        REX::FModule::GetRuntimeIndex() == REX::FModule::Runtime::kOG &&
         (!OriginalFinishShadowRenderBatches || !OriginalFinishShadowRenderGeometryGroup)) {
         if (ptr_FinishAccumulatingShadowMapOrMask.address() < 0x140000000ull ||
             ptr_RenderBatches.address() < 0x140000000ull ||
