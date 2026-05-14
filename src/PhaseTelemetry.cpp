@@ -653,6 +653,11 @@ bool IsInRenderPreUI()
     return tl_inFrame;
 }
 
+bool IsInMainAccum()
+{
+    return tl_inFrame && tl_subphase == SubPhase::MainAccum;
+}
+
 bool IsInDeferredPrePass()
 {
     return tl_inFrame && tl_subphase == SubPhase::DeferredPrePass;

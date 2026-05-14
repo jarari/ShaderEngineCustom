@@ -455,7 +455,7 @@ namespace
     constexpr std::uint32_t kBSXArticulated = 0x80;
     constexpr std::uint32_t kShadowDynamicBSXMask =
         kBSXAnimated | kBSXHavok | kBSXRagdoll | kBSXDynamic | kBSXArticulated;
-    constexpr std::uint32_t kMaxShadowParentScan = 32;
+    constexpr std::uint32_t kMaxShadowParentScan = 2;
     constexpr std::size_t kMaxShadowGeometryClassCache = 262144;
     constexpr std::size_t kMaxShadowPassClassCache = 262144;
     constexpr bool kLegacyFinishLevelShadowSplitEnabled = false;
@@ -1833,6 +1833,16 @@ namespace
     REL::Relocation<std::uintptr_t> ptr_RegisterObjectShadowMapOrMask{ REL::ID{ 1071289, 2317861 } };
     constexpr std::uintptr_t kRegisterObjectShadowMapOrMaskRegisterPassCallOffsetOG = 0xCF;  // 0x14282D8CF - 0x14282D800
 
+    using RegisterObjectStandard_t = bool (*)(void* accumulator, RE::BSGeometry* geometry, void* shaderProperty);
+    RegisterObjectStandard_t OriginalRegisterObjectStandard = nullptr;
+    REL::Relocation<std::uintptr_t> ptr_RegisterObjectStandard{ REL::ID{ 289935, 0 } };
+
+    using AccumulatePassesFromArena_t = void* (*)(void* arena, void* accumulator);
+    AccumulatePassesFromArena_t OriginalAccumulatePassesFromCullerArena = nullptr;
+    AccumulatePassesFromArena_t OriginalAccumulatePassesFromSubGroupArena = nullptr;
+    REL::Relocation<std::uintptr_t> ptr_AccumulatePassesFromCullerArena{ REL::ID{ 962984, 2275945 } };
+    REL::Relocation<std::uintptr_t> ptr_AccumulatePassesFromSubGroupArena{ REL::ID{ 389706, 2275946 } };
+
     using RegisterPassGeometryGroup_t = void (*)(void* batchRenderer, BSRenderPassLayout* pass, int group, bool appendOrUnk);
     RegisterPassGeometryGroup_t OriginalRegisterPassGeometryGroup = nullptr;
     REL::Relocation<std::uintptr_t> ptr_RegisterPassGeometryGroup{ REL::ID{ 197098, 0 } };
@@ -2060,6 +2070,13 @@ namespace
         std::uint64_t lastTouchedFrame = 0;
     };
 
+    struct PassOcclusionEarlyGeometryState
+    {
+        std::uint8_t hiddenStreak = 0;
+        std::uint8_t skippedSinceRefresh = 0;
+        std::uint64_t lastTouchedFrame = 0;
+    };
+
     struct CameraOcclusionSnapshot
     {
         float x = 0.0f;
@@ -2068,6 +2085,12 @@ namespace
         float dx = 0.0f;
         float dy = 0.0f;
         float dz = 1.0f;
+    };
+
+    struct PassOcclusionArenaGatePatch
+    {
+        std::uint16_t* gate = nullptr;
+        std::uint16_t original = 0;
     };
 
     constexpr std::size_t kPassOcclusionMaxEntries = 32768;
@@ -2082,15 +2105,35 @@ namespace
     constexpr std::uint64_t kPassOcclusionStaleFrames = 600;
     constexpr std::uint32_t kPassOcclusionPrunePeriod = 120;
     constexpr std::uint64_t kPassOcclusionTelemetryPeriod = 300;
+    constexpr std::size_t kCullerBlockStride = 0x3A70;
+    constexpr std::size_t kCullerBlockObjectArrayOffset = 0x2060;
+    constexpr std::size_t kCullerBlockGateArrayOffset = 0x3060;
+    constexpr std::size_t kCullerBlockGateStride = 5;
+    constexpr std::size_t kCullerBlockCountOffset = 0x3A68;
+    constexpr std::size_t kCullerBlockNextOffset = 0x3A70;
+    constexpr std::size_t kCullerArenaHeadOffset = 0x00;
+    constexpr std::size_t kCullerArenaFirstBlockOffset = 0x10;
+    constexpr std::size_t kCullerArenaCurrentOffset = 0x20;
+    constexpr std::size_t kCullerArenaTailOffset = 0x28;
+    constexpr std::size_t kNiAVObjectTypeOffset = 0x158;
 
     enum class PassOcclusionGeometryReject : std::uint8_t
     {
         None,
         NullOrSkinned,
         Type,
+        StaticClass,
         Radius,
         NearCamera,
         ActorTagged
+    };
+
+    enum class PassOcclusionResolveResult : std::uint8_t
+    {
+        None,
+        Pending,
+        Hidden,
+        Visible
     };
 
     struct PassOcclusionTelemetry
@@ -2128,6 +2171,7 @@ namespace
         std::uint64_t resolvedVisible = 0;
         std::uint64_t skipMain = 0;
         std::uint64_t skipShadow = 0;
+        std::uint64_t earlySkipMain = 0;
         std::uint64_t cameraStableFrames = 0;
         std::uint64_t cameraUnstableFrames = 0;
         std::uint64_t cameraInvalidFrames = 0;
@@ -2138,6 +2182,7 @@ namespace
     };
 
     std::unordered_map<PassOcclusionKey, PassOcclusionState, PassOcclusionKeyHash> g_passOcclusionCache;
+    std::unordered_map<RE::BSGeometry*, PassOcclusionEarlyGeometryState> g_passOcclusionEarlyGeometryCache;
     PassOcclusionTelemetry g_passOcclusionTelemetry;
     std::uint64_t g_passOcclusionFrame = 0;
     std::uint64_t g_passOcclusionLastTelemetryFrame = 0;
@@ -2197,6 +2242,9 @@ namespace
             case PassOcclusionGeometryReject::Type:
                 ++g_passOcclusionTelemetry.rejectGeomType;
                 break;
+            case PassOcclusionGeometryReject::StaticClass:
+                ++g_passOcclusionTelemetry.rejectGeomType;
+                break;
             case PassOcclusionGeometryReject::Radius:
                 ++g_passOcclusionTelemetry.rejectGeomRadius;
                 break;
@@ -2222,6 +2270,11 @@ namespace
         }
         if (!IsStaticGeometryType(geometry->type)) {
             if (reject) *reject = PassOcclusionGeometryReject::Type;
+            return false;
+        }
+        if (domain == PassOcclusionDomain::MainGBuffer &&
+            !IsPrecombineShadowGeometry(geometry)) {
+            if (reject) *reject = PassOcclusionGeometryReject::StaticClass;
             return false;
         }
 
@@ -2295,6 +2348,7 @@ namespace
 
         if (depthTarget == static_cast<UINT>(MAIN_DEPTHSTENCIL_TARGET) &&
             hasRT &&
+            PhaseTelemetry::IsInDeferredPrePass() &&
             IsMainGBufferGroup(group)) {
             return PassOcclusionDomain::MainGBuffer;
         }
@@ -2352,10 +2406,10 @@ namespace
         return GetRenderBatchNodeHeadRaw(GetRenderBatchNodeAddress(batchRenderer, group, subIdx));
     }
 
-    void ResolvePassOcclusionQuery(REX::W32::ID3D11DeviceContext* context, PassOcclusionState& state)
+    PassOcclusionResolveResult ResolvePassOcclusionQuery(REX::W32::ID3D11DeviceContext* context, PassOcclusionState& state)
     {
         if (!context || !state.query || !state.pending) {
-            return;
+            return PassOcclusionResolveResult::None;
         }
 
         std::uint64_t samples = 0;
@@ -2366,7 +2420,7 @@ namespace
             REX::W32::D3D11_ASYNC_GETDATA_DONOTFLUSH);
         if (hr != S_OK) {
             ++g_passOcclusionTelemetry.queryPending;
-            return;
+            return PassOcclusionResolveResult::Pending;
         }
 
         state.pending = false;
@@ -2375,10 +2429,12 @@ namespace
             if (state.hiddenStreak < 255) {
                 ++state.hiddenStreak;
             }
+            return PassOcclusionResolveResult::Hidden;
         } else {
             ++g_passOcclusionTelemetry.resolvedVisible;
             state.hiddenStreak = 0;
             state.skippedSinceRefresh = 0;
+            return PassOcclusionResolveResult::Visible;
         }
     }
 
@@ -2418,6 +2474,146 @@ namespace
             ++g_passOcclusionTelemetry.stateCreated;
         }
         return &newIt->second;
+    }
+
+    bool ConsumePassOcclusionSkipBudget(PassOcclusionDomain domain);
+
+    void SyncPassOcclusionEarlyGeometryState(
+        RE::BSGeometry* geometry,
+        PassOcclusionDomain domain,
+        const PassOcclusionState& state,
+        PassOcclusionResolveResult result)
+    {
+        if (!geometry || domain != PassOcclusionDomain::MainGBuffer) {
+            return;
+        }
+        if (result != PassOcclusionResolveResult::Hidden &&
+            result != PassOcclusionResolveResult::Visible) {
+            return;
+        }
+
+        auto& early = g_passOcclusionEarlyGeometryCache[geometry];
+        early.hiddenStreak = state.hiddenStreak;
+        early.skippedSinceRefresh = 0;
+        early.lastTouchedFrame = g_passOcclusionFrame;
+    }
+
+    bool ShouldEarlyCullRegisterObjectStandard(RE::BSGeometry* geometry)
+    {
+        if (!PASS_LEVEL_OCCLUSION_ON ||
+            !PhaseTelemetry::IsInMainAccum() ||
+            !g_passOcclusionCameraStable ||
+            !geometry) {
+            return false;
+        }
+
+        PassOcclusionGeometryReject reject = PassOcclusionGeometryReject::None;
+        if (!IsGeometryEligibleForPassOcclusion(geometry, PassOcclusionDomain::MainGBuffer, &reject)) {
+            CountPassOcclusionGeometryReject(reject);
+            return false;
+        }
+
+        auto it = g_passOcclusionEarlyGeometryCache.find(geometry);
+        if (it == g_passOcclusionEarlyGeometryCache.end()) {
+            return false;
+        }
+
+        auto& early = it->second;
+        if (early.hiddenStreak < kPassOcclusionMainHiddenFrames ||
+            early.skippedSinceRefresh >= kPassOcclusionMainMaxSkips ||
+            !ConsumePassOcclusionSkipBudget(PassOcclusionDomain::MainGBuffer)) {
+            return false;
+        }
+
+        ++early.skippedSinceRefresh;
+        early.lastTouchedFrame = g_passOcclusionFrame;
+        ++g_passOcclusionTelemetry.skipMain;
+        ++g_passOcclusionTelemetry.earlySkipMain;
+        return true;
+    }
+
+    std::uintptr_t ReadArenaPtr(std::uintptr_t base, std::size_t offset)
+    {
+        return base ? *reinterpret_cast<std::uintptr_t*>(base + offset) : 0;
+    }
+
+    std::uintptr_t ResolveCullerArenaEnd(std::uintptr_t arena)
+    {
+        const auto current = ReadArenaPtr(arena, kCullerArenaCurrentOffset);
+        const auto firstBlock = ReadArenaPtr(arena, kCullerArenaFirstBlockOffset);
+        if (firstBlock && current >= firstBlock + kCullerBlockNextOffset) {
+            const auto next = ReadArenaPtr(firstBlock, kCullerBlockNextOffset);
+            if (next) {
+                return next;
+            }
+        }
+        return current;
+    }
+
+    std::uintptr_t ResolveCullerArenaStart(std::uintptr_t arena)
+    {
+        const auto current = ReadArenaPtr(arena, kCullerArenaCurrentOffset);
+        const auto tail = ReadArenaPtr(arena, kCullerArenaTailOffset);
+        if (tail == current) {
+            return ResolveCullerArenaEnd(arena);
+        }
+        return ReadArenaPtr(arena, kCullerArenaHeadOffset) ? tail : 0;
+    }
+
+    void PatchPassOcclusionArenaGates(void* arena, std::vector<PassOcclusionArenaGatePatch>& patches)
+    {
+        if (!PASS_LEVEL_OCCLUSION_ON ||
+            !PhaseTelemetry::IsInMainAccum() ||
+            !g_passOcclusionCameraStable ||
+            !arena) {
+            return;
+        }
+
+        const auto arenaBase = reinterpret_cast<std::uintptr_t>(arena);
+        const auto endBlock = ResolveCullerArenaEnd(arenaBase);
+        std::uintptr_t block = ResolveCullerArenaStart(arenaBase);
+        for (std::uint32_t blockGuard = 0; block && block != endBlock && blockGuard < 4096; ++blockGuard) {
+            const auto count = *reinterpret_cast<std::uint32_t*>(block + kCullerBlockCountOffset);
+            const auto safeCount = (std::min)(count, 1024u);
+            for (std::uint32_t i = 0; i < safeCount; ++i) {
+                auto* gate = reinterpret_cast<std::uint16_t*>(
+                    block + kCullerBlockGateArrayOffset + static_cast<std::size_t>(i) * kCullerBlockGateStride);
+                if (*gate == 0) {
+                    continue;
+                }
+
+                const auto object = *reinterpret_cast<std::uintptr_t*>(
+                    block + kCullerBlockObjectArrayOffset + static_cast<std::size_t>(i) * sizeof(void*));
+                if (!object) {
+                    continue;
+                }
+
+                const auto type = *reinterpret_cast<std::uint8_t*>(object + kNiAVObjectTypeOffset);
+                if (!IsStaticGeometryType(type)) {
+                    continue;
+                }
+
+                auto* geometry = reinterpret_cast<RE::BSGeometry*>(object);
+                if (!ShouldEarlyCullRegisterObjectStandard(geometry)) {
+                    continue;
+                }
+
+                patches.push_back({ gate, *gate });
+                *gate = 0;
+            }
+
+            block = ReadArenaPtr(block, kCullerBlockNextOffset);
+        }
+    }
+
+    void RestorePassOcclusionArenaGates(std::vector<PassOcclusionArenaGatePatch>& patches)
+    {
+        for (const auto& patch : patches) {
+            if (patch.gate) {
+                *patch.gate = patch.original;
+            }
+        }
+        patches.clear();
     }
 
     bool ConsumePassOcclusionSkipBudget(PassOcclusionDomain domain)
@@ -2556,7 +2752,8 @@ namespace
         }
 
         state->lastTouchedFrame = g_passOcclusionFrame;
-        ResolvePassOcclusionQuery(context, *state);
+        const auto resolveResult = ResolvePassOcclusionQuery(context, *state);
+        SyncPassOcclusionEarlyGeometryState(key.geometry, domain, *state, resolveResult);
 
         const std::uint8_t requiredHidden =
             domain == PassOcclusionDomain::Shadow ? kPassOcclusionShadowHiddenFrames : kPassOcclusionMainHiddenFrames;
@@ -2685,6 +2882,14 @@ namespace
                     ++it;
                 }
             }
+            for (auto it = g_passOcclusionEarlyGeometryCache.begin(); it != g_passOcclusionEarlyGeometryCache.end();) {
+                if (g_passOcclusionFrame > it->second.lastTouchedFrame &&
+                    g_passOcclusionFrame - it->second.lastTouchedFrame > kPassOcclusionStaleFrames) {
+                    it = g_passOcclusionEarlyGeometryCache.erase(it);
+                } else {
+                    ++it;
+                }
+            }
         }
 
         MaybeLogPassOcclusionTelemetry();
@@ -2699,6 +2904,7 @@ namespace
             }
         }
         g_passOcclusionCache.clear();
+        g_passOcclusionEarlyGeometryCache.clear();
     }
 
     void CollectActorDrawTaggedGeometry(RE::NiAVObject* root, std::unordered_set<RE::BSGeometry*>& geometry)
@@ -3400,6 +3606,47 @@ namespace
         }
 
         return OriginalRegisterObjectShadowMapOrMask(accumulator, geometry, shaderProperty);
+    }
+
+    bool HookedRegisterObjectStandard(void* accumulator, RE::BSGeometry* geometry, void* shaderProperty)
+    {
+        if (ShouldEarlyCullRegisterObjectStandard(geometry)) {
+            return true;
+        }
+
+        return OriginalRegisterObjectStandard(accumulator, geometry, shaderProperty);
+    }
+
+    void* HookedAccumulatePassesFromArenaImpl(
+        AccumulatePassesFromArena_t original,
+        void* arena,
+        void* accumulator)
+    {
+        if (!original) {
+            return nullptr;
+        }
+
+        std::vector<PassOcclusionArenaGatePatch> patches;
+        PatchPassOcclusionArenaGates(arena, patches);
+        void* result = original(arena, accumulator);
+        RestorePassOcclusionArenaGates(patches);
+        return result;
+    }
+
+    void* HookedAccumulatePassesFromCullerArena(void* arena, void* accumulator)
+    {
+        return HookedAccumulatePassesFromArenaImpl(
+            OriginalAccumulatePassesFromCullerArena,
+            arena,
+            accumulator);
+    }
+
+    void* HookedAccumulatePassesFromSubGroupArena(void* arena, void* accumulator)
+    {
+        return HookedAccumulatePassesFromArenaImpl(
+            OriginalAccumulatePassesFromSubGroupArena,
+            arena,
+            accumulator);
     }
 
     void HookedRegisterPassGeometryGroup(void* batchRenderer, BSRenderPassLayout* pass, int group, bool appendOrUnk)
@@ -7112,6 +7359,9 @@ bool InstallDrawTaggingHooks_Internal()
         OriginalRenderPersistentPassListImpl &&
         (REX::FModule::GetRuntimeIndex() != REX::FModule::Runtime::kOG || OriginalProcessCommandBuffer) &&
         OriginalRegisterObjectShadowMapOrMask &&
+        (REX::FModule::GetRuntimeIndex() != REX::FModule::Runtime::kOG || OriginalRegisterObjectStandard) &&
+        OriginalAccumulatePassesFromCullerArena &&
+        OriginalAccumulatePassesFromSubGroupArena &&
         (REX::FModule::GetRuntimeIndex() != REX::FModule::Runtime::kOG || OriginalRegisterPassGeometryGroup) &&
         OriginalRenderPassImpl &&
         OriginalBuildCommandBuffer &&
@@ -7410,6 +7660,66 @@ bool InstallDrawTaggingHooks_Internal()
         }
 
         REX::INFO("InstallDrawTaggingHooks_Internal: RegisterObject_ShadowMapOrMask hook installed");
+    }
+
+    if (REX::FModule::GetRuntimeIndex() == REX::FModule::Runtime::kOG && !OriginalRegisterObjectStandard) {
+        if (ptr_RegisterObjectStandard.address() < 0x140000000ull) {
+            REX::WARN("InstallDrawTaggingHooks_Internal: RegisterObject_Standard REL::ID failed to resolve");
+            return false;
+        }
+
+        constexpr std::size_t kRegisterObjectStandardPrologueSize = 15;
+        OriginalRegisterObjectStandard = CreateBranchGateway5<RegisterObjectStandard_t>(
+            ptr_RegisterObjectStandard,
+            kRegisterObjectStandardPrologueSize,
+            reinterpret_cast<void*>(&HookedRegisterObjectStandard));
+
+        if (!OriginalRegisterObjectStandard) {
+            REX::WARN("InstallDrawTaggingHooks_Internal: Failed to install RegisterObject_Standard hook");
+            return false;
+        }
+
+        REX::INFO("InstallDrawTaggingHooks_Internal: RegisterObject_Standard hook installed");
+    }
+
+    if (!OriginalAccumulatePassesFromCullerArena) {
+        if (ptr_AccumulatePassesFromCullerArena.address() < 0x140000000ull) {
+            REX::WARN("InstallDrawTaggingHooks_Internal: AccumulatePassesFromArena<CullerArena> REL::ID failed to resolve");
+            return false;
+        }
+
+        constexpr std::size_t kAccumulatePassesFromArenaPrologueSize = 17;
+        OriginalAccumulatePassesFromCullerArena = CreateBranchGateway<AccumulatePassesFromArena_t>(
+            ptr_AccumulatePassesFromCullerArena,
+            kAccumulatePassesFromArenaPrologueSize,
+            reinterpret_cast<void*>(&HookedAccumulatePassesFromCullerArena));
+
+        if (!OriginalAccumulatePassesFromCullerArena) {
+            REX::WARN("InstallDrawTaggingHooks_Internal: Failed to install AccumulatePassesFromArena<CullerArena> hook");
+            return false;
+        }
+
+        REX::INFO("InstallDrawTaggingHooks_Internal: AccumulatePassesFromArena<CullerArena> hook installed");
+    }
+
+    if (!OriginalAccumulatePassesFromSubGroupArena) {
+        if (ptr_AccumulatePassesFromSubGroupArena.address() < 0x140000000ull) {
+            REX::WARN("InstallDrawTaggingHooks_Internal: AccumulatePassesFromArena<SubGroupArena> REL::ID failed to resolve");
+            return false;
+        }
+
+        constexpr std::size_t kAccumulatePassesFromSubGroupArenaPrologueSize = 17;
+        OriginalAccumulatePassesFromSubGroupArena = CreateBranchGateway<AccumulatePassesFromArena_t>(
+            ptr_AccumulatePassesFromSubGroupArena,
+            kAccumulatePassesFromSubGroupArenaPrologueSize,
+            reinterpret_cast<void*>(&HookedAccumulatePassesFromSubGroupArena));
+
+        if (!OriginalAccumulatePassesFromSubGroupArena) {
+            REX::WARN("InstallDrawTaggingHooks_Internal: Failed to install AccumulatePassesFromArena<SubGroupArena> hook");
+            return false;
+        }
+
+        REX::INFO("InstallDrawTaggingHooks_Internal: AccumulatePassesFromArena<SubGroupArena> hook installed");
     }
 
     if (REX::FModule::GetRuntimeIndex() == REX::FModule::Runtime::kOG && !OriginalRegisterPassGeometryGroup) {

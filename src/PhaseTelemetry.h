@@ -55,6 +55,7 @@ void RequireHooks();
 
 // Cheap render-thread phase predicates used by renderer hooks.
 bool IsInRenderPreUI();
+bool IsInMainAccum();
 bool IsInDeferredPrePass();
 bool IsInDeferredLightsImpl();
 
