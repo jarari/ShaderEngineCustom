@@ -1046,6 +1046,14 @@ bool DirectionalMapSlot1CacheHit(const Scope& scope) noexcept
 bool DirectionalMapSlot1StaticBuildReady(const Scope& scope) noexcept
 {
     auto& cache = s_directionalMapSlot1Cache;
+    if (cache.valid &&
+        s_staticDepthCache.valid &&
+        CacheKeyStable(cache.key, scope.key)) {
+        cache.pendingBuildKey = {};
+        cache.pendingBuildKeyHits = 0;
+        return true;
+    }
+
     if (!CacheKeyStable(cache.pendingBuildKey, scope.key)) {
         cache.pendingBuildKey = scope.key;
         cache.pendingBuildKeyHits = 1;

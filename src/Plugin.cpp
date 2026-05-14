@@ -440,11 +440,12 @@ namespace
     struct ShadowPassClassification
     {
         RE::BSGeometry* geometry = nullptr;
-        bool isPrecombine = false;
+        std::uint8_t flags = 0;
     };
     std::shared_mutex g_shadowPassClassLock;
     std::unordered_map<BSRenderPassLayout*, ShadowPassClassification> g_shadowPassClassifications;
 
+    constexpr std::uint8_t kShadowPassClassStatic = 1u << 0;
     constexpr std::uint32_t kBSXAnimated = 0x1;
     constexpr std::uint32_t kBSXHavok = 0x2;
     constexpr std::uint32_t kBSXRagdoll = 0x4;
@@ -665,7 +666,7 @@ namespace
             return false;
         }
 
-        isPrecombine = it->second.isPrecombine;
+        isPrecombine = (it->second.flags & kShadowPassClassStatic) != 0;
         return true;
     }
 
@@ -679,7 +680,10 @@ namespace
         if (g_shadowPassClassifications.size() >= kMaxShadowPassClassCache) {
             g_shadowPassClassifications.clear();
         }
-        g_shadowPassClassifications[pass] = { pass->geometry, isPrecombine };
+        g_shadowPassClassifications[pass] = {
+            pass->geometry,
+            static_cast<std::uint8_t>(isPrecombine ? kShadowPassClassStatic : 0)
+        };
     }
 
     bool ClassifyShadowPass(BSRenderPassLayout* pass)
@@ -739,6 +743,18 @@ namespace
                ShadowTelemetry::IsShadowCacheActiveForCurrentShadow() &&
                (ShadowTelemetry::IsShadowCacheStaticBuildPass() ||
                 ShadowTelemetry::IsShadowCacheDynamicOverlayPass());
+    }
+
+    bool ShouldSplitRenderBatchesCall(unsigned int passGroupIdx, unsigned int filter) noexcept
+    {
+        if (!IsShadowCacheRenderSplitActive()) {
+            return false;
+        }
+
+        // FinishAccumulating_ShadowMapOrMask consumes accumulator group 1, then
+        // RenderGeometryGroup(group=9). The latter can render a nested batch
+        // renderer across groups 0..12 with filter=9.
+        return passGroupIdx == kShadowCacheBatchPassGroup || filter == 9;
     }
 
     std::uintptr_t GetRenderBatchNodeAddress(void* batchRenderer, int group, unsigned int subIdx)
@@ -850,12 +866,536 @@ namespace
         std::vector<NodeHead> nodes_;
     };
 
+    enum class ShadowSplitPhase : std::uint8_t
+    {
+        None,
+        StaticBuild,
+        DynamicOverlay
+    };
+
+    constexpr std::size_t kGeometryGroupPersistentHeadOffset = 0x08;
+    constexpr std::size_t kGeometryGroupFlagsOffset = 0x20;
+
+    struct alignas(16) CommandBufferPassesDataSidecar
+    {
+        std::array<void*, kMaxCommandBufferRecords> records{};
+        void** writeCursor = records.data();
+        std::uint64_t pad10008 = 0;
+        std::uint32_t frame = 0xFFFFFFFFu;
+        std::uint32_t pad10014 = 0;
+    };
+    static_assert(offsetof(CommandBufferPassesDataSidecar, records) == 0x0);
+    static_assert(offsetof(CommandBufferPassesDataSidecar, writeCursor) == kCommandBufferWriteCursorOffset);
+    static_assert(offsetof(CommandBufferPassesDataSidecar, frame) == kCommandBufferFrameOffset);
+
+    struct ShadowSplitChain
+    {
+        BSRenderPassLayout* head = nullptr;
+        BSRenderPassLayout* tail = nullptr;
+        std::vector<BSRenderPassLayout*> passes;
+        std::vector<void*> commandBuffers;
+    };
+
+    struct ShadowSplitChains
+    {
+        ShadowSplitChain staticChain;
+        ShadowSplitChain dynamicChain;
+    };
+
+    struct ActiveCommandBufferSelection
+    {
+        std::uintptr_t node = 0;
+        BSRenderPassLayout* head = nullptr;
+        std::uint32_t techniqueID = 0;
+        std::vector<void*> commandBuffers;
+    };
+
+    struct CommandBufferSidecarCacheEntry
+    {
+        void* originalCbData = nullptr;
+        std::uintptr_t node = 0;
+        ShadowSplitPhase phase = ShadowSplitPhase::None;
+        std::unique_ptr<CommandBufferPassesDataSidecar> data;
+        std::vector<void*> selectedCommandBuffers;
+        void** sourceWriteCursor = nullptr;
+        std::uint32_t sourceFrame = 0xFFFFFFFFu;
+    };
+
+    struct PassGroupState
+    {
+        std::uint32_t head = 0xFFFFu;
+        std::uint32_t tail = 0xFFFFu;
+    };
+
+    struct NodeState
+    {
+        std::uintptr_t address = 0;
+        BSRenderPassLayout* head = nullptr;
+        std::uint16_t next = 0xFFFFu;
+    };
+
+    struct PassLinkState
+    {
+        BSRenderPassLayout* pass = nullptr;
+        BSRenderPassLayout* next = nullptr;
+    };
+
+    thread_local std::uint32_t tl_finishLevelShadowSplitDepth = 0;
+    thread_local std::vector<ActiveCommandBufferSelection> tl_shadowCommandSelections;
+    thread_local std::vector<CommandBufferSidecarCacheEntry> tl_commandBufferSidecars;
+    constexpr std::size_t kMaxShadowCommandBufferSidecars = 256;
+
+    ShadowSplitPhase CurrentShadowSplitPhase() noexcept
+    {
+        if (ShadowTelemetry::IsShadowCacheStaticBuildPass()) {
+            return ShadowSplitPhase::StaticBuild;
+        }
+        if (ShadowTelemetry::IsShadowCacheDynamicOverlayPass()) {
+            return ShadowSplitPhase::DynamicOverlay;
+        }
+        return ShadowSplitPhase::None;
+    }
+
+    bool IsFinishLevelShadowSplitActive() noexcept
+    {
+        return tl_finishLevelShadowSplitDepth != 0;
+    }
+
+    class ScopedFinishLevelShadowSplit
+    {
+    public:
+        ScopedFinishLevelShadowSplit()
+        {
+            ++tl_finishLevelShadowSplitDepth;
+        }
+
+        ~ScopedFinishLevelShadowSplit()
+        {
+            --tl_finishLevelShadowSplitDepth;
+        }
+
+        ScopedFinishLevelShadowSplit(const ScopedFinishLevelShadowSplit&) = delete;
+        ScopedFinishLevelShadowSplit& operator=(const ScopedFinishLevelShadowSplit&) = delete;
+    };
+
+    void AddPassToShadowSplitChain(ShadowSplitChain& chain, BSRenderPassLayout* pass)
+    {
+        if (!pass) {
+            return;
+        }
+
+        if (!chain.head) {
+            chain.head = pass;
+        }
+        chain.tail = pass;
+        chain.passes.push_back(pass);
+        auto* commandBufferRecord = reinterpret_cast<void*>(pass->next);
+        if (!commandBufferRecord) {
+            commandBufferRecord = pass->commandBuffer;
+        }
+        if (commandBufferRecord) {
+            chain.commandBuffers.push_back(commandBufferRecord);
+        }
+    }
+
+    ShadowSplitChains BuildShadowSplitChains(BSRenderPassLayout* head)
+    {
+        ShadowSplitChains chains{};
+        const auto phase = CurrentShadowSplitPhase();
+        if (phase == ShadowSplitPhase::None || !head) {
+            return chains;
+        }
+
+        std::uint32_t count = 0;
+        for (auto* pass = head; pass && count < 65536; pass = pass->passGroupNext, ++count) {
+            const bool isStaticCaster = ClassifyShadowPass(pass);
+            if (phase == ShadowSplitPhase::StaticBuild) {
+                ShadowTelemetry::NoteShadowCacheRenderPassSplit(isStaticCaster, isStaticCaster);
+            } else if (phase == ShadowSplitPhase::DynamicOverlay) {
+                ShadowTelemetry::NoteShadowCacheRenderPassSplit(!isStaticCaster, isStaticCaster);
+            }
+
+            if (isStaticCaster) {
+                AddPassToShadowSplitChain(chains.staticChain, pass);
+            } else {
+                AddPassToShadowSplitChain(chains.dynamicChain, pass);
+            }
+        }
+        return chains;
+    }
+
+    const ShadowSplitChain& SelectShadowSplitChain(const ShadowSplitChains& chains) noexcept
+    {
+        return ShadowTelemetry::IsShadowCacheStaticBuildPass() ? chains.staticChain : chains.dynamicChain;
+    }
+
+    void ExposeShadowSplitChain(const ShadowSplitChain& chain, std::vector<PassLinkState>& originalLinks)
+    {
+        for (std::size_t i = 0; i < chain.passes.size(); ++i) {
+            auto* pass = chain.passes[i];
+            if (!pass) {
+                continue;
+            }
+            originalLinks.push_back({ pass, pass->passGroupNext });
+            pass->passGroupNext = (i + 1 < chain.passes.size()) ? chain.passes[i + 1] : nullptr;
+        }
+    }
+
+    void RestorePassLinks(std::vector<PassLinkState>& originalLinks)
+    {
+        for (const auto& link : originalLinks) {
+            if (link.pass) {
+                link.pass->passGroupNext = link.next;
+            }
+        }
+        originalLinks.clear();
+    }
+
+    std::uintptr_t GetBatchRendererNodeArray(std::uintptr_t batchRenderer, unsigned int group)
+    {
+        if (!batchRenderer || group >= 32) {
+            return 0;
+        }
+        return *reinterpret_cast<std::uintptr_t*>(
+            batchRenderer + kBatchRendererGroupStride * group + kBatchRendererGroupArrayOffset);
+    }
+
+    PassGroupState ReadBatchGroupState(std::uintptr_t batchRenderer, unsigned int group)
+    {
+        PassGroupState state{};
+        if (!batchRenderer || group >= 32) {
+            return state;
+        }
+        state.head = *reinterpret_cast<std::uint32_t*>(
+            batchRenderer + kBatchRendererGroupHeadOffset + group * sizeof(std::uint64_t));
+        state.tail = *reinterpret_cast<std::uint32_t*>(
+            batchRenderer + kBatchRendererGroupTailOffset + group * sizeof(std::uint64_t));
+        return state;
+    }
+
+    void WriteBatchGroupState(std::uintptr_t batchRenderer, unsigned int group, PassGroupState state)
+    {
+        if (!batchRenderer || group >= 32) {
+            return;
+        }
+        *reinterpret_cast<std::uint32_t*>(
+            batchRenderer + kBatchRendererGroupHeadOffset + group * sizeof(std::uint64_t)) = state.head;
+        *reinterpret_cast<std::uint32_t*>(
+            batchRenderer + kBatchRendererGroupTailOffset + group * sizeof(std::uint64_t)) = state.tail;
+    }
+
+    std::size_t GetCommandBufferRecordCount(void* cbData)
+    {
+        if (!cbData) {
+            return 0;
+        }
+
+        auto** records = static_cast<void**>(cbData);
+        auto** cursor = *reinterpret_cast<void***>(
+            static_cast<std::byte*>(cbData) + kCommandBufferWriteCursorOffset);
+        const auto recordsAddr = reinterpret_cast<std::uintptr_t>(records);
+        const auto cursorAddr = reinterpret_cast<std::uintptr_t>(cursor);
+        const auto maxCursorAddr = recordsAddr + kMaxCommandBufferRecords * sizeof(void*);
+        if (cursorAddr >= recordsAddr &&
+            cursorAddr <= maxCursorAddr &&
+            ((cursorAddr - recordsAddr) % sizeof(void*)) == 0) {
+            return static_cast<std::size_t>((cursorAddr - recordsAddr) / sizeof(void*));
+        }
+
+        std::size_t count = 0;
+        while (count < kMaxCommandBufferRecords && records[count]) {
+            ++count;
+        }
+        return count;
+    }
+
+    bool ContainsPointer(const std::vector<void*>& values, void* needle)
+    {
+        return std::find(values.begin(), values.end(), needle) != values.end();
+    }
+
+    CommandBufferSidecarCacheEntry& GetCommandBufferSidecarEntry(
+        void* cbData,
+        std::uintptr_t node,
+        ShadowSplitPhase phase)
+    {
+        for (auto& entry : tl_commandBufferSidecars) {
+            if (entry.originalCbData == cbData &&
+                entry.node == node &&
+                entry.phase == phase) {
+                return entry;
+            }
+        }
+
+        if (tl_commandBufferSidecars.size() >= kMaxShadowCommandBufferSidecars) {
+            tl_commandBufferSidecars.clear();
+        }
+
+        auto& entry = tl_commandBufferSidecars.emplace_back();
+        entry.originalCbData = cbData;
+        entry.node = node;
+        entry.phase = phase;
+        entry.data = std::make_unique<CommandBufferPassesDataSidecar>();
+        return entry;
+    }
+
+    ActiveCommandBufferSelection* FindActiveCommandBufferSelection(std::uintptr_t node)
+    {
+        if (!node) {
+            return nullptr;
+        }
+
+        for (auto it = tl_shadowCommandSelections.rbegin(); it != tl_shadowCommandSelections.rend(); ++it) {
+            if (it->node == node) {
+                return std::addressof(*it);
+            }
+        }
+        return nullptr;
+    }
+
+    std::vector<void*> CollectCommandBufferRecords(BSRenderPassLayout* head)
+    {
+        std::vector<void*> records;
+        for (auto* pass = head; pass && records.size() < 65536; pass = pass->passGroupNext) {
+            auto* commandBufferRecord = reinterpret_cast<void*>(pass->next);
+            if (!commandBufferRecord) {
+                commandBufferRecord = pass->commandBuffer;
+            }
+            if (commandBufferRecord) {
+                records.push_back(commandBufferRecord);
+            }
+        }
+        return records;
+    }
+
+    void* PrepareShadowCommandBufferSidecar(
+        void* cbData,
+        const ActiveCommandBufferSelection& selection,
+        ShadowSplitPhase phase)
+    {
+        if (!cbData || selection.commandBuffers.empty() || phase == ShadowSplitPhase::None) {
+            return nullptr;
+        }
+
+        auto& entry = GetCommandBufferSidecarEntry(cbData, selection.node, phase);
+        if (!entry.data) {
+            entry.data = std::make_unique<CommandBufferPassesDataSidecar>();
+        }
+
+        auto** sourceRecords = static_cast<void**>(cbData);
+        auto** sourceCursor = *reinterpret_cast<void***>(
+            static_cast<std::byte*>(cbData) + kCommandBufferWriteCursorOffset);
+        const auto sourceFrame = *reinterpret_cast<std::uint32_t*>(
+            static_cast<std::byte*>(cbData) + kCommandBufferFrameOffset);
+        const bool needsRebuild =
+            entry.sourceWriteCursor != sourceCursor ||
+            entry.sourceFrame != sourceFrame ||
+            entry.selectedCommandBuffers != selection.commandBuffers;
+
+        if (needsRebuild) {
+            std::fill(entry.data->records.begin(), entry.data->records.end(), nullptr);
+            const std::size_t sourceCount = GetCommandBufferRecordCount(cbData);
+            std::size_t keptCount = 0;
+            std::vector<void*> keptRecords;
+            keptRecords.reserve(selection.commandBuffers.size());
+
+            for (std::size_t i = 0; i < sourceCount && keptCount < kMaxCommandBufferRecords; ++i) {
+                void* record = sourceRecords[i];
+                if (record && ContainsPointer(selection.commandBuffers, record)) {
+                    entry.data->records[keptCount++] = record;
+                    keptRecords.push_back(record);
+                }
+            }
+
+            for (void* commandBuffer : selection.commandBuffers) {
+                if (commandBuffer && !ContainsPointer(keptRecords, commandBuffer)) {
+                    return nullptr;
+                }
+            }
+            if (keptCount == 0) {
+                return nullptr;
+            }
+
+            entry.data->writeCursor = entry.data->records.data() + keptCount;
+            if (keptCount < kMaxCommandBufferRecords) {
+                entry.data->records[keptCount] = nullptr;
+            }
+            entry.selectedCommandBuffers = selection.commandBuffers;
+            entry.sourceWriteCursor = sourceCursor;
+            entry.sourceFrame = sourceFrame;
+        }
+
+        entry.data->frame = sourceFrame;
+        return entry.data.get();
+    }
+
+    class ScopedShadowBatchGroupExposure
+    {
+    public:
+        ScopedShadowBatchGroupExposure(void* batchRenderer, unsigned int group) :
+            batchRenderer_(reinterpret_cast<std::uintptr_t>(batchRenderer)),
+            group_(group)
+        {
+            if (!IsShadowCacheRenderSplitActive() ||
+                !batchRenderer_) {
+                return;
+            }
+
+            nodeArray_ = GetBatchRendererNodeArray(batchRenderer_, group_);
+            if (!nodeArray_) {
+                return;
+            }
+
+            active_ = true;
+            originalGroup_ = ReadBatchGroupState(batchRenderer_, group_);
+            const bool clearAfterRender = *reinterpret_cast<std::uint8_t*>(batchRenderer_ + 0x350) != 0;
+            restore_ = ShadowTelemetry::IsShadowCacheStaticBuildPass() || !clearAfterRender;
+            std::uint32_t filteredHead = 0xFFFFu;
+            std::uint32_t filteredTail = 0xFFFFu;
+
+            std::uint32_t nodeIndex = originalGroup_.head;
+            for (std::size_t count = 0; nodeIndex != kInvalidBatchNode && count < 65536; ++count) {
+                const std::uintptr_t node = nodeArray_ + kBatchRendererNodeStride * nodeIndex;
+                const auto originalHead = GetRenderBatchNodeHeadRaw(node);
+                const auto originalNext = *reinterpret_cast<std::uint16_t*>(node + kBatchRendererNodeNextOffset);
+                originalNodes_.push_back({ node, originalHead, originalNext });
+
+                const auto chains = BuildShadowSplitChains(originalHead);
+                const auto& selected = SelectShadowSplitChain(chains);
+                ExposeShadowSplitChain(selected, originalPassLinks_);
+                SetRenderBatchNodeHeadRaw(node, selected.head);
+
+                if (selected.head) {
+                    if (filteredHead == 0xFFFFu) {
+                        filteredHead = nodeIndex;
+                    } else if (filteredTail != 0xFFFFu) {
+                        const std::uintptr_t tailNode = nodeArray_ + kBatchRendererNodeStride * filteredTail;
+                        *reinterpret_cast<std::uint16_t*>(tailNode + kBatchRendererNodeNextOffset) =
+                            static_cast<std::uint16_t>(nodeIndex);
+                    }
+                    filteredTail = nodeIndex;
+                    *reinterpret_cast<std::uint16_t*>(node + kBatchRendererNodeNextOffset) = 0xFFFFu;
+
+                    tl_shadowCommandSelections.push_back({
+                        node,
+                        selected.head,
+                        GetRenderBatchNodeTechniqueRaw(node),
+                        selected.commandBuffers
+                    });
+                    ++commandSelectionCount_;
+                } else if (!restore_ && clearAfterRender) {
+                    SetRenderBatchNodeHeadRaw(node, nullptr);
+                }
+
+                nodeIndex = originalNext;
+            }
+
+            WriteBatchGroupState(batchRenderer_, group_, { filteredHead, filteredTail });
+            empty_ = filteredHead == 0xFFFFu;
+        }
+
+        ~ScopedShadowBatchGroupExposure()
+        {
+            if (!active_) {
+                return;
+            }
+
+            RestorePassLinks(originalPassLinks_);
+            if (commandSelectionCount_ <= tl_shadowCommandSelections.size()) {
+                tl_shadowCommandSelections.resize(tl_shadowCommandSelections.size() - commandSelectionCount_);
+            } else {
+                tl_shadowCommandSelections.clear();
+            }
+
+            if (!restore_) {
+                for (const auto& node : originalNodes_) {
+                    *reinterpret_cast<std::uint16_t*>(node.address + kBatchRendererNodeNextOffset) = node.next;
+                }
+                return;
+            }
+
+            WriteBatchGroupState(batchRenderer_, group_, originalGroup_);
+            for (const auto& node : originalNodes_) {
+                SetRenderBatchNodeHeadRaw(node.address, node.head);
+                *reinterpret_cast<std::uint16_t*>(node.address + kBatchRendererNodeNextOffset) = node.next;
+            }
+        }
+
+        bool Active() const noexcept { return active_; }
+        bool Empty() const noexcept { return active_ && empty_; }
+
+        ScopedShadowBatchGroupExposure(const ScopedShadowBatchGroupExposure&) = delete;
+        ScopedShadowBatchGroupExposure& operator=(const ScopedShadowBatchGroupExposure&) = delete;
+
+    private:
+        std::uintptr_t batchRenderer_ = 0;
+        unsigned int group_ = 0;
+        std::uintptr_t nodeArray_ = 0;
+        PassGroupState originalGroup_{};
+        std::vector<NodeState> originalNodes_;
+        std::vector<PassLinkState> originalPassLinks_;
+        std::size_t commandSelectionCount_ = 0;
+        bool active_ = false;
+        bool restore_ = false;
+        bool empty_ = false;
+    };
+
+    class ScopedPersistentShadowListExposure
+    {
+    public:
+        explicit ScopedPersistentShadowListExposure(void* persistentPassList) :
+            list_(static_cast<BSRenderPassLayout**>(persistentPassList))
+        {
+            if (!list_ || !IsShadowCacheRenderSplitActive()) {
+                return;
+            }
+
+            active_ = true;
+            restore_ = ShadowTelemetry::IsShadowCacheStaticBuildPass();
+            originalHead_ = list_[0];
+            originalTail_ = list_[1];
+
+            const auto chains = BuildShadowSplitChains(originalHead_);
+            const auto& selected = SelectShadowSplitChain(chains);
+            ExposeShadowSplitChain(selected, originalPassLinks_);
+            list_[0] = selected.head;
+            list_[1] = selected.tail;
+        }
+
+        ~ScopedPersistentShadowListExposure()
+        {
+            if (!active_) {
+                return;
+            }
+
+            RestorePassLinks(originalPassLinks_);
+            if (restore_ && list_) {
+                list_[0] = originalHead_;
+                list_[1] = originalTail_;
+            }
+        }
+
+        bool Active() const noexcept { return active_; }
+
+        ScopedPersistentShadowListExposure(const ScopedPersistentShadowListExposure&) = delete;
+        ScopedPersistentShadowListExposure& operator=(const ScopedPersistentShadowListExposure&) = delete;
+
+    private:
+        BSRenderPassLayout** list_ = nullptr;
+        BSRenderPassLayout* originalHead_ = nullptr;
+        BSRenderPassLayout* originalTail_ = nullptr;
+        std::vector<PassLinkState> originalPassLinks_;
+        bool active_ = false;
+        bool restore_ = false;
+    };
+
     class ScopedShadowPassChainFilter
     {
     public:
         explicit ScopedShadowPassChainFilter(BSRenderPassLayout* head)
         {
-            if (!SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON ||
+            if (IsFinishLevelShadowSplitActive() ||
+                !SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON ||
                 !ShadowTelemetry::IsShadowCacheActiveForCurrentShadow() ||
                 (!ShadowTelemetry::IsShadowCacheStaticBuildPass() &&
                  !ShadowTelemetry::IsShadowCacheDynamicOverlayPass())) {
@@ -920,7 +1460,8 @@ namespace
             records_(static_cast<void**>(cbData)),
             node_(GetRenderBatchNodeAddress(batchRenderer, group, subIdx))
         {
-            if (!IsShadowCacheRenderSplitActive() ||
+            if (IsFinishLevelShadowSplitActive() ||
+                !IsShadowCacheRenderSplitActive() ||
                 group != static_cast<int>(kShadowCacheBatchPassGroup) ||
                 !cbData_ ||
                 !records_ ||
@@ -1090,7 +1631,8 @@ namespace
             originalHead_ = list_[0];
             originalTail_ = list_[1];
 
-            if (!SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON ||
+            if (IsFinishLevelShadowSplitActive() ||
+                !SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON ||
                 !ShadowTelemetry::IsShadowCacheActiveForCurrentShadow() ||
                 (!ShadowTelemetry::IsShadowCacheStaticBuildPass() &&
                  !ShadowTelemetry::IsShadowCacheDynamicOverlayPass())) {
@@ -1254,7 +1796,16 @@ namespace
     // Mangled: ?RenderCommandBufferPassesImpl@BSBatchRenderer@@QEAAXHPEAUCommandBufferPassesData@1@I_N@Z
     using RenderBatches_t = void (*)(void* this_, unsigned int passGroupIdx, bool allowAlpha, unsigned int filter);
     RenderBatches_t OriginalRenderBatches = nullptr;
+    RenderBatches_t OriginalFinishShadowRenderBatches = nullptr;
     REL::Relocation<std::uintptr_t> ptr_RenderBatches{ REL::ID{ 1083446, 0 } };
+
+    using RenderGeometryGroup_t = void (*)(void* accumulator, unsigned int group, bool allowAlpha);
+    RenderGeometryGroup_t OriginalFinishShadowRenderGeometryGroup = nullptr;
+    REL::Relocation<std::uintptr_t> ptr_RenderGeometryGroup{ REL::ID{ 1379976, 2317897 } };
+
+    REL::Relocation<std::uintptr_t> ptr_FinishAccumulatingShadowMapOrMask{ REL::ID{ 1358523, 2317874 } };
+    constexpr std::uintptr_t kFinishShadowRenderBatchesCallOffsetOG = 0x38;       // 0x14282E4A8 - 0x14282E470
+    constexpr std::uintptr_t kFinishShadowRenderGeometryGroupCallOffsetOG = 0x51; // 0x14282E4C1 - 0x14282E470
 
     using RenderCommandBufferPassesImpl_t = void (*)(void* this_, int passGroupIdx, void* cbData, unsigned int subIdx, bool allowAlpha);
     RenderCommandBufferPassesImpl_t OriginalRenderCommandBufferPassesImpl = nullptr;
@@ -2606,14 +3157,75 @@ namespace
         RefreshActorDrawTaggedGeometry(biped);
     }
 
+    void HookedFinishShadowRenderBatches(void* this_, unsigned int passGroupIdx, bool allowAlpha, unsigned int filter)
+    {
+        auto renderBatches = OriginalRenderBatches ? OriginalRenderBatches : OriginalFinishShadowRenderBatches;
+        if (!renderBatches) {
+            return;
+        }
+
+        const unsigned int prevGroup = g_renderBatchesGroup;
+        ++g_renderBatchesDepth;
+        g_renderBatchesGroup = passGroupIdx;
+        {
+            if (!ShouldSplitRenderBatchesCall(passGroupIdx, filter)) {
+                renderBatches(this_, passGroupIdx, allowAlpha, filter);
+            } else {
+                ScopedFinishLevelShadowSplit finishSplit;
+                ScopedShadowBatchGroupExposure exposure(this_, passGroupIdx);
+                if (!exposure.Empty()) {
+                    renderBatches(this_, passGroupIdx, allowAlpha, filter);
+                }
+            }
+        }
+        g_renderBatchesGroup = prevGroup;
+        --g_renderBatchesDepth;
+    }
+
+    void HookedFinishShadowRenderGeometryGroup(void* accumulator, unsigned int group, bool allowAlpha)
+    {
+        if (!OriginalFinishShadowRenderGeometryGroup) {
+            return;
+        }
+
+        if (!IsShadowCacheRenderSplitActive() || group != 9 || !accumulator) {
+            OriginalFinishShadowRenderGeometryGroup(accumulator, group, allowAlpha);
+            return;
+        }
+
+        auto* geometryGroup = *reinterpret_cast<std::byte**>(
+            static_cast<std::byte*>(accumulator) + 0x420 + static_cast<std::size_t>(group) * sizeof(void*));
+        const bool persistentListMode =
+            geometryGroup &&
+            ((*reinterpret_cast<std::uint8_t*>(geometryGroup + kGeometryGroupFlagsOffset) & 1u) != 0);
+        if (!persistentListMode) {
+            OriginalFinishShadowRenderGeometryGroup(accumulator, group, allowAlpha);
+            return;
+        }
+
+        {
+            ScopedFinishLevelShadowSplit finishSplit;
+            ScopedPersistentShadowListExposure exposure(geometryGroup + kGeometryGroupPersistentHeadOffset);
+            OriginalFinishShadowRenderGeometryGroup(accumulator, group, allowAlpha);
+        }
+    }
+
     void HookedRenderBatches(void* this_, unsigned int passGroupIdx, bool allowAlpha, unsigned int filter)
     {
         const unsigned int prevGroup = g_renderBatchesGroup;
         ++g_renderBatchesDepth;
         g_renderBatchesGroup = passGroupIdx;
         {
-            ScopedStaticRenderBatchesRestore staticBuildRestore(this_, passGroupIdx);
-            OriginalRenderBatches(this_, passGroupIdx, allowAlpha, filter);
+            if (ShouldSplitRenderBatchesCall(passGroupIdx, filter)) {
+                ScopedFinishLevelShadowSplit renderBatchesSplit;
+                ScopedShadowBatchGroupExposure exposure(this_, passGroupIdx);
+                if (!exposure.Empty()) {
+                    OriginalRenderBatches(this_, passGroupIdx, allowAlpha, filter);
+                }
+            } else {
+                ScopedStaticRenderBatchesRestore staticBuildRestore(this_, passGroupIdx);
+                OriginalRenderBatches(this_, passGroupIdx, allowAlpha, filter);
+            }
         }
         g_renderBatchesGroup = prevGroup;
         --g_renderBatchesDepth;
@@ -2659,6 +3271,49 @@ namespace
         }
 
         {
+            const auto node = GetRenderBatchNodeAddress(this_, passGroupIdx, subIdx);
+            ActiveCommandBufferSelection fallbackSelection{};
+            auto* shadowSelection =
+                IsFinishLevelShadowSplitActive() ? FindActiveCommandBufferSelection(node) : nullptr;
+            const bool forceSelectedReplay =
+                IsFinishLevelShadowSplitActive() &&
+                IsShadowCacheRenderSplitActive() &&
+                (passGroupIdx == static_cast<int>(kShadowCacheBatchPassGroup) ||
+                 ShadowTelemetry::IsShadowCacheActiveForCurrentShadow());
+            if (forceSelectedReplay && !shadowSelection) {
+                fallbackSelection.node = node;
+                fallbackSelection.head = head;
+                fallbackSelection.techniqueID = node ? GetRenderBatchNodeTechniqueRaw(node) : 0;
+                fallbackSelection.commandBuffers = CollectCommandBufferRecords(head);
+                shadowSelection = &fallbackSelection;
+            }
+
+            void* replayCbData = cbData;
+            if (shadowSelection) {
+                const auto phase = CurrentShadowSplitPhase();
+                if (!shadowSelection->head) {
+                    if (phase == ShadowSplitPhase::DynamicOverlay) {
+                        InvalidateCommandBufferFrame(cbData);
+                    }
+                    EndPassOcclusionDecision(g_rendererData ? g_rendererData->context : nullptr, decision);
+                    return;
+                }
+
+                replayCbData = PrepareShadowCommandBufferSidecar(cbData, *shadowSelection, phase);
+                if (!replayCbData) {
+                    OriginalRenderPassImpl(
+                        this_,
+                        shadowSelection->head,
+                        shadowSelection->techniqueID,
+                        allowAlpha);
+                    if (phase == ShadowSplitPhase::DynamicOverlay) {
+                        InvalidateCommandBufferFrame(cbData);
+                    }
+                    EndPassOcclusionDecision(g_rendererData ? g_rendererData->context : nullptr, decision);
+                    return;
+                }
+            }
+
             ScopedCommandBufferPassesFilter shadowSplitFilter(this_, passGroupIdx, cbData, subIdx);
             if (shadowSplitFilter.Active()) {
                 if (!shadowSplitFilter.Head()) {
@@ -2684,8 +3339,8 @@ namespace
                 ShadowTelemetry::IsShadowCacheActiveForCurrentShadow()) {
                 processTarget.emplace(MakeShadowPassWorkTarget(
                     this_,
-                    head,
-                    cbData,
+                    shadowSelection ? shadowSelection->head : head,
+                    replayCbData,
                     passGroupIdx,
                     subIdx,
                     allowAlpha));
@@ -2709,7 +3364,10 @@ namespace
                 g_bindingInjectedPixelResources = false;
             }
 
-            OriginalRenderCommandBufferPassesImpl(this_, passGroupIdx, cbData, subIdx, allowAlpha);
+            OriginalRenderCommandBufferPassesImpl(this_, passGroupIdx, replayCbData, subIdx, allowAlpha);
+            if (shadowSelection && CurrentShadowSplitPhase() == ShadowSplitPhase::DynamicOverlay) {
+                InvalidateCommandBufferFrame(cbData);
+            }
         }
         EndPassOcclusionDecision(g_rendererData ? g_rendererData->context : nullptr, decision);
     }
@@ -6380,6 +7038,8 @@ bool InstallDrawTaggingHooks_Internal()
         OriginalUpdate3DModel &&
         OriginalReset3D &&
         OriginalRenderBatches &&
+        (REX::FModule::GetRuntimeIndex() != REX::FModule::Runtime::kOG ||
+            (OriginalFinishShadowRenderBatches && OriginalFinishShadowRenderGeometryGroup)) &&
         OriginalRenderCommandBufferPassesImpl &&
         OriginalRenderPersistentPassListImpl &&
         (REX::FModule::GetRuntimeIndex() != REX::FModule::Runtime::kOG || OriginalProcessCommandBuffer) &&
@@ -6479,6 +7139,115 @@ bool InstallDrawTaggingHooks_Internal()
         }
 
         REX::INFO("InstallDrawTaggingHooks_Internal: BSBatchRenderer::RenderBatches hook installed");
+    }
+
+    auto verifyRel32Call = [](const char* label,
+                              std::uintptr_t callSite,
+                              std::uintptr_t expectedTarget) -> bool {
+        if (callSite < 0x140000000ull || expectedTarget < 0x140000000ull) {
+            REX::WARN("InstallDrawTaggingHooks_Internal: {} call site failed to resolve ({:#x}, expected {:#x})",
+                      label,
+                      callSite,
+                      expectedTarget);
+            return false;
+        }
+
+        auto* callBytes = reinterpret_cast<const std::uint8_t*>(callSite);
+        if (callBytes[0] != 0xE8) {
+            REX::WARN("InstallDrawTaggingHooks_Internal: {} call site at {:#x} is not a CALL rel32",
+                      label,
+                      callSite);
+            return false;
+        }
+
+        std::int32_t rel32 = 0;
+        std::memcpy(&rel32, callBytes + 1, sizeof(rel32));
+        const std::uintptr_t actualTarget = callSite + 5 + rel32;
+        if (actualTarget != expectedTarget) {
+            REX::WARN("InstallDrawTaggingHooks_Internal: {} call site {:#x} targets {:#x}, expected {:#x}",
+                      label,
+                      callSite,
+                      actualTarget,
+                      expectedTarget);
+            return false;
+        }
+
+        return true;
+    };
+
+    auto patchVerifiedCall = [&verifyRel32Call](const char* label,
+                                                std::uintptr_t callSite,
+                                                std::uintptr_t expectedTarget,
+                                                void* hook,
+                                                std::uintptr_t* outOriginal) -> bool {
+        if (!verifyRel32Call(label, callSite, expectedTarget)) {
+            return false;
+        }
+
+        REL::Relocation<std::uintptr_t> callSiteRel{ callSite };
+        const auto original = callSiteRel.write_call<5>(reinterpret_cast<std::uintptr_t>(hook));
+        if (outOriginal) {
+            *outOriginal = original;
+        }
+        REX::INFO("InstallDrawTaggingHooks_Internal: {} call-site redirect installed at {:#x}",
+                  label,
+                  callSite);
+        return true;
+    };
+
+    if (REX::FModule::GetRuntimeIndex() == REX::FModule::Runtime::kOG &&
+        (!OriginalFinishShadowRenderBatches || !OriginalFinishShadowRenderGeometryGroup)) {
+        if (ptr_FinishAccumulatingShadowMapOrMask.address() < 0x140000000ull ||
+            ptr_RenderBatches.address() < 0x140000000ull ||
+            ptr_RenderGeometryGroup.address() < 0x140000000ull) {
+            REX::WARN("InstallDrawTaggingHooks_Internal: FinishAccumulating_ShadowMapOrMask split call-site dependencies failed to resolve");
+            return false;
+        }
+
+        const auto finishShadowRenderBatchesCallSite =
+            ptr_FinishAccumulatingShadowMapOrMask.address() + kFinishShadowRenderBatchesCallOffsetOG;
+        const auto finishShadowRenderGeometryGroupCallSite =
+            ptr_FinishAccumulatingShadowMapOrMask.address() + kFinishShadowRenderGeometryGroupCallOffsetOG;
+        if (!OriginalFinishShadowRenderBatches &&
+            !verifyRel32Call(
+                "FinishAccumulating_ShadowMapOrMask -> RenderBatches",
+                finishShadowRenderBatchesCallSite,
+                ptr_RenderBatches.address())) {
+            return false;
+        }
+        if (!OriginalFinishShadowRenderGeometryGroup &&
+            !verifyRel32Call(
+                "FinishAccumulating_ShadowMapOrMask -> RenderGeometryGroup",
+                finishShadowRenderGeometryGroupCallSite,
+                ptr_RenderGeometryGroup.address())) {
+            return false;
+        }
+
+        if (!OriginalFinishShadowRenderBatches) {
+            std::uintptr_t original = 0;
+            if (!patchVerifiedCall(
+                    "FinishAccumulating_ShadowMapOrMask -> RenderBatches",
+                    finishShadowRenderBatchesCallSite,
+                    ptr_RenderBatches.address(),
+                    reinterpret_cast<void*>(&HookedFinishShadowRenderBatches),
+                    &original)) {
+                return false;
+            }
+            OriginalFinishShadowRenderBatches = reinterpret_cast<RenderBatches_t>(original);
+        }
+
+        if (!OriginalFinishShadowRenderGeometryGroup) {
+            std::uintptr_t original = 0;
+            if (!patchVerifiedCall(
+                    "FinishAccumulating_ShadowMapOrMask -> RenderGeometryGroup",
+                    finishShadowRenderGeometryGroupCallSite,
+                    ptr_RenderGeometryGroup.address(),
+                    reinterpret_cast<void*>(&HookedFinishShadowRenderGeometryGroup),
+                    &original)) {
+                return false;
+            }
+            OriginalFinishShadowRenderGeometryGroup = reinterpret_cast<RenderGeometryGroup_t>(original);
+        }
     }
 
     if (!OriginalRenderCommandBufferPassesImpl) {
