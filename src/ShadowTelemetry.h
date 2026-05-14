@@ -1,0 +1,83 @@
+#pragma once
+
+#include <atomic>
+#include <cstdint>
+
+namespace REX::W32 {
+    struct ID3D11DeviceContext;
+    struct ID3D11DepthStencilView;
+}
+
+// ShadowTelemetry attributes shadow-map submission cost hidden inside
+// DrawWorld::DeferredLightsImpl and owns the optional directional shadow
+// static-cache experiment.
+namespace ShadowTelemetry {
+
+enum class Mode : std::uint8_t {
+    Off,
+    On,
+};
+
+extern std::atomic<Mode> g_mode;
+
+bool Initialize();
+
+enum class WorkKind : std::uint8_t {
+    CommandBufferReplay,
+    ImmediatePass,
+    BuildCommandBuffer,
+};
+
+struct WorkTarget {
+    void* owner = nullptr;
+    void* head = nullptr;
+    void* cbData = nullptr;
+    void* commandBuffer = nullptr;
+    void* geometry = nullptr;
+    void* shader = nullptr;
+    void* shaderProperty = nullptr;
+    std::uint32_t techniqueID = 0;
+    std::int32_t passGroupIdx = -1;
+    std::uint32_t subIdx = 0;
+    std::uint32_t chainLen = 0;
+    std::uint32_t srvCount = 0;
+    std::uint32_t cbRecordCount = 0;
+    std::uint32_t cbDrawCount = 0;
+    std::uint32_t cbNonZeroDrawCount = 0;
+    std::uint32_t cbMaxDrawCount = 0;
+    std::uint32_t cbSrvRecordCount = 0;
+    std::uint32_t cbMaxSrvRecordCount = 0;
+    bool allowAlpha = false;
+};
+
+// Called from the existing renderer hooks. Cheap when mode is off, and only
+// increments counters while BSShadowLight::RenderShadowMap is on the stack.
+void OnBSDraw();
+void OnD3DDraw();
+void OnCommandBufferDraw();
+
+bool BeginShadowWork(WorkKind kind, const WorkTarget& target);
+void EndShadowWork(WorkKind kind);
+
+bool IsInShadowMap();
+bool IsDirectionalMapSlot1Shadow();
+bool IsShadowCacheActiveForCurrentShadow();
+bool IsShadowCacheStaticBuildPass();
+bool IsShadowCacheDynamicOverlayPass();
+bool IsShadowCacheRegistrationFilterActive(void* accumulator, void* geometry);
+void NoteShadowCacheShadowMapOrMaskHook(bool active);
+void NoteShadowCacheShadowMapOrMaskHookDetail(bool active, void* accumulator);
+void NoteShadowCacheRenderPassSplit(bool kept, bool isStaticCaster);
+void ResetShadowCacheState();
+
+// Called from the D3D11 ClearDepthStencilView hook. Returns true when the
+// hook handled the clear by restoring cached static depth and the original
+// ClearDepthStencilView call must be suppressed.
+bool HandleShadowCacheClearDepthStencilView(
+    REX::W32::ID3D11DeviceContext* context,
+    REX::W32::ID3D11DepthStencilView* dsv,
+    std::uint32_t clearFlags,
+    float depth,
+    std::uint8_t stencil);
+
+}  // namespace ShadowTelemetry

@@ -28,6 +28,14 @@ extern std::filesystem::path g_pluginPath;
 extern bool DEBUGGING;
 // Custom buffer update flag
 extern bool CUSTOMBUFFER_ON;
+// Pass-level cached occlusion toggle. Disabling it bypasses the render-pass
+// occlusion query/skip path added for A/B testing.
+extern bool PASS_LEVEL_OCCLUSION_ON;
+// Experimental directional shadow-map static-depth cache. Off by default; when
+// enabled it caches precombine-only depth for the stable directional mapSlot=1
+// cascade and overlays dynamic/unknown records for up to N consecutive calls.
+extern bool SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON;
+extern std::uint32_t SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_MAX_SKIP;
 // Custom resource view slot in shader
 extern UINT CUSTOMBUFFER_SLOT;
 extern UINT DRAWTAG_SLOT;
@@ -117,6 +125,7 @@ inline std::string ToLower(const std::string& str) {
 
 std::string GetCommonShaderHeaderHLSLTop();
 std::string GetCommonShaderHeaderHLSLBottom();
+bool SaveShaderEngineConfig(std::string* errorMessage = nullptr);
 
 // --- Compiled-shader cache ----------------------------------------------
 //

@@ -658,6 +658,11 @@ bool IsInDeferredPrePass()
     return tl_inFrame && tl_subphase == SubPhase::DeferredPrePass;
 }
 
+bool IsInDeferredLightsImpl()
+{
+    return tl_inFrame && tl_subphase == SubPhase::DeferredLightsImpl;
+}
+
 bool Initialize()
 {
     if (s_installed) {

@@ -4,6 +4,7 @@
 #include <LightCullPolicy.h>
 #include <LightTracker.h>
 #include <PhaseTelemetry.h>
+#include <ShadowTelemetry.h>
 #include <LightSorter.h>
 
 // Global logger pointer
@@ -81,6 +82,11 @@ std::filesystem::path g_shaderFolderPath;
 bool DEBUGGING = false;
 // Custom buffer update flag
 bool CUSTOMBUFFER_ON = true;
+// Pass-level cached occlusion flag
+bool PASS_LEVEL_OCCLUSION_ON = false;
+// Experimental directional shadow-map static-depth cache benchmark
+bool SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON = false;
+std::uint32_t SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_MAX_SKIP = 1;
 // Custom resource view slot in shader
 UINT CUSTOMBUFFER_SLOT = 31;
 UINT DRAWTAG_SLOT = 26;
@@ -200,6 +206,107 @@ HMODULE GetThisModuleHandle()
         hModule = GetModuleHandleA(g_moduleName.c_str());
     }
     return hModule;
+}
+
+bool SaveShaderEngineConfig(std::string* errorMessage)
+{
+    auto setError = [errorMessage](std::string message) {
+        if (errorMessage) {
+            *errorMessage = std::move(message);
+        }
+        return false;
+    };
+
+    try {
+        std::filesystem::path configPath =
+            (g_pluginPath.empty() ? std::filesystem::path{ "Data\\F4SE\\Plugins" } : g_pluginPath) / g_iniName;
+        std::error_code ec;
+        std::filesystem::create_directories(configPath.parent_path(), ec);
+        if (ec) {
+            return setError("Could not create config directory: " + ec.message());
+        }
+
+        std::vector<std::string> lines;
+        if (std::filesystem::exists(configPath, ec)) {
+            std::ifstream in(configPath, std::ios::in);
+            if (!in.is_open()) {
+                return setError("Could not open " + configPath.string() + " for reading.");
+            }
+            std::string line;
+            while (std::getline(in, line)) {
+                lines.push_back(line);
+            }
+        } else {
+            std::istringstream defaults(defaultIni ? defaultIni : "");
+            std::string line;
+            while (std::getline(defaults, line)) {
+                lines.push_back(line);
+            }
+        }
+
+        bool foundPassOcclusion = false;
+        bool foundShadowCache = false;
+        for (auto& line : lines) {
+            auto [key, value] = GetKeyValueFromLine(line);
+            const auto lowerKey = ToLower(key);
+            if (lowerKey == "pass_level_occlusion_on") {
+                line = std::string("PASS_LEVEL_OCCLUSION_ON=") + (PASS_LEVEL_OCCLUSION_ON ? "true" : "false");
+                foundPassOcclusion = true;
+            } else if (lowerKey == "shadow_cache_directional_mapslot1_on") {
+                line = std::string("SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON=") + (SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON ? "true" : "false");
+                foundShadowCache = true;
+            }
+        }
+
+        if (!foundPassOcclusion) {
+            if (!lines.empty() && !lines.back().empty()) {
+                lines.emplace_back();
+            }
+            lines.emplace_back("; --- PASS-LEVEL CACHED OCCLUSION ---");
+            lines.emplace_back("; Enable/disable render-pass occlusion query caching and draw skipping.");
+            lines.emplace_back(std::string("PASS_LEVEL_OCCLUSION_ON=") + (PASS_LEVEL_OCCLUSION_ON ? "true" : "false"));
+        }
+        if (!foundShadowCache) {
+            if (!lines.empty() && !lines.back().empty()) {
+                lines.emplace_back();
+            }
+            lines.emplace_back("; --- SHADOW STATIC CACHE ---");
+            lines.emplace_back("; Directional mapSlot=1 precombine static-depth cache A/B toggle.");
+            lines.emplace_back(std::string("SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON=") + (SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON ? "true" : "false"));
+        }
+
+        std::filesystem::path tmpPath = configPath;
+        tmpPath += ".tmp";
+        {
+            std::ofstream out(tmpPath, std::ios::out | std::ios::trunc);
+            if (!out.is_open()) {
+                return setError("Could not open " + tmpPath.string() + " for writing.");
+            }
+            for (const auto& line : lines) {
+                out << line << '\n';
+            }
+            if (!out.good()) {
+                return setError("Failed while writing " + tmpPath.string() + ".");
+            }
+        }
+
+        std::error_code copyEc;
+        std::filesystem::copy_file(tmpPath, configPath, std::filesystem::copy_options::overwrite_existing, copyEc);
+        std::error_code removeEc;
+        std::filesystem::remove(tmpPath, removeEc);
+        if (copyEc) {
+            return setError("Could not save " + configPath.string() + ": " + copyEc.message());
+        }
+
+        if (errorMessage) {
+            errorMessage->clear();
+        }
+        return true;
+    } catch (const std::exception& e) {
+        return setError(e.what());
+    } catch (...) {
+        return setError("Unknown error while saving ShaderEngine.ini.");
+    }
 }
 
 // Helper to parse hex string to uint32_t
@@ -782,6 +889,28 @@ void LoadConfig(HMODULE hModule) {
             REX::INFO("LoadConfig: CUSTOMBUFFER_ON set to {}", CUSTOMBUFFER_ON);
             continue;
         }
+        else if (lowerKey == "pass_level_occlusion_on") {
+            const std::string v = ToLower(value);
+            PASS_LEVEL_OCCLUSION_ON = (v == "true" || v == "1" || v == "on");
+            REX::INFO("LoadConfig: PASS_LEVEL_OCCLUSION_ON set to {}", PASS_LEVEL_OCCLUSION_ON);
+            continue;
+        }
+        else if (lowerKey == "shadow_cache_directional_mapslot1_on") {
+            const std::string v = ToLower(value);
+            SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON = (v == "true" || v == "1" || v == "on");
+            REX::INFO("LoadConfig: SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON set to {}", SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON);
+            continue;
+        }
+        else if (lowerKey == "shadow_cache_directional_mapslot1_max_skip") {
+            try {
+                const int parsed = std::stoi(value);
+                SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_MAX_SKIP = static_cast<std::uint32_t>((std::max)(0, (std::min)(parsed, 8)));
+                REX::INFO("LoadConfig: SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_MAX_SKIP set to {}", SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_MAX_SKIP);
+            } catch (...) {
+                REX::WARN("LoadConfig: Invalid SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_MAX_SKIP value: {}. Using default: {}", value, SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_MAX_SKIP);
+            }
+            continue;
+        }
         else if (lowerKey == "custombuffer_slot") {
             try {
                 CUSTOMBUFFER_SLOT = static_cast<UINT>(std::stoi(value));
@@ -952,6 +1081,17 @@ void LoadConfig(HMODULE hModule) {
             } else {
                 PhaseTelemetry::g_mode.store(PhaseTelemetry::Mode::Off, std::memory_order_relaxed);
                 REX::INFO("LoadConfig: PHASE_TELEMETRY_MODE set to off");
+            }
+            continue;
+        }
+        else if (lowerKey == "shadow_telemetry_mode") {
+            const std::string v = ToLower(value);
+            if (v == "on" || v == "true" || v == "1") {
+                ShadowTelemetry::g_mode.store(ShadowTelemetry::Mode::On, std::memory_order_relaxed);
+                REX::INFO("LoadConfig: SHADOW_TELEMETRY_MODE set to on");
+            } else {
+                ShadowTelemetry::g_mode.store(ShadowTelemetry::Mode::Off, std::memory_order_relaxed);
+                REX::INFO("LoadConfig: SHADOW_TELEMETRY_MODE set to off");
             }
             continue;
         }
@@ -1207,11 +1347,10 @@ F4SE_PLUGIN_LOAD(const F4SE::LoadInterface* a_f4se)
     // Budget covers ShaderEngine's pre-existing CreateBranchGateway hooks
     // (~210 B on OG) plus the 5-byte branch hooks for Update3DModel/Reset3D
     // (each ~19 B gateway + 14 B abs-jump thunk in this same arena) plus
-    // PhaseTelemetry's DrawWorld:: per-phase hooks (14 sites × ~30 B ≈ 420 B,
-    // including the rip-rel instruction relocator for 5 of those sites that
-    // expands the gateway to ~32 B each). 2 KB total leaves comfortable
-    // headroom and matches commonlibf4's default upper bound.
-    trampoline.create(2048);
+    // PhaseTelemetry's DrawWorld:: per-phase hooks (14 sites × ~30 B ≈ 420 B),
+    // plus ShadowTelemetry's direct call-site patches. 4 KB leaves headroom
+    // for write_call thunks and future measurement hooks.
+    trampoline.create(4096);
     // Install the shader creation hooks very early.
     InstallShaderCreationHooks_Internal();
     InstallDrawTaggingHooks_Internal();
@@ -1221,6 +1360,7 @@ F4SE_PLUGIN_LOAD(const F4SE::LoadInterface* a_f4se)
     // so it requests hook installation without enabling telemetry output.
     PhaseTelemetry::RequireHooks();
     PhaseTelemetry::Initialize();
+    ShadowTelemetry::Initialize();
     // LightSorter — stable-partitions the point-light array by stencil flag
     // before DrawWorld::DeferredLightsImpl, then restores. No own hook;
     // PhaseTelemetry's HookedDeferredLightsImpl calls OnEnter/OnExit.

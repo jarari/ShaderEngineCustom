@@ -9,6 +9,16 @@ DEBUGGING=false
 ; This setting applies to all replaced shaders
 ; Shaders with #include "common.inc" have access to ingame data like FPS, Camera position and shader settings
 CUSTOMBUFFER_ON=true
+; Enable/disable pass-level cached occlusion for render-pass A/B testing
+PASS_LEVEL_OCCLUSION_ON=false
+; --- SHADOW STATIC CACHE (behavioral, experimental) ---
+; Directional mapSlot=1 only. Builds a precombine-only static depth cache,
+; restores that depth on cache hits, then replays dynamic/unknown casters.
+; Requires slot-safe DSV access; otherwise it falls back to vanilla rendering.
+SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON=false
+; Maximum consecutive dynamic-overlay cache hits before rebuilding static depth.
+; 1 = rebuild every other eligible call. 0 disables the cache even if enabled.
+SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_MAX_SKIP=1
 ; Custom resource view slot in shader (beyond what the game uses, default t31)
 CUSTOMBUFFER_SLOT=31
 ; Per-draw classification tag resource view slot
@@ -48,6 +58,11 @@ DEVGUI_WIDTH=600
 DEVGUI_HEIGHT=300
 ; Development GUI opacity (0.0 - 1.0)
 DEVGUI_OPACITY=0.75
+
+; Performance counters. Off by default.
+PHASE_TELEMETRY_MODE=off
+SHADOW_TELEMETRY_MODE=off
+LIGHT_SORTER_MODE=off
 
 ; Folder structure
 ; /F4SE/Plugins/ShaderEngine.ini - main configuration file for shader replacement rules

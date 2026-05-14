@@ -56,6 +56,7 @@ void RequireHooks();
 // Cheap render-thread phase predicates used by renderer hooks.
 bool IsInRenderPreUI();
 bool IsInDeferredPrePass();
+bool IsInDeferredLightsImpl();
 
 // Called from Plugin.cpp's HookedBSBatchRendererDraw. Cheap when mode==Off
 // (single relaxed atomic load + branch). Attributes a draw to the currently
