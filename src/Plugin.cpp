@@ -1824,9 +1824,6 @@ namespace
     RenderPassImpl_t OriginalRenderPassImpl = nullptr;
     REL::Relocation<std::uintptr_t> ptr_RenderPassImpl{ REL::ID{ 1543785, 2318710 } };
 
-    using BSShaderAccumulatorRegisterObject_t = bool (*)(void* accumulator, RE::BSGeometry* geometry);
-    BSShaderAccumulatorRegisterObject_t OriginalBSShaderAccumulatorRegisterObject = nullptr;
-
     using RegisterObjectShadowMapOrMask_t = bool (*)(void* accumulator, RE::BSGeometry* geometry, void* shaderProperty);
     RegisterObjectShadowMapOrMask_t OriginalRegisterObjectShadowMapOrMask = nullptr;
     REL::Relocation<std::uintptr_t> ptr_RegisterObjectShadowMapOrMask{ REL::ID{ 1071289, 2317861 } };
@@ -3389,20 +3386,6 @@ namespace
         }
 
         return OriginalRegisterObjectShadowMapOrMask(accumulator, geometry, shaderProperty);
-    }
-
-    bool HookedBSShaderAccumulatorRegisterObject(void* accumulator, RE::BSGeometry* geometry)
-    {
-        if (SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON &&
-            ShadowTelemetry::IsShadowCacheObjectSuppressionActive(accumulator)) {
-            const bool isStaticCaster = IsPrecombineShadowGeometry(geometry);
-            if (ShadowTelemetry::ShouldSuppressShadowCacheObject(accumulator, isStaticCaster)) {
-                ShadowTelemetry::NoteShadowCacheObjectSuppressed(isStaticCaster);
-                return true;
-            }
-        }
-
-        return OriginalBSShaderAccumulatorRegisterObject(accumulator, geometry);
     }
 
     void HookedRegisterPassGeometryGroup(void* batchRenderer, BSRenderPassLayout* pass, int group, bool appendOrUnk)
@@ -7090,7 +7073,6 @@ bool InstallDrawTaggingHooks_Internal()
         OriginalRegisterObjectShadowMapOrMask &&
         (REX::FModule::GetRuntimeIndex() != REX::FModule::Runtime::kOG || OriginalRegisterPassGeometryGroup) &&
         OriginalRenderPassImpl &&
-        (!SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON || OriginalBSShaderAccumulatorRegisterObject) &&
         OriginalBuildCommandBuffer &&
         OriginalReplaceHeadTaskRun &&
         OriginalBSLightTestFrustumCull &&
@@ -7151,19 +7133,6 @@ bool InstallDrawTaggingHooks_Internal()
 
             REX::INFO("InstallDrawTaggingHooks_Internal: BSEffectShader::RestoreGeometry hook installed");
         }
-    }
-
-    if (SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON && !OriginalBSShaderAccumulatorRegisterObject) {
-        REL::Relocation<std::uintptr_t> accumulatorVTable{ RE::VTABLE::BSShaderAccumulator[0] };
-        OriginalBSShaderAccumulatorRegisterObject = reinterpret_cast<BSShaderAccumulatorRegisterObject_t>(
-            accumulatorVTable.write_vfunc(0x2D, reinterpret_cast<void*>(&HookedBSShaderAccumulatorRegisterObject)));
-
-        if (!OriginalBSShaderAccumulatorRegisterObject) {
-            REX::WARN("InstallDrawTaggingHooks_Internal: Failed to install BSShaderAccumulator::RegisterObject hook");
-            return false;
-        }
-
-        REX::INFO("InstallDrawTaggingHooks_Internal: BSShaderAccumulator::RegisterObject hook installed");
     }
 
     if (!OriginalBSBatchRendererDraw) {

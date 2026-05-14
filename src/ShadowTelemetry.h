@@ -65,14 +65,10 @@ bool IsShadowCacheActiveForCurrentShadow();
 bool IsShadowCacheStaticBuildPass();
 bool IsShadowCacheDynamicOverlayPass();
 bool IsShadowCacheRegistrationFilterActive(void* accumulator, void* geometry);
-bool IsShadowCacheObjectSuppressionActive(void* accumulator);
-bool ShouldSuppressShadowCacheObject(void* accumulator, bool isStaticCaster);
-bool IsShadowCacheRegisterPassSplitActive(void* accumulator);
 void* GetShadowCacheSplitBatchRenderer(void* accumulator, bool isStaticCaster);
 void NoteShadowCacheShadowMapOrMaskHook(bool active);
 void NoteShadowCacheShadowMapOrMaskHookDetail(bool active, void* accumulator);
 void NoteShadowCacheRenderPassSplit(bool kept, bool isStaticCaster);
-void NoteShadowCacheObjectSuppressed(bool isStaticCaster);
 void NoteShadowCachePassRouted(bool isStaticCaster);
 void ResetShadowCacheState();
 

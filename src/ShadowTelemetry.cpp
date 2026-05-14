@@ -34,14 +34,12 @@ using BSShaderAccumulatorSetShadowSceneNode_t = void (*)(void* accumulator, void
 using BSShaderAccumulatorSetDepthPassIndex_t = void (*)(void* accumulator, std::uint32_t index);
 using BSShaderAccumulatorSetShadowLight_t = void (*)(void* accumulator, void* light);
 using RenderTargetManagerDestroyRenderTargets_t = void (*)(void* renderTargetManager);
-using SetDirtyRenderTargets_t = void (*)();
 
 RenderShadowMap_t s_origRenderShadowMap = nullptr;
 RenderScene_t     s_origRenderScene = nullptr;
 AccumulateFromLists_t s_origAccumulateFromLists = nullptr;
 RendererFlush_t s_origRenderShadowMapFlush = nullptr;
 RenderTargetManagerDestroyRenderTargets_t s_origDestroyRenderTargets = nullptr;
-SetDirtyRenderTargets_t s_origSetDirtyRenderTargets = nullptr;
 bool              s_installed = false;
 
 REL::Relocation<std::uintptr_t> ptr_ShadowDirectionalRender{ REL::ID{ 871921, 2319335 } };
@@ -55,7 +53,6 @@ REL::Relocation<BSShaderAccumulatorSetShadowSceneNode_t> ptr_SetShadowSceneNode{
 REL::Relocation<BSShaderAccumulatorSetDepthPassIndex_t> ptr_SetDepthPassIndex{ REL::ID{ 695248, 0 } };
 REL::Relocation<BSShaderAccumulatorSetShadowLight_t> ptr_SetShadowLight{ REL::ID{ 50100, 2317901 } };
 REL::Relocation<std::uintptr_t> ptr_DestroyRenderTargets{ REL::ID{ 456166, 0 } };
-REL::Relocation<std::uintptr_t> ptr_SetDirtyRenderTargets{ REL::ID{ 361475, 0 } };
 REL::Relocation<std::uint32_t*> ptr_BSGraphicsTLSIndex{ REL::Offset{ 0x67337B4 } };
 REL::Relocation<void**> ptr_BSGraphicsDefaultContext{ REL::Offset{ 0x61DDC68 } };
 
@@ -82,15 +79,12 @@ constexpr std::uint32_t kShadowAccumulatorCtorMode = 0x63;
 constexpr std::uint32_t kShadowRenderMode = 0x10;
 constexpr std::size_t kAccumulateFromListsPrologueSizeOG = 15;
 constexpr std::size_t kDestroyRenderTargetsPrologueSizeOG = 5;
-constexpr std::size_t kSetDirtyRenderTargetsPrologueSizeOG = 12;
 constexpr std::size_t kBSGraphicsTLSD3DContextOffset = 0xB18;
 constexpr std::size_t kBSGraphicsTLSContextOffset = 0xB20;
 constexpr std::size_t kBSGraphicsContextShadowStateOffset = 0x1B70;
 constexpr std::size_t kRendererStateDepthPlatformTargetOffset = 0x4C;
 constexpr std::size_t kRendererStateDepthMapSlotOffset = 0x50;
-constexpr std::size_t kRendererStateDepthModeOffset = 0x7C;
 constexpr std::size_t kRendererStateDepthLogicalTargetOffset = 0x88;
-constexpr std::uint32_t kRenderTargetModeClear = 0;
 constexpr std::uint32_t kFirstCacheableDirectionalMapSlot = 1;
 constexpr bool kShadowCacheLogEnabled = false;
 
@@ -493,7 +487,6 @@ struct DirectionalSplitContext {
     bool cacheHit = false;
     bool buildBoth = false;
     bool hitRouted = false;
-    bool suppressStaticOnHit = false;
     bool staticRenderedThisFrame = false;
     bool staticCaptureSucceeded = false;
     bool staticCaptureAttempted = false;
@@ -643,18 +636,13 @@ std::array<bool, kMaxDirectionalCacheSplits> s_dynamicAccumulatorConstructed{};
 thread_local ShadowCachePass tl_shadowCachePass = ShadowCachePass::None;
 thread_local std::uint32_t tl_shadowCacheRenderSplit = kInvalidSplitIndex;
 thread_local std::uint32_t tl_lastRegistrationSplit = kInvalidSplitIndex;
-thread_local std::uint32_t tl_dirtyRenderTargetsSplit = kInvalidSplitIndex;
-thread_local ShadowCachePass tl_dirtyRenderTargetsPass = ShadowCachePass::None;
-thread_local REX::W32::ID3D11DepthStencilView* tl_dirtyRenderTargetsDSV = nullptr;
 std::atomic<ShadowCachePass> g_registrationShadowCachePass{ ShadowCachePass::None };
 std::atomic_bool g_registrationShadowCacheActive{ false };
-std::atomic_bool g_registrationSuppressStatic{ false };
 std::array<std::atomic_uint32_t, kMaxDirectionalCacheSplits> g_registrationStaticKeepCounts{};
 std::array<std::atomic_uint32_t, kMaxDirectionalCacheSplits> g_registrationDynamicKeepCounts{};
 std::array<std::atomic<void*>, kMaxDirectionalCacheSplits> g_registrationShadowCacheAccumulators{};
 std::array<std::atomic<void*>, kMaxDirectionalCacheSplits> g_registrationStaticAccumulators{};
 std::array<std::atomic<void*>, kMaxDirectionalCacheSplits> g_registrationDynamicAccumulators{};
-std::array<std::atomic_bool, kMaxDirectionalCacheSplits> g_registrationSuppressStaticBySplit{};
 std::array<std::atomic_bool, kMaxDirectionalCacheSplits> g_registrationBuildBothBySplit{};
 std::atomic_bool g_shadowCacheTargetActive{ false };
 std::atomic<std::uint32_t> g_shadowCacheTargetMapSlot{ (std::numeric_limits<std::uint32_t>::max)() };
@@ -810,38 +798,6 @@ DirectionalSplitContext& ContextForSplit(std::uint32_t splitIndex) noexcept
 }
 
 bool DSVSliceMatchesMapSlot(REX::W32::ID3D11DepthStencilView* dsv, std::uint32_t mapSlot) noexcept;
-
-std::uint32_t FindDirtyRenderTargetsRestoreSplit(
-    std::uint32_t platformDepthTarget,
-    std::uint32_t mapSlot,
-    REX::W32::ID3D11DepthStencilView* dsv) noexcept
-{
-    if (!dsv || !ValidSplitIndex(mapSlot)) {
-        return kInvalidSplitIndex;
-    }
-
-    const auto renderTargetManager = RE::BSGraphics::RenderTargetManager::GetSingleton();
-    for (std::uint32_t i = 0; i < kMaxDirectionalCacheSplits; ++i) {
-        auto& ctx = ContextForSplit(i);
-        if (!ctx.cacheHit ||
-            !ctx.hitRouted ||
-            ctx.key.mapSlot != mapSlot ||
-            !DepthCacheForSplit(i).valid) {
-            continue;
-        }
-
-        if (ctx.key.depthTarget >= static_cast<std::uint32_t>(std::size(renderTargetManager.depthStencilTargetID)) ||
-            renderTargetManager.depthStencilTargetID[ctx.key.depthTarget] != platformDepthTarget) {
-            continue;
-        }
-
-        if (dsv == ActiveShadowDSV(ctx.key) || DSVSliceMatchesMapSlot(dsv, mapSlot)) {
-            return i;
-        }
-    }
-
-    return kInvalidSplitIndex;
-}
 
 bool IsRegistrationFilteringPass(ShadowCachePass pass) noexcept
 {
@@ -1250,7 +1206,9 @@ bool CaptureStaticCacheFromBuildDSV(std::uint32_t splitIndex, REX::W32::ID3D11De
         ok = CopyDSVToStaticCache(depthCache, context, dsv);
     }
     if (ok) {
-        ++CacheForSplit(splitIndex).captured;
+        if constexpr (kShadowCacheLogEnabled) {
+            ++CacheForSplit(splitIndex).captured;
+        }
     }
     return ok;
 }
@@ -1437,8 +1395,7 @@ Scope MakeScope(void* light, void* shadowMapData, LightKind kind) noexcept
 void PublishRegistrationTarget(
     const Scope& scope,
     DirectionalSplitContext& ctx,
-    ShadowCachePass pass,
-    bool suppressStatic) noexcept
+    ShadowCachePass pass) noexcept
 {
     if (!ValidSplitIndex(ctx.slotIndex)) {
         return;
@@ -1450,9 +1407,7 @@ void PublishRegistrationTarget(
     tl_shadowCachePass = pass;
     g_registrationShadowCacheAccumulators[ctx.slotIndex].store(scope.key.accumulator, std::memory_order_release);
     g_registrationShadowCachePass.store(pass, std::memory_order_release);
-    g_registrationSuppressStatic.store(suppressStatic, std::memory_order_release);
-    g_registrationShadowCacheActive.store(pass == ShadowCachePass::BuildBoth || suppressStatic, std::memory_order_release);
-    g_registrationSuppressStaticBySplit[ctx.slotIndex].store(suppressStatic, std::memory_order_release);
+    g_registrationShadowCacheActive.store(pass == ShadowCachePass::BuildBoth, std::memory_order_release);
     g_registrationBuildBothBySplit[ctx.slotIndex].store(pass == ShadowCachePass::BuildBoth, std::memory_order_release);
     g_shadowCacheTargetMapSlot.store(scope.key.mapSlot, std::memory_order_release);
     g_shadowCacheTargetDepthTarget.store(scope.key.depthTarget, std::memory_order_release);
@@ -1464,12 +1419,10 @@ void ClearRegistrationTarget() noexcept
 {
     g_registrationShadowCachePass.store(ShadowCachePass::None, std::memory_order_release);
     g_registrationShadowCacheActive.store(false, std::memory_order_release);
-    g_registrationSuppressStatic.store(false, std::memory_order_release);
     for (std::uint32_t i = 0; i < kMaxDirectionalCacheSplits; ++i) {
         g_registrationShadowCacheAccumulators[i].store(nullptr, std::memory_order_release);
         g_registrationStaticAccumulators[i].store(nullptr, std::memory_order_release);
         g_registrationDynamicAccumulators[i].store(nullptr, std::memory_order_release);
-        g_registrationSuppressStaticBySplit[i].store(false, std::memory_order_release);
         g_registrationBuildBothBySplit[i].store(false, std::memory_order_release);
         g_registrationStaticKeepCounts[i].store(0, std::memory_order_release);
         g_registrationDynamicKeepCounts[i].store(0, std::memory_order_release);
@@ -1899,6 +1852,9 @@ void SetRegistrationShadowCachePass(ShadowCachePass pass) noexcept
 
 void IncrementRegistrationCounter(std::uint64_t& counter) noexcept
 {
+    if constexpr (!kShadowCacheLogEnabled) {
+        return;
+    }
     std::atomic_ref<std::uint64_t>(counter).fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -1912,12 +1868,10 @@ void BeginShadowCachePass(DirectionalSplitContext* ctx, ShadowCachePass pass) no
     }
     SetRegistrationShadowCachePass(pass);
     if (pass == ShadowCachePass::Passthrough || pass == ShadowCachePass::None) {
-        g_registrationSuppressStatic.store(false, std::memory_order_release);
         g_registrationShadowCacheActive.store(false, std::memory_order_release);
     }
     g_shadowCacheTargetActive.store(pass == ShadowCachePass::StaticRender ||
-                                        pass == ShadowCachePass::DynamicRender ||
-                                        (ctx && ctx->suppressStaticOnHit),
+                                        pass == ShadowCachePass::DynamicRender,
                                     std::memory_order_release);
     g_shadowCacheTargetSplit.store(ctx ? ctx->slotIndex : kInvalidSplitIndex, std::memory_order_release);
     if (ctx) {
@@ -2038,9 +1992,7 @@ void MaybeLogShadowCacheClearReject(
         return;
     }
 
-    const auto split = ValidSplitIndex(tl_shadowCacheRenderSplit) ?
-        tl_shadowCacheRenderSplit :
-        tl_dirtyRenderTargetsSplit;
+    const auto split = tl_shadowCacheRenderSplit;
     const bool validSplit = ValidSplitIndex(split);
     const DirectionalSplitContext* ctx = validSplit ? &ContextForSplit(split) : nullptr;
     const Key* key = ctx ? &ctx->key : nullptr;
@@ -2056,9 +2008,7 @@ void MaybeLogShadowCacheClearReject(
         "keyDSV={} keyTex={} depthTarget={} mapSlot={} targetDepth={} targetSlot={} flags={:#x} depth={} stencil={}",
         reason ? reason : "?",
         count,
-        PassShortName(ValidSplitIndex(tl_dirtyRenderTargetsSplit) ?
-            tl_dirtyRenderTargetsPass :
-            CurrentResolvedRegistrationPass()),
+        PassShortName(tl_shadowCachePass),
         g_shadowCacheTargetActive.load(std::memory_order_acquire),
         split,
         validSplit,
@@ -2379,7 +2329,6 @@ void HookedAccumulateFromLists(void* light, void* cullingGroup)
         ctx.key = scope.key;
         ctx.eligible = true;
         ctx.cacheHit = cacheHit;
-        ctx.suppressStaticOnHit = false;
 
         if (ctx.passthroughCooldown != 0) {
             ctx.cacheHit = false;
@@ -2387,7 +2336,7 @@ void HookedAccumulateFromLists(void* light, void* cullingGroup)
         } else if (cacheHit) {
             if (PrepareScratchAccumulators(ctx, scope.key.accumulator)) {
                 ctx.hitRouted = true;
-                PublishRegistrationTarget(scope, ctx, ShadowCachePass::BuildBoth, false);
+                PublishRegistrationTarget(scope, ctx, ShadowCachePass::BuildBoth);
             } else {
                 ctx.cacheHit = false;
                 ctx.splitFailed = true;
@@ -2398,7 +2347,7 @@ void HookedAccumulateFromLists(void* light, void* cullingGroup)
             ++cache.staticBuilds;
             if (PrepareScratchAccumulators(ctx, scope.key.accumulator)) {
                 ctx.buildBoth = true;
-                PublishRegistrationTarget(scope, ctx, ShadowCachePass::BuildBoth, false);
+                PublishRegistrationTarget(scope, ctx, ShadowCachePass::BuildBoth);
             } else {
                 ctx.splitFailed = true;
                 InvalidateStaticCache(splitIndex);
@@ -2590,54 +2539,6 @@ void HookedRenderShadowMapFlush(void* renderer)
     RestoreStaticCacheAfterVanillaFlush();
 }
 
-void HookedSetDirtyRenderTargets()
-{
-    const auto oldSplit = tl_dirtyRenderTargetsSplit;
-    const auto oldPass = tl_dirtyRenderTargetsPass;
-    auto* oldDSV = tl_dirtyRenderTargetsDSV;
-
-    tl_dirtyRenderTargetsSplit = kInvalidSplitIndex;
-    tl_dirtyRenderTargetsPass = ShadowCachePass::None;
-    tl_dirtyRenderTargetsDSV = nullptr;
-
-    if (SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON && g_rendererData) {
-        auto* state = ActiveRendererShadowState();
-        if (!state) {
-            if (s_origSetDirtyRenderTargets) {
-                s_origSetDirtyRenderTargets();
-            }
-            tl_dirtyRenderTargetsSplit = oldSplit;
-            tl_dirtyRenderTargetsPass = oldPass;
-            tl_dirtyRenderTargetsDSV = oldDSV;
-            return;
-        }
-        const std::uint32_t platformDepthTarget =
-            ReadField<std::uint32_t>(state, kRendererStateDepthPlatformTargetOffset, kInvalidSplitIndex);
-        const std::uint32_t mapSlot =
-            ReadField<std::uint32_t>(state, kRendererStateDepthMapSlotOffset, kInvalidSplitIndex);
-        const std::uint32_t mode =
-            ReadField<std::uint32_t>(state, kRendererStateDepthModeOffset, 3u);
-        auto* dsv = RendererStateDepthStencilView(platformDepthTarget, mapSlot);
-
-        if (mode == kRenderTargetModeClear && dsv) {
-            const std::uint32_t split = FindDirtyRenderTargetsRestoreSplit(platformDepthTarget, mapSlot, dsv);
-            if (ValidSplitIndex(split)) {
-                tl_dirtyRenderTargetsSplit = split;
-                tl_dirtyRenderTargetsPass = ShadowCachePass::DynamicRender;
-                tl_dirtyRenderTargetsDSV = dsv;
-            }
-        }
-    }
-
-    if (s_origSetDirtyRenderTargets) {
-        s_origSetDirtyRenderTargets();
-    }
-
-    tl_dirtyRenderTargetsSplit = oldSplit;
-    tl_dirtyRenderTargetsPass = oldPass;
-    tl_dirtyRenderTargetsDSV = oldDSV;
-}
-
 bool PatchCall(const char* label, std::uintptr_t callSite, void* hook, std::uintptr_t* outOriginal)
 {
     if (callSite < 0x140000000ull) {
@@ -2819,33 +2720,7 @@ bool IsShadowCacheRegistrationFilterActive(void* accumulator, void* geometry)
     if (!ValidSplitIndex(splitIndex)) {
         return false;
     }
-    return g_registrationBuildBothBySplit[splitIndex].load(std::memory_order_acquire) ||
-           g_registrationSuppressStaticBySplit[splitIndex].load(std::memory_order_acquire);
-}
-
-bool IsShadowCacheObjectSuppressionActive(void* accumulator)
-{
-    const auto splitIndex = FindRegistrationSplitForAccumulator(accumulator);
-    return SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON &&
-           ValidSplitIndex(splitIndex) &&
-           g_registrationSuppressStaticBySplit[splitIndex].load(std::memory_order_acquire);
-}
-
-bool ShouldSuppressShadowCacheObject(void* accumulator, bool isStaticCaster)
-{
-    const auto splitIndex = FindRegistrationSplitForAccumulator(accumulator);
-    tl_lastRegistrationSplit = splitIndex;
-    return isStaticCaster &&
-           ValidSplitIndex(splitIndex) &&
-           g_registrationSuppressStaticBySplit[splitIndex].load(std::memory_order_acquire);
-}
-
-bool IsShadowCacheRegisterPassSplitActive(void* accumulator)
-{
-    const auto splitIndex = FindRegistrationSplitForAccumulator(accumulator);
-    return SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON &&
-           ValidSplitIndex(splitIndex) &&
-           g_registrationBuildBothBySplit[splitIndex].load(std::memory_order_acquire);
+    return g_registrationBuildBothBySplit[splitIndex].load(std::memory_order_acquire);
 }
 
 void* GetShadowCacheSplitBatchRenderer(void* accumulator, bool isStaticCaster)
@@ -2869,6 +2744,10 @@ void* GetShadowCacheSplitBatchRenderer(void* accumulator, bool isStaticCaster)
 
 void NoteShadowCacheShadowMapOrMaskHook(bool active)
 {
+    if constexpr (!kShadowCacheLogEnabled) {
+        return;
+    }
+
     const ShadowCachePass pass = CurrentResolvedRegistrationPass();
     const std::size_t passIdx = PassIndex(pass);
     if (!ValidSplitIndex(tl_lastRegistrationSplit)) {
@@ -2885,12 +2764,20 @@ void NoteShadowCacheShadowMapOrMaskHook(bool active)
 
 void NoteShadowCacheShadowMapOrMaskHookDetail(bool active, void* accumulator)
 {
+    if constexpr (!kShadowCacheLogEnabled) {
+        return;
+    }
+
     tl_lastRegistrationSplit = FindRegistrationSplitForAccumulator(accumulator);
     NoteShadowCacheShadowMapOrMaskHook(active);
 }
 
 void NoteShadowCacheRenderPassSplit(bool kept, bool isStaticCaster)
 {
+    if constexpr (!kShadowCacheLogEnabled) {
+        return;
+    }
+
     if (!SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON ||
         !g_shadowCacheTargetActive.load(std::memory_order_acquire) ||
         !ValidSplitIndex(tl_shadowCacheRenderSplit)) {
@@ -2919,27 +2806,20 @@ void NoteShadowCacheRenderPassSplit(bool kept, bool isStaticCaster)
     }
 }
 
-void NoteShadowCacheObjectSuppressed(bool isStaticCaster)
-{
-    if (!isStaticCaster) {
-        return;
-    }
-    if (ValidSplitIndex(tl_lastRegistrationSplit)) {
-        IncrementRegistrationCounter(CacheForSplit(tl_lastRegistrationSplit).overlaySkipped);
-    }
-}
-
 void NoteShadowCachePassRouted(bool isStaticCaster)
 {
     if (!ValidSplitIndex(tl_lastRegistrationSplit)) {
         return;
     }
-    auto& cache = CacheForSplit(tl_lastRegistrationSplit);
     if (isStaticCaster) {
-        IncrementRegistrationCounter(cache.staticKept);
+        if constexpr (kShadowCacheLogEnabled) {
+            IncrementRegistrationCounter(CacheForSplit(tl_lastRegistrationSplit).staticKept);
+        }
         g_registrationStaticKeepCounts[tl_lastRegistrationSplit].fetch_add(1, std::memory_order_relaxed);
     } else {
-        IncrementRegistrationCounter(cache.overlayKept);
+        if constexpr (kShadowCacheLogEnabled) {
+            IncrementRegistrationCounter(CacheForSplit(tl_lastRegistrationSplit).overlayKept);
+        }
         g_registrationDynamicKeepCounts[tl_lastRegistrationSplit].fetch_add(1, std::memory_order_relaxed);
     }
 }
@@ -2972,10 +2852,9 @@ bool HandleShadowCacheClearDepthStencilView(
     if (!SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON) {
         return false;
     }
-    const bool scopedTargetActive = g_shadowCacheTargetActive.load(std::memory_order_acquire) &&
+    const bool targetActive = g_shadowCacheTargetActive.load(std::memory_order_acquire) &&
         ValidSplitIndex(tl_shadowCacheRenderSplit);
-    const bool dirtyTargetActive = ValidSplitIndex(tl_dirtyRenderTargetsSplit);
-    if (!scopedTargetActive && !dirtyTargetActive) {
+    if (!targetActive) {
         MaybeLogShadowCacheClearReject(
             "target-inactive",
             g_shadowCacheClearRejectTargetInactive,
@@ -2985,10 +2864,8 @@ bool HandleShadowCacheClearDepthStencilView(
             stencil);
         return false;
     }
-    const std::uint32_t activeSplit = scopedTargetActive ? tl_shadowCacheRenderSplit : tl_dirtyRenderTargetsSplit;
-    const ShadowCachePass activePass = scopedTargetActive ?
-        tl_shadowCachePass :
-        tl_dirtyRenderTargetsPass;
+    const std::uint32_t activeSplit = tl_shadowCacheRenderSplit;
+    const ShadowCachePass activePass = tl_shadowCachePass;
     if (!ValidSplitIndex(activeSplit)) {
         MaybeLogShadowCacheClearReject(
             "split-invalid",
@@ -3086,23 +2963,6 @@ bool Initialize()
         REX::INFO("ShadowTelemetry::Initialize: BSShadowDirectionalLight::AccumulateFromLists hook installed");
     }
 
-    if (SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON && !s_origSetDirtyRenderTargets) {
-        if (ptr_SetDirtyRenderTargets.address() < 0x140000000ull) {
-            REX::WARN("ShadowTelemetry::Initialize: BSGraphics::SetDirtyRenderTargets REL::ID failed to resolve");
-            return false;
-        }
-
-        s_origSetDirtyRenderTargets = CreateBranchGateway5<SetDirtyRenderTargets_t>(
-            ptr_SetDirtyRenderTargets,
-            kSetDirtyRenderTargetsPrologueSizeOG,
-            reinterpret_cast<void*>(&HookedSetDirtyRenderTargets));
-        if (!s_origSetDirtyRenderTargets) {
-            REX::WARN("ShadowTelemetry::Initialize: failed to install BSGraphics::SetDirtyRenderTargets hook");
-            return false;
-        }
-        REX::INFO("ShadowTelemetry::Initialize: BSGraphics::SetDirtyRenderTargets hook installed");
-    }
-
     const bool needsRenderSceneHook =
         g_mode.load(std::memory_order_relaxed) == Mode::On ||
         SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON;
@@ -3130,14 +2990,13 @@ bool Initialize()
 
     if (!s_origRenderShadowMap ||
         (needsRenderSceneHook && !s_origRenderScene) ||
-        (SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON && (!s_origAccumulateFromLists || !s_origRenderShadowMapFlush || !s_origDestroyRenderTargets || !s_origSetDirtyRenderTargets))) {
-        REX::WARN("ShadowTelemetry::Initialize: original function capture failed (RenderShadowMap={}, RenderScene={}, Flush={}, AccumulateFromLists={}, DestroyRenderTargets={}, SetDirtyRenderTargets={}, telemetryMode={})",
+        (SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON && (!s_origAccumulateFromLists || !s_origRenderShadowMapFlush || !s_origDestroyRenderTargets))) {
+        REX::WARN("ShadowTelemetry::Initialize: original function capture failed (RenderShadowMap={}, RenderScene={}, Flush={}, AccumulateFromLists={}, DestroyRenderTargets={}, telemetryMode={})",
                   reinterpret_cast<void*>(s_origRenderShadowMap),
                   reinterpret_cast<void*>(s_origRenderScene),
                   reinterpret_cast<void*>(s_origRenderShadowMapFlush),
                   reinterpret_cast<void*>(s_origAccumulateFromLists),
                   reinterpret_cast<void*>(s_origDestroyRenderTargets),
-                  reinterpret_cast<void*>(s_origSetDirtyRenderTargets),
                   static_cast<int>(g_mode.load(std::memory_order_relaxed)));
         return false;
     }
