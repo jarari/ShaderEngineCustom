@@ -1349,9 +1349,11 @@ F4SE_PLUGIN_LOAD(const F4SE::LoadInterface* a_f4se)
     InstallDrawTaggingHooks_Internal();
     // Phase telemetry — installs per-DrawWorld:: hooks to attribute wall time
     // + draw count per sub-phase under DrawWorld::Render_PreUI. Default off
-    // = no logging. Render-pass occlusion uses these hooks as phase context,
-    // so it requests hook installation without enabling telemetry output.
-    PhaseTelemetry::RequireHooks();
+    // = no logging. Render-pass occlusion requests those hooks only when its
+    // A/B path is actually enabled.
+    if (PASS_LEVEL_OCCLUSION_ON) {
+        PhaseTelemetry::RequireHooks();
+    }
     PhaseTelemetry::Initialize();
     ShadowTelemetry::Initialize();
     // LightSorter — stable-partitions the point-light array by stencil flag

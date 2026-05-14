@@ -86,7 +86,7 @@ constexpr std::size_t kRendererStateDepthPlatformTargetOffset = 0x4C;
 constexpr std::size_t kRendererStateDepthMapSlotOffset = 0x50;
 constexpr std::size_t kRendererStateDepthLogicalTargetOffset = 0x88;
 constexpr std::uint32_t kFirstCacheableDirectionalMapSlot = 1;
-constexpr bool kShadowCacheLogEnabled = false;
+constexpr bool kShadowCacheLogEnabled = kDetailedShadowCacheLogging;
 
 constexpr double kLogIntervalSecs = 2.0;
 constexpr std::size_t kMaxLoggedKeys = 8;
@@ -454,8 +454,8 @@ struct ShadowCacheState {
     std::uint64_t overlaySkipped = 0;
     std::uint64_t shadowMapOrMaskHookCalls = 0;
     std::uint64_t shadowMapOrMaskHookActiveCalls = 0;
-    std::array<std::uint64_t, 5> shadowMapOrMaskHookCallsByPass{};
-    std::array<std::uint64_t, 5> shadowMapOrMaskHookActiveCallsByPass{};
+    std::array<std::uint64_t, 6> shadowMapOrMaskHookCallsByPass{};
+    std::array<std::uint64_t, 6> shadowMapOrMaskHookActiveCallsByPass{};
     bool valid = false;
 };
 
@@ -463,6 +463,7 @@ enum class ShadowCachePass : std::uint8_t {
     None,
     Passthrough,
     BuildBoth,
+    DynamicRegister,
     StaticRender,
     DynamicRender,
 };
@@ -644,6 +645,7 @@ std::array<std::atomic<void*>, kMaxDirectionalCacheSplits> g_registrationShadowC
 std::array<std::atomic<void*>, kMaxDirectionalCacheSplits> g_registrationStaticAccumulators{};
 std::array<std::atomic<void*>, kMaxDirectionalCacheSplits> g_registrationDynamicAccumulators{};
 std::array<std::atomic_bool, kMaxDirectionalCacheSplits> g_registrationBuildBothBySplit{};
+std::array<std::atomic_bool, kMaxDirectionalCacheSplits> g_registrationDynamicOnlyBySplit{};
 std::atomic_bool g_shadowCacheTargetActive{ false };
 std::atomic<std::uint32_t> g_shadowCacheTargetMapSlot{ (std::numeric_limits<std::uint32_t>::max)() };
 std::atomic<std::uint32_t> g_shadowCacheTargetDepthTarget{ (std::numeric_limits<std::uint32_t>::max)() };
@@ -762,7 +764,7 @@ void IncrementRegistrationCounter(std::uint64_t& counter) noexcept;
 std::size_t PassIndex(ShadowCachePass pass) noexcept
 {
     const auto idx = static_cast<std::size_t>(pass);
-    return idx < 5 ? idx : 0;
+    return idx < 6 ? idx : 0;
 }
 
 const char* PassShortName(ShadowCachePass pass) noexcept
@@ -771,6 +773,7 @@ const char* PassShortName(ShadowCachePass pass) noexcept
     case ShadowCachePass::None: return "n";
     case ShadowCachePass::Passthrough: return "p";
     case ShadowCachePass::BuildBoth: return "b";
+    case ShadowCachePass::DynamicRegister: return "r";
     case ShadowCachePass::StaticRender: return "s";
     case ShadowCachePass::DynamicRender: return "d";
     default: return "?";
@@ -802,6 +805,7 @@ bool DSVSliceMatchesMapSlot(REX::W32::ID3D11DepthStencilView* dsv, std::uint32_t
 bool IsRegistrationFilteringPass(ShadowCachePass pass) noexcept
 {
     return pass == ShadowCachePass::BuildBoth ||
+           pass == ShadowCachePass::DynamicRegister ||
            pass == ShadowCachePass::DynamicRender;
 }
 
@@ -1335,6 +1339,28 @@ bool PrepareScratchAccumulators(DirectionalSplitContext& ctx, void* vanillaAccum
     return true;
 }
 
+bool PrepareDynamicScratchAccumulator(DirectionalSplitContext& ctx, void* vanillaAccumulator) noexcept
+{
+    if (!vanillaAccumulator ||
+        !ValidSplitIndex(ctx.slotIndex)) {
+        return false;
+    }
+
+    void* dynamicAccumulator = ConstructScratchAccumulator(
+        s_dynamicAccumulatorStorage[ctx.slotIndex].bytes,
+        s_dynamicAccumulatorConstructed[ctx.slotIndex],
+        ctx.slotIndex);
+    if (!dynamicAccumulator) {
+        return false;
+    }
+
+    ctx.dynamicAccumulator = dynamicAccumulator;
+    ConfigureScratchAccumulator(ctx.dynamicAccumulator, vanillaAccumulator, ctx.slotIndex);
+    g_registrationStaticAccumulators[ctx.slotIndex].store(nullptr, std::memory_order_release);
+    g_registrationDynamicAccumulators[ctx.slotIndex].store(ctx.dynamicAccumulator, std::memory_order_release);
+    return true;
+}
+
 void ClearScratchAccumulators(DirectionalSplitContext& ctx) noexcept
 {
     ClearScratchAccumulator(ctx.staticAccumulator);
@@ -1400,15 +1426,19 @@ void PublishRegistrationTarget(
     if (!ValidSplitIndex(ctx.slotIndex)) {
         return;
     }
-    if (pass == ShadowCachePass::BuildBoth) {
+    if (pass == ShadowCachePass::BuildBoth ||
+        pass == ShadowCachePass::DynamicRegister) {
         g_registrationStaticKeepCounts[ctx.slotIndex].store(0, std::memory_order_relaxed);
         g_registrationDynamicKeepCounts[ctx.slotIndex].store(0, std::memory_order_relaxed);
     }
+    const bool buildBoth = pass == ShadowCachePass::BuildBoth;
+    const bool dynamicOnly = pass == ShadowCachePass::DynamicRegister;
     tl_shadowCachePass = pass;
     g_registrationShadowCacheAccumulators[ctx.slotIndex].store(scope.key.accumulator, std::memory_order_release);
     g_registrationShadowCachePass.store(pass, std::memory_order_release);
-    g_registrationShadowCacheActive.store(pass == ShadowCachePass::BuildBoth, std::memory_order_release);
-    g_registrationBuildBothBySplit[ctx.slotIndex].store(pass == ShadowCachePass::BuildBoth, std::memory_order_release);
+    g_registrationShadowCacheActive.store(buildBoth || dynamicOnly, std::memory_order_release);
+    g_registrationBuildBothBySplit[ctx.slotIndex].store(buildBoth, std::memory_order_release);
+    g_registrationDynamicOnlyBySplit[ctx.slotIndex].store(dynamicOnly, std::memory_order_release);
     g_shadowCacheTargetMapSlot.store(scope.key.mapSlot, std::memory_order_release);
     g_shadowCacheTargetDepthTarget.store(scope.key.depthTarget, std::memory_order_release);
     g_shadowCacheTargetSplit.store(ctx.slotIndex, std::memory_order_release);
@@ -1424,6 +1454,7 @@ void ClearRegistrationTarget() noexcept
         g_registrationStaticAccumulators[i].store(nullptr, std::memory_order_release);
         g_registrationDynamicAccumulators[i].store(nullptr, std::memory_order_release);
         g_registrationBuildBothBySplit[i].store(false, std::memory_order_release);
+        g_registrationDynamicOnlyBySplit[i].store(false, std::memory_order_release);
         g_registrationStaticKeepCounts[i].store(0, std::memory_order_release);
         g_registrationDynamicKeepCounts[i].store(0, std::memory_order_release);
     }
@@ -1516,7 +1547,7 @@ void MaybeLogShadowCache(
         "dsv(validMask={:#x}) pass={}/{} "
         "eligible={} hits={} misses={} staticBuilds={} captures={} "
         "emptyStatic={} restoreFailures={} staticKeep={} staticSkip={} overlayKeep={} overlaySkip={} "
-        "regSM={}/{} smPass(n/p/b/s/d={}/{}/{}/{}/{}, active={}/{}/{}/{}/{}) "
+        "regSM={}/{} smPass(n/p/b/r/s/d={}/{}/{}/{}/{}/{}, active={}/{}/{}/{}/{}/{}) "
         "updates={} skips={} invalidations={}",
         scope.shadowMapDataIndex,
         scope.key.mapSlot,
@@ -1565,11 +1596,13 @@ void MaybeLogShadowCache(
         cache.shadowMapOrMaskHookCallsByPass[PassIndex(ShadowCachePass::None)],
         cache.shadowMapOrMaskHookCallsByPass[PassIndex(ShadowCachePass::Passthrough)],
         cache.shadowMapOrMaskHookCallsByPass[PassIndex(ShadowCachePass::BuildBoth)],
+        cache.shadowMapOrMaskHookCallsByPass[PassIndex(ShadowCachePass::DynamicRegister)],
         cache.shadowMapOrMaskHookCallsByPass[PassIndex(ShadowCachePass::StaticRender)],
         cache.shadowMapOrMaskHookCallsByPass[PassIndex(ShadowCachePass::DynamicRender)],
         cache.shadowMapOrMaskHookActiveCallsByPass[PassIndex(ShadowCachePass::None)],
         cache.shadowMapOrMaskHookActiveCallsByPass[PassIndex(ShadowCachePass::Passthrough)],
         cache.shadowMapOrMaskHookActiveCallsByPass[PassIndex(ShadowCachePass::BuildBoth)],
+        cache.shadowMapOrMaskHookActiveCallsByPass[PassIndex(ShadowCachePass::DynamicRegister)],
         cache.shadowMapOrMaskHookActiveCallsByPass[PassIndex(ShadowCachePass::StaticRender)],
         cache.shadowMapOrMaskHookActiveCallsByPass[PassIndex(ShadowCachePass::DynamicRender)],
         cache.updates,
@@ -2334,9 +2367,9 @@ void HookedAccumulateFromLists(void* light, void* cullingGroup)
             ctx.cacheHit = false;
             cacheHit = false;
         } else if (cacheHit) {
-            if (PrepareScratchAccumulators(ctx, scope.key.accumulator)) {
+            if (PrepareDynamicScratchAccumulator(ctx, scope.key.accumulator)) {
                 ctx.hitRouted = true;
-                PublishRegistrationTarget(scope, ctx, ShadowCachePass::BuildBoth);
+                PublishRegistrationTarget(scope, ctx, ShadowCachePass::DynamicRegister);
             } else {
                 ctx.cacheHit = false;
                 ctx.splitFailed = true;
@@ -2720,26 +2753,44 @@ bool IsShadowCacheRegistrationFilterActive(void* accumulator, void* geometry)
     if (!ValidSplitIndex(splitIndex)) {
         return false;
     }
-    return g_registrationBuildBothBySplit[splitIndex].load(std::memory_order_acquire);
+    return g_registrationBuildBothBySplit[splitIndex].load(std::memory_order_acquire) ||
+           g_registrationDynamicOnlyBySplit[splitIndex].load(std::memory_order_acquire);
 }
 
-void* GetShadowCacheSplitBatchRenderer(void* accumulator, bool isStaticCaster)
+bool RouteShadowCacheRegistration(void* accumulator, bool isStaticCaster, void** outBatchRenderer)
 {
+    if (outBatchRenderer) {
+        *outBatchRenderer = nullptr;
+    }
+    if (!outBatchRenderer ||
+        !g_registrationShadowCacheActive.load(std::memory_order_acquire)) {
+        return false;
+    }
+
     const auto splitIndex = FindRegistrationSplitForAccumulator(accumulator);
     tl_lastRegistrationSplit = splitIndex;
-    if (!ValidSplitIndex(splitIndex) ||
-        !g_registrationBuildBothBySplit[splitIndex].load(std::memory_order_acquire)) {
-        return nullptr;
+    if (!ValidSplitIndex(splitIndex)) {
+        return false;
+    }
+
+    const bool buildBoth = g_registrationBuildBothBySplit[splitIndex].load(std::memory_order_acquire);
+    const bool dynamicOnly = g_registrationDynamicOnlyBySplit[splitIndex].load(std::memory_order_acquire);
+    if (!buildBoth && !dynamicOnly) {
+        return false;
+    }
+    if (dynamicOnly && isStaticCaster) {
+        return true;
     }
 
     void* targetAccumulator = isStaticCaster ?
         g_registrationStaticAccumulators[splitIndex].load(std::memory_order_acquire) :
         g_registrationDynamicAccumulators[splitIndex].load(std::memory_order_acquire);
     if (!targetAccumulator) {
-        return nullptr;
+        return false;
     }
 
-    return static_cast<std::byte*>(targetAccumulator) + kAccumulatorBatchRendererOffset;
+    *outBatchRenderer = static_cast<std::byte*>(targetAccumulator) + kAccumulatorBatchRendererOffset;
+    return true;
 }
 
 void NoteShadowCacheShadowMapOrMaskHook(bool active)
@@ -2908,11 +2959,6 @@ bool HandleShadowCacheClearDepthStencilView(
 
 bool Initialize()
 {
-    if (s_installed) {
-        REX::INFO("ShadowTelemetry::Initialize: already installed; skipping");
-        return true;
-    }
-
     if (g_mode.load(std::memory_order_relaxed) != Mode::On &&
         !SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON) {
         REX::INFO("ShadowTelemetry::Initialize: mode=off and shadow cache=off; hooks skipped");
@@ -2922,6 +2968,17 @@ bool Initialize()
     if (REX::FModule::GetRuntimeIndex() != REX::FModule::Runtime::kOG) {
         REX::WARN("ShadowTelemetry::Initialize: hooks skipped; call-site offsets are verified for OG runtime only");
         return false;
+    }
+
+    const bool needsRenderSceneHook = g_mode.load(std::memory_order_relaxed) == Mode::On;
+    const bool alreadyReady =
+        s_origRenderShadowMap &&
+        (!needsRenderSceneHook || s_origRenderScene) &&
+        (!SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON ||
+            (s_origAccumulateFromLists && s_origRenderShadowMapFlush && s_origDestroyRenderTargets));
+    if (s_installed && alreadyReady) {
+        REX::INFO("ShadowTelemetry::Initialize: already installed; skipping");
+        return true;
     }
 
     bool ok = true;
@@ -2963,30 +3020,38 @@ bool Initialize()
         REX::INFO("ShadowTelemetry::Initialize: BSShadowDirectionalLight::AccumulateFromLists hook installed");
     }
 
-    const bool needsRenderSceneHook =
-        g_mode.load(std::memory_order_relaxed) == Mode::On ||
-        SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON;
     if (needsRenderSceneHook) {
         const auto renderShadowMapAddr = ptr_RenderShadowMap.address();
-        if (SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON) {
+        if (SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON && !s_origRenderShadowMapFlush) {
             ok &= PatchCall("BSShadowLight::RenderShadowMap -> Renderer::Flush",
                             renderShadowMapAddr + kRenderShadowMapFlushCallOffsetOG,
                             reinterpret_cast<void*>(&HookedRenderShadowMapFlush),
                             &originalFlush);
             s_origRenderShadowMapFlush = reinterpret_cast<RendererFlush_t>(originalFlush);
         }
-        ok &= PatchCall("BSShadowLight::RenderShadowMap -> BSShaderUtil::RenderScene",
-                        renderShadowMapAddr + kRenderSceneCallOffsetOG,
-                        reinterpret_cast<void*>(&HookedRenderScene),
-                        &originalScene);
-        s_origRenderScene = reinterpret_cast<RenderScene_t>(originalScene);
+        if (!s_origRenderScene) {
+            ok &= PatchCall("BSShadowLight::RenderShadowMap -> BSShaderUtil::RenderScene",
+                            renderShadowMapAddr + kRenderSceneCallOffsetOG,
+                            reinterpret_cast<void*>(&HookedRenderScene),
+                            &originalScene);
+            s_origRenderScene = reinterpret_cast<RenderScene_t>(originalScene);
+        }
+    } else if (SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON && !s_origRenderShadowMapFlush) {
+        const auto renderShadowMapAddr = ptr_RenderShadowMap.address();
+        ok &= PatchCall("BSShadowLight::RenderShadowMap -> Renderer::Flush",
+                        renderShadowMapAddr + kRenderShadowMapFlushCallOffsetOG,
+                        reinterpret_cast<void*>(&HookedRenderShadowMapFlush),
+                        &originalFlush);
+        s_origRenderShadowMapFlush = reinterpret_cast<RendererFlush_t>(originalFlush);
     }
 
-    ok &= PatchCall("BSShadowDirectionalLight::Render -> RenderShadowMap",
-                    ptr_ShadowDirectionalRender.address() + kDirectionalRenderShadowMapCallOffsetOG,
-                    reinterpret_cast<void*>(&HookedRenderShadowMap),
-                    &originalShadow);
-    s_origRenderShadowMap = reinterpret_cast<RenderShadowMap_t>(originalShadow);
+    if (!s_origRenderShadowMap) {
+        ok &= PatchCall("BSShadowDirectionalLight::Render -> RenderShadowMap",
+                        ptr_ShadowDirectionalRender.address() + kDirectionalRenderShadowMapCallOffsetOG,
+                        reinterpret_cast<void*>(&HookedRenderShadowMap),
+                        &originalShadow);
+        s_origRenderShadowMap = reinterpret_cast<RenderShadowMap_t>(originalShadow);
+    }
 
     if (!s_origRenderShadowMap ||
         (needsRenderSceneHook && !s_origRenderScene) ||

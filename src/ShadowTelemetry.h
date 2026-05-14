@@ -19,6 +19,7 @@ enum class Mode : std::uint8_t {
 };
 
 extern std::atomic<Mode> g_mode;
+inline constexpr bool kDetailedShadowCacheLogging = false;
 
 bool Initialize();
 
@@ -65,7 +66,9 @@ bool IsShadowCacheActiveForCurrentShadow();
 bool IsShadowCacheStaticBuildPass();
 bool IsShadowCacheDynamicOverlayPass();
 bool IsShadowCacheRegistrationFilterActive(void* accumulator, void* geometry);
-void* GetShadowCacheSplitBatchRenderer(void* accumulator, bool isStaticCaster);
+// Returns true when the current shadow-cache registration route handled the
+// pass. *outBatchRenderer == nullptr means the pass should be skipped.
+bool RouteShadowCacheRegistration(void* accumulator, bool isStaticCaster, void** outBatchRenderer);
 void NoteShadowCacheShadowMapOrMaskHook(bool active);
 void NoteShadowCacheShadowMapOrMaskHookDetail(bool active, void* accumulator);
 void NoteShadowCacheRenderPassSplit(bool kept, bool isStaticCaster);

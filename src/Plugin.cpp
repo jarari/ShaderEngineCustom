@@ -458,6 +458,7 @@ namespace
     constexpr std::uint32_t kMaxShadowParentScan = 32;
     constexpr std::size_t kMaxShadowGeometryClassCache = 262144;
     constexpr std::size_t kMaxShadowPassClassCache = 262144;
+    constexpr bool kLegacyFinishLevelShadowSplitEnabled = false;
 
     std::uint32_t GetBSXFlags(RE::NiObjectNET* object, std::uint32_t mask)
     {
@@ -674,6 +675,9 @@ namespace
 
     void RememberShadowPassClassification(BSRenderPassLayout* pass, bool isPrecombine)
     {
+        if constexpr (!kLegacyFinishLevelShadowSplitEnabled) {
+            return;
+        }
         if (!pass) {
             return;
         }
@@ -739,10 +743,10 @@ namespace
     constexpr std::size_t kCommandBufferWriteCursorOffset = 0x10000;
     constexpr std::size_t kCommandBufferFrameOffset = 0x10010;
     constexpr std::size_t kMaxCommandBufferRecords = 8192;
-
     bool IsShadowCacheRenderSplitActive() noexcept
     {
-        return false;
+        return kLegacyFinishLevelShadowSplitEnabled &&
+               ShadowTelemetry::IsShadowCacheActiveForCurrentShadow();
     }
 
     bool ShouldSplitRenderBatchesCall(unsigned int passGroupIdx, unsigned int filter) noexcept
@@ -2467,6 +2471,10 @@ namespace
         bool commandBufferPath)
     {
         PassOcclusionDecision decision;
+        if (!PASS_LEVEL_OCCLUSION_ON) {
+            return decision;
+        }
+
         ++g_passOcclusionTelemetry.attempts;
         if (commandBufferPath) {
             ++g_passOcclusionTelemetry.commandAttempts;
@@ -2474,10 +2482,6 @@ namespace
             ++g_passOcclusionTelemetry.immediateAttempts;
         }
 
-        if (!PASS_LEVEL_OCCLUSION_ON) {
-            ++g_passOcclusionTelemetry.disabled;
-            return decision;
-        }
         if (!context || !batchRenderer || !head || g_renderBatchesDepth == 0) {
             ++g_passOcclusionTelemetry.badInput;
             return decision;
@@ -3038,8 +3042,12 @@ namespace
         // Per-phase G-buffer telemetry. Cheap when INI is `off`. Attributes
         // this draw to whichever DrawWorld:: sub-phase is innermost on the TLS
         // stack (no-op if outside Render_PreUI entirely).
-        PhaseTelemetry::OnDraw();
-        ShadowTelemetry::OnBSDraw();
+        if (PhaseTelemetry::g_mode.load(std::memory_order_relaxed) == PhaseTelemetry::Mode::On) {
+            PhaseTelemetry::OnDraw();
+        }
+        if (ShadowTelemetry::g_mode.load(std::memory_order_relaxed) == ShadowTelemetry::Mode::On) {
+            ShadowTelemetry::OnBSDraw();
+        }
 
         PushCurrentDrawTag(pass);
 
@@ -3248,8 +3256,12 @@ namespace
     {
         EnsureD3DDrawHooksPresent();
 
-        PhaseTelemetry::OnCommandBufferDraw();
-        ShadowTelemetry::OnCommandBufferDraw();
+        if (PhaseTelemetry::g_mode.load(std::memory_order_relaxed) == PhaseTelemetry::Mode::On) {
+            PhaseTelemetry::OnCommandBufferDraw();
+        }
+        if (ShadowTelemetry::g_mode.load(std::memory_order_relaxed) == ShadowTelemetry::Mode::On) {
+            ShadowTelemetry::OnCommandBufferDraw();
+        }
 
         auto* head = GetRenderBatchNodeHead(this_, passGroupIdx, subIdx);
         auto decision = BeginPassOcclusionDecision(
@@ -3379,10 +3391,12 @@ namespace
 
     bool HookedRegisterObjectShadowMapOrMask(void* accumulator, RE::BSGeometry* geometry, void* shaderProperty)
     {
-        const bool active = SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON &&
-            ShadowTelemetry::IsShadowCacheRegistrationFilterActive(accumulator, geometry);
-        if (SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON) {
-            ShadowTelemetry::NoteShadowCacheShadowMapOrMaskHookDetail(active, accumulator);
+        if constexpr (ShadowTelemetry::kDetailedShadowCacheLogging) {
+            const bool active = SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON &&
+                ShadowTelemetry::IsShadowCacheRegistrationFilterActive(accumulator, geometry);
+            if (SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON) {
+                ShadowTelemetry::NoteShadowCacheShadowMapOrMaskHookDetail(active, accumulator);
+            }
         }
 
         return OriginalRegisterObjectShadowMapOrMask(accumulator, geometry, shaderProperty);
@@ -3394,11 +3408,18 @@ namespace
             auto* sourceAccumulator = static_cast<void*>(
                 static_cast<std::byte*>(batchRenderer) - kAccumulatorBatchRendererOffset);
             const bool isStaticCaster = IsPrecombineShadowGeometry(pass->geometry);
-            RememberShadowPassClassification(pass, isStaticCaster);
-            if (auto* splitBatchRenderer =
-                    ShadowTelemetry::GetShadowCacheSplitBatchRenderer(sourceAccumulator, isStaticCaster)) {
-                ShadowTelemetry::NoteShadowCachePassRouted(isStaticCaster);
-                OriginalRegisterPassGeometryGroup(splitBatchRenderer, pass, group, appendOrUnk);
+            if constexpr (kLegacyFinishLevelShadowSplitEnabled) {
+                RememberShadowPassClassification(pass, isStaticCaster);
+            }
+            void* splitBatchRenderer = nullptr;
+            if (ShadowTelemetry::RouteShadowCacheRegistration(
+                    sourceAccumulator,
+                    isStaticCaster,
+                    &splitBatchRenderer)) {
+                if (splitBatchRenderer) {
+                    ShadowTelemetry::NoteShadowCachePassRouted(isStaticCaster);
+                    OriginalRegisterPassGeometryGroup(splitBatchRenderer, pass, group, appendOrUnk);
+                }
                 return;
             }
         }
@@ -4110,7 +4131,10 @@ static void ApplyPassLevelOcclusionSetting(bool enabled)
     }
 
     PASS_LEVEL_OCCLUSION_ON = enabled;
-    if (!PASS_LEVEL_OCCLUSION_ON) {
+    if (PASS_LEVEL_OCCLUSION_ON) {
+        PhaseTelemetry::RequireHooks();
+        PhaseTelemetry::Initialize();
+    } else {
         ShutdownPassOcclusionCache_Internal();
     }
     REX::INFO("ShaderEngine Settings: PASS_LEVEL_OCCLUSION_ON set to {}", PASS_LEVEL_OCCLUSION_ON);
@@ -4425,7 +4449,8 @@ void STDMETHODCALLTYPE MyClearDepthStencilView(
     FLOAT Depth,
     UINT8 Stencil)
 {
-    if (ShadowTelemetry::HandleShadowCacheClearDepthStencilView(
+    if (SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON &&
+        ShadowTelemetry::HandleShadowCacheClearDepthStencilView(
             This, pDepthStencilView, ClearFlags, Depth, Stencil)) {
         return;
     }
@@ -4446,8 +4471,12 @@ void STDMETHODCALLTYPE MyDrawIndexed(
     INT BaseVertexLocation)
 {
     g_d3dDrawCallsThisFrame.fetch_add(1, std::memory_order_relaxed);
-    PhaseTelemetry::OnD3DDraw();
-    ShadowTelemetry::OnD3DDraw();
+    if (PhaseTelemetry::g_mode.load(std::memory_order_relaxed) == PhaseTelemetry::Mode::On) {
+        PhaseTelemetry::OnD3DDraw();
+    }
+    if (ShadowTelemetry::g_mode.load(std::memory_order_relaxed) == ShadowTelemetry::Mode::On) {
+        ShadowTelemetry::OnD3DDraw();
+    }
     BindDrawTagForCurrentDraw(This);
     // BeforeDrawForMatchedDef custom passes fire here, when the engine has
     // fully set up the pipeline for the upcoming draw. State is fresh.
@@ -4468,8 +4497,12 @@ void STDMETHODCALLTYPE MyDraw(
     UINT StartVertexLocation)
 {
     g_d3dDrawCallsThisFrame.fetch_add(1, std::memory_order_relaxed);
-    PhaseTelemetry::OnD3DDraw();
-    ShadowTelemetry::OnD3DDraw();
+    if (PhaseTelemetry::g_mode.load(std::memory_order_relaxed) == PhaseTelemetry::Mode::On) {
+        PhaseTelemetry::OnD3DDraw();
+    }
+    if (ShadowTelemetry::g_mode.load(std::memory_order_relaxed) == ShadowTelemetry::Mode::On) {
+        ShadowTelemetry::OnD3DDraw();
+    }
     BindDrawTagForCurrentDraw(This);
     if (CustomPass::g_registry.OnBeforeDraw(This, "d3d11-Draw") && g_activeReplacementPixelShader) {
         BindInjectedPixelShaderResources(This);
@@ -4494,8 +4527,12 @@ void STDMETHODCALLTYPE MyDrawIndexedInstanced(
     UINT StartInstanceLocation)
 {
     g_d3dDrawCallsThisFrame.fetch_add(1, std::memory_order_relaxed);
-    PhaseTelemetry::OnD3DDraw();
-    ShadowTelemetry::OnD3DDraw();
+    if (PhaseTelemetry::g_mode.load(std::memory_order_relaxed) == PhaseTelemetry::Mode::On) {
+        PhaseTelemetry::OnD3DDraw();
+    }
+    if (ShadowTelemetry::g_mode.load(std::memory_order_relaxed) == ShadowTelemetry::Mode::On) {
+        ShadowTelemetry::OnD3DDraw();
+    }
     BindDrawTagForCurrentDraw(This);
     if (CustomPass::g_registry.OnBeforeDraw(This, "d3d11-DrawIndexedInstanced") && g_activeReplacementPixelShader) {
         BindInjectedPixelShaderResources(This);
@@ -4518,8 +4555,12 @@ void STDMETHODCALLTYPE MyDrawInstanced(
     UINT StartInstanceLocation)
 {
     g_d3dDrawCallsThisFrame.fetch_add(1, std::memory_order_relaxed);
-    PhaseTelemetry::OnD3DDraw();
-    ShadowTelemetry::OnD3DDraw();
+    if (PhaseTelemetry::g_mode.load(std::memory_order_relaxed) == PhaseTelemetry::Mode::On) {
+        PhaseTelemetry::OnD3DDraw();
+    }
+    if (ShadowTelemetry::g_mode.load(std::memory_order_relaxed) == ShadowTelemetry::Mode::On) {
+        ShadowTelemetry::OnD3DDraw();
+    }
     BindDrawTagForCurrentDraw(This);
     if (CustomPass::g_registry.OnBeforeDraw(This, "d3d11-DrawInstanced") && g_activeReplacementPixelShader) {
         BindInjectedPixelShaderResources(This);
