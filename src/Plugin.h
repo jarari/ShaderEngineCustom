@@ -442,6 +442,11 @@ struct ShaderDefinition {
     ID3DBlob* compiledShader = nullptr;
     REX::W32::ID3D11PixelShader* loadedPixelShader = nullptr;
     REX::W32::ID3D11VertexShader* loadedVertexShader = nullptr;
+    bool usesGFXInjected = false;
+    bool usesGFXDrawTag = false;
+    bool usesGFXModularFloats = false;
+    bool usesGFXModularInts = false;
+    bool usesGFXModularBools = false;
     // Per-definition compile mutex. Held by CompileShader_Internal so the
     // background precompile worker and the render thread can't both try to
     // compile the same def at once (which would leak one of the two

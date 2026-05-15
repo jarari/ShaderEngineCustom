@@ -127,6 +127,13 @@ static std::atomic<bool> g_currentHasRenderTarget{ false };
 // Global depth buffer SRV for shaders to read depth when DEPTHBUFFER_ON is enabled
 REX::W32::ID3D11ShaderResourceView* g_depthSRV = nullptr;
 static bool g_activeReplacementPixelShader = false;
+static bool g_activeReplacementPixelShaderUsesGFXInjected = false;
+static bool g_activeReplacementPixelShaderUsesDrawTag = false;
+static bool g_activeReplacementPixelShaderUsesModularFloats = false;
+static bool g_activeReplacementPixelShaderUsesModularInts = false;
+static bool g_activeReplacementPixelShaderUsesModularBools = false;
+static bool g_activeReplacementPixelShaderNeedsResourceRebind = false;
+static std::atomic_bool g_anyReplacementShaderUsesDrawTag{ false };
 // Exposed via Global.h so CustomPass.cpp can guard against recursion in
 // MyPSSetShader while the registry rebinds injected resources during a pass.
 thread_local bool g_bindingInjectedPixelResources = false;
@@ -3301,7 +3308,10 @@ namespace
             ShadowTelemetry::OnBSDraw();
         }
 
-        PushCurrentDrawTag(pass);
+        const bool needsDrawTag = g_activeReplacementPixelShaderUsesDrawTag || DEBUGGING;
+        if (needsDrawTag) {
+            PushCurrentDrawTag(pass);
+        }
 
         if (DEBUGGING) {
             const bool actorTag = g_currentDrawTag >= 0.5f;
@@ -3371,13 +3381,15 @@ namespace
         if (g_rendererData && g_rendererData->context) {
             BindDrawTagForCurrentDraw(g_rendererData->context, true);
             if (CustomPass::g_registry.OnBeforeDraw(g_rendererData->context, "engine-BSBatch")
-                && g_activeReplacementPixelShader) {
+                && g_activeReplacementPixelShaderNeedsResourceRebind) {
                 BindInjectedPixelShaderResources(g_rendererData->context);
             }
         }
 
         OriginalBSBatchRendererDraw(pass, unk2, unk3, dynamicDrawData);
-        PopCurrentDrawTag();
+        if (needsDrawTag) {
+            PopCurrentDrawTag();
+        }
     }
 
     RE::NiAVObject* HookedBipedAnimAttachSkinnedObject(RE::BipedAnim* biped, RE::NiNode* destinationRoot, RE::NiNode* sourceRoot, RE::BIPED_OBJECT bipedObject, bool firstPerson)
@@ -3882,7 +3894,8 @@ namespace
             shadowWork.emplace(ShadowTelemetry::WorkKind::BuildCommandBuffer, shadowTarget);
         }
 
-        if (!EnsureDrawTagWrapperResources()) {
+        if (!g_anyReplacementShaderUsesDrawTag.load(std::memory_order_acquire) ||
+            !EnsureDrawTagWrapperResources()) {
             return OriginalBuildCommandBuffer(this_, param);
         }
 
@@ -4248,41 +4261,49 @@ static REX::W32::ID3D11ShaderResourceView* UpdateDrawTagBuffer(REX::W32::ID3D11D
     return ringSRV;
 }
 
-static void BindCustomShaderResources(REX::W32::ID3D11DeviceContext* context, bool pixelShader)
+static void BindCustomShaderResources(REX::W32::ID3D11DeviceContext* context,
+                                      bool pixelShader,
+                                      bool bindGFXInjected,
+                                      bool bindDrawTag,
+                                      bool bindModularFloats,
+                                      bool bindModularInts,
+                                      bool bindModularBools,
+                                      REX::W32::ID3D11ShaderResourceView* drawTagOverride = nullptr)
 {
     if (!context) {
         return;
     }
 
-    if (g_customSRV) {
+    if (bindGFXInjected && g_customSRV) {
         if (pixelShader) {
             context->PSSetShaderResources(CUSTOMBUFFER_SLOT, 1, &g_customSRV);
         } else {
             context->VSSetShaderResources(CUSTOMBUFFER_SLOT, 1, &g_customSRV);
         }
     }
-    if (g_drawTagSRV && g_commandBufferReplayDepth == 0) {
+    auto* drawTagSRV = drawTagOverride ? drawTagOverride : g_drawTagSRV;
+    if (bindDrawTag && drawTagSRV && g_commandBufferReplayDepth == 0) {
         if (pixelShader) {
-            context->PSSetShaderResources(DRAWTAG_SLOT, 1, &g_drawTagSRV);
+            context->PSSetShaderResources(DRAWTAG_SLOT, 1, &drawTagSRV);
         } else {
-            context->VSSetShaderResources(DRAWTAG_SLOT, 1, &g_drawTagSRV);
+            context->VSSetShaderResources(DRAWTAG_SLOT, 1, &drawTagSRV);
         }
     }
-    if (g_modularFloatsSRV) {
+    if (bindModularFloats && g_modularFloatsSRV) {
         if (pixelShader) {
             context->PSSetShaderResources(MODULAR_FLOATS_SLOT, 1, &g_modularFloatsSRV);
         } else {
             context->VSSetShaderResources(MODULAR_FLOATS_SLOT, 1, &g_modularFloatsSRV);
         }
     }
-    if (g_modularIntsSRV) {
+    if (bindModularInts && g_modularIntsSRV) {
         if (pixelShader) {
             context->PSSetShaderResources(MODULAR_INTS_SLOT, 1, &g_modularIntsSRV);
         } else {
             context->VSSetShaderResources(MODULAR_INTS_SLOT, 1, &g_modularIntsSRV);
         }
     }
-    if (g_modularBoolsSRV) {
+    if (bindModularBools && g_modularBoolsSRV) {
         if (pixelShader) {
             context->PSSetShaderResources(MODULAR_BOOLS_SLOT, 1, &g_modularBoolsSRV);
         } else {
@@ -4293,23 +4314,32 @@ static void BindCustomShaderResources(REX::W32::ID3D11DeviceContext* context, bo
 
 static void BindInjectedPixelShaderResources(REX::W32::ID3D11DeviceContext* context)
 {
-    if (!context) {
+    if (!context || !g_activeReplacementPixelShaderNeedsResourceRebind) {
         return;
     }
 
     g_bindingInjectedPixelResources = true;
-    BindCustomShaderResources(context, true);
+    BindCustomShaderResources(
+        context,
+        true,
+        g_activeReplacementPixelShaderUsesGFXInjected,
+        g_activeReplacementPixelShaderUsesDrawTag,
+        g_activeReplacementPixelShaderUsesModularFloats,
+        g_activeReplacementPixelShaderUsesModularInts,
+        g_activeReplacementPixelShaderUsesModularBools);
 
-    g_depthSRV = GetDepthBufferSRV_Internal();
-    if (g_depthSRV) {
-        context->PSSetShaderResources(DEPTHBUFFER_SLOT, 1, &g_depthSRV);
-    } else if (DEBUGGING) {
-        REX::WARN("BindInjectedPixelShaderResources: No depth SRV available for t{}", DEPTHBUFFER_SLOT);
+    if (g_activeReplacementPixelShaderUsesGFXInjected) {
+        g_depthSRV = GetDepthBufferSRV_Internal();
+        if (g_depthSRV) {
+            context->PSSetShaderResources(DEPTHBUFFER_SLOT, 1, &g_depthSRV);
+        } else if (DEBUGGING) {
+            REX::WARN("BindInjectedPixelShaderResources: No depth SRV available for t{}", DEPTHBUFFER_SLOT);
+        }
+
+        // Custom pass output resources that declared srvSlot get re-bound here so
+        // replacement shaders downstream (e.g. tonemap) see the latest GI texture.
+        CustomPass::g_registry.BindGlobalResourceSRVs(context, /*pixelStage=*/true);
     }
-
-    // Custom pass output resources that declared srvSlot get re-bound here so
-    // replacement shaders downstream (e.g. tonemap) see the latest GI texture.
-    CustomPass::g_registry.BindGlobalResourceSRVs(context, /*pixelStage=*/true);
 
     g_bindingInjectedPixelResources = false;
 }
@@ -4320,7 +4350,7 @@ static void BindInjectedVertexShaderResources(REX::W32::ID3D11DeviceContext* con
         return;
     }
 
-    BindCustomShaderResources(context, false);
+    BindCustomShaderResources(context, false, true, false, true, true, true);
     CustomPass::g_registry.BindGlobalResourceSRVs(context, /*pixelStage=*/false);
 }
 
@@ -4334,6 +4364,10 @@ static void BindDrawTagForCurrentDraw(REX::W32::ID3D11DeviceContext* context, bo
         return;
     }
 
+    if (!g_activeReplacementPixelShaderUsesDrawTag) {
+        return;
+    }
+
     auto* drawTagSRV = UpdateDrawTagBuffer(context, g_currentDrawTag, g_currentDrawTagIsHead);
     if (!drawTagSRV) {
         return;
@@ -4343,7 +4377,7 @@ static void BindDrawTagForCurrentDraw(REX::W32::ID3D11DeviceContext* context, bo
     context->PSSetShaderResources(DRAWTAG_SLOT, 1, &drawTagSRV);
     g_bindingInjectedPixelResources = false;
 
-    if (g_activeReplacementPixelShader) {
+    if (g_activeReplacementPixelShaderNeedsResourceRebind) {
         BindInjectedPixelShaderResources(context);
     }
 
@@ -4404,6 +4438,27 @@ static REX::W32::ID3D11ShaderResourceView* GetMainDepthSRV()
     }
 
     return g_rendererData->depthStencilTargets[static_cast<UINT>(MAIN_DEPTHSTENCIL_TARGET)].srViewDepth;
+}
+
+static bool DefinitionNeedsPixelResourceRebind(const ShaderDefinition* def) noexcept
+{
+    return def &&
+           (def->usesGFXInjected ||
+            def->usesGFXDrawTag ||
+            def->usesGFXModularFloats ||
+            def->usesGFXModularInts ||
+            def->usesGFXModularBools);
+}
+
+static void SetActiveReplacementPixelShaderUsage(const ShaderDefinition* def, bool active) noexcept
+{
+    g_activeReplacementPixelShader = active;
+    g_activeReplacementPixelShaderUsesGFXInjected = active && def && def->usesGFXInjected;
+    g_activeReplacementPixelShaderUsesDrawTag = active && def && def->usesGFXDrawTag;
+    g_activeReplacementPixelShaderUsesModularFloats = active && def && def->usesGFXModularFloats;
+    g_activeReplacementPixelShaderUsesModularInts = active && def && def->usesGFXModularInts;
+    g_activeReplacementPixelShaderUsesModularBools = active && def && def->usesGFXModularBools;
+    g_activeReplacementPixelShaderNeedsResourceRebind = active && DefinitionNeedsPixelResourceRebind(def);
 }
 
 // UI: shader-list lock snapshot (when checked we show a frozen list)
@@ -4689,7 +4744,7 @@ void STDMETHODCALLTYPE MyPSSetShaderResources(
 {
     OriginalPSSetShaderResources(This, StartSlot, NumViews, ppShaderResourceViews);
 
-    if (g_activeReplacementPixelShader && !g_bindingInjectedPixelResources) {
+    if (g_activeReplacementPixelShaderNeedsResourceRebind && !g_bindingInjectedPixelResources) {
         BindInjectedPixelShaderResources(This);
     }
 }
@@ -4770,10 +4825,10 @@ void STDMETHODCALLTYPE MyDrawIndexed(
     if (ShadowTelemetry::g_mode.load(std::memory_order_relaxed) == ShadowTelemetry::Mode::On) {
         ShadowTelemetry::OnD3DDraw();
     }
-    BindDrawTagForCurrentDraw(This);
+    //BindDrawTagForCurrentDraw(This);
     // BeforeDrawForMatchedDef custom passes fire here, when the engine has
     // fully set up the pipeline for the upcoming draw. State is fresh.
-    if (CustomPass::g_registry.OnBeforeDraw(This, "d3d11-DrawIndexed") && g_activeReplacementPixelShader) {
+    if (CustomPass::g_registry.OnBeforeDraw(This, "d3d11-DrawIndexed") && g_activeReplacementPixelShaderNeedsResourceRebind) {
         BindInjectedPixelShaderResources(This);
     }
     OriginalDrawIndexed(This, IndexCount, StartIndexLocation, BaseVertexLocation);
@@ -4796,8 +4851,8 @@ void STDMETHODCALLTYPE MyDraw(
     if (ShadowTelemetry::g_mode.load(std::memory_order_relaxed) == ShadowTelemetry::Mode::On) {
         ShadowTelemetry::OnD3DDraw();
     }
-    BindDrawTagForCurrentDraw(This);
-    if (CustomPass::g_registry.OnBeforeDraw(This, "d3d11-Draw") && g_activeReplacementPixelShader) {
+    //BindDrawTagForCurrentDraw(This);
+    if (CustomPass::g_registry.OnBeforeDraw(This, "d3d11-Draw") && g_activeReplacementPixelShaderNeedsResourceRebind) {
         BindInjectedPixelShaderResources(This);
     }
     OriginalDraw(This, VertexCount, StartVertexLocation);
@@ -4826,8 +4881,8 @@ void STDMETHODCALLTYPE MyDrawIndexedInstanced(
     if (ShadowTelemetry::g_mode.load(std::memory_order_relaxed) == ShadowTelemetry::Mode::On) {
         ShadowTelemetry::OnD3DDraw();
     }
-    BindDrawTagForCurrentDraw(This);
-    if (CustomPass::g_registry.OnBeforeDraw(This, "d3d11-DrawIndexedInstanced") && g_activeReplacementPixelShader) {
+    //BindDrawTagForCurrentDraw(This);
+    if (CustomPass::g_registry.OnBeforeDraw(This, "d3d11-DrawIndexedInstanced") && g_activeReplacementPixelShaderNeedsResourceRebind) {
         BindInjectedPixelShaderResources(This);
     }
     OriginalDrawIndexedInstanced(This, IndexCountPerInstance, InstanceCount, StartIndexLocation, BaseVertexLocation, StartInstanceLocation);
@@ -4854,8 +4909,8 @@ void STDMETHODCALLTYPE MyDrawInstanced(
     if (ShadowTelemetry::g_mode.load(std::memory_order_relaxed) == ShadowTelemetry::Mode::On) {
         ShadowTelemetry::OnD3DDraw();
     }
-    BindDrawTagForCurrentDraw(This);
-    if (CustomPass::g_registry.OnBeforeDraw(This, "d3d11-DrawInstanced") && g_activeReplacementPixelShader) {
+    //BindDrawTagForCurrentDraw(This);
+    if (CustomPass::g_registry.OnBeforeDraw(This, "d3d11-DrawInstanced") && g_activeReplacementPixelShaderNeedsResourceRebind) {
         BindInjectedPixelShaderResources(This);
     }
     OriginalDrawInstanced(This, VertexCountPerInstance, InstanceCount, StartVertexLocation, StartInstanceLocation);
@@ -4932,6 +4987,7 @@ void STDMETHODCALLTYPE MyPSSetShader(
     REX::W32::ID3D11ClassInstance* const* ppClassInstances,
     UINT NumClassInstances) {
     bool usingReplacementPixelShader = false;
+    ShaderDefinition* activeReplacementDef = nullptr;
     g_currentOriginalPixelShader.store(pPixelShader, std::memory_order_release);
 
     // Light-tracker capture at PS-bind time. Engine sets RTVs / blend /
@@ -4966,6 +5022,7 @@ void STDMETHODCALLTYPE MyPSSetShader(
                 }
                 pPixelShader = replacementPixelShader;
                 usingReplacementPixelShader = true;
+                activeReplacementDef = matchedDefinition;
             } else {
                 if (matchedDefinition && !matchedDefinition->buggy) {
                     if (DEBUGGING)
@@ -4980,6 +5037,7 @@ void STDMETHODCALLTYPE MyPSSetShader(
                         }
                         pPixelShader = g_ShaderDB.GetReplacementShader(pPixelShader);
                         usingReplacementPixelShader = pPixelShader != nullptr;
+                        activeReplacementDef = usingReplacementPixelShader ? matchedDefinition : nullptr;
                     } else {
                         REX::WARN("MyPSSetShader: Failed to compile replacement shader for definition '{}'", matchedDefinition->id);
                         matchedDefinition->buggy = true; // Mark as failed to compile
@@ -4990,12 +5048,15 @@ void STDMETHODCALLTYPE MyPSSetShader(
     }
     // Call original function with either the original or replacement shader
     OriginalPSSetShader(This, pPixelShader, ppClassInstances, NumClassInstances);
-    g_activeReplacementPixelShader = usingReplacementPixelShader;
+    SetActiveReplacementPixelShaderUsage(activeReplacementDef, usingReplacementPixelShader);
+    if (g_activeReplacementPixelShaderNeedsResourceRebind) {
+        BindInjectedPixelShaderResources(This);
+    }
     // If a customPass fired, the engine's next draw still expects the injected
     // resource set we publish for replacement shaders (depth, GFXInjected, etc.)
     // to be present on its slots. The pass already re-binds them, but there is
     // no harm in publishing them again here when running a replacement.
-    if (customPassFired && usingReplacementPixelShader) {
+    if (customPassFired && g_activeReplacementPixelShaderNeedsResourceRebind) {
         BindInjectedPixelShaderResources(This);
     }
 }
@@ -5214,6 +5275,66 @@ ShaderDBEntry AnalyzeShader_Internal(REX::W32::ID3D11PixelShader* pixelShader, R
     return entry;
 }
 
+void UpdateReplacementResourceUsageFromReflection(ShaderDefinition* def)
+{
+    if (!def || !def->compiledShader) {
+        return;
+    }
+
+    def->usesGFXInjected = false;
+    def->usesGFXDrawTag = false;
+    def->usesGFXModularFloats = false;
+    def->usesGFXModularInts = false;
+    def->usesGFXModularBools = false;
+
+    ID3D11ShaderReflection* reflection = nullptr;
+    const HRESULT hr = D3DReflect(
+        def->compiledShader->GetBufferPointer(),
+        def->compiledShader->GetBufferSize(),
+        IID_ID3D11ShaderReflection,
+        reinterpret_cast<void**>(&reflection));
+    if (FAILED(hr) || !reflection) {
+        REX::WARN("CompileShader_Internal: D3DReflect failed for '{}' (0x{:08X}); conservatively binding injected resources",
+                  def->id,
+                  static_cast<unsigned>(hr));
+        def->usesGFXInjected = true;
+        def->usesGFXDrawTag = true;
+        def->usesGFXModularFloats = true;
+        def->usesGFXModularInts = true;
+        def->usesGFXModularBools = true;
+        g_anyReplacementShaderUsesDrawTag.store(true, std::memory_order_release);
+        return;
+    }
+
+    D3D11_SHADER_DESC shaderDesc{};
+    if (SUCCEEDED(reflection->GetDesc(&shaderDesc))) {
+        for (UINT i = 0; i < shaderDesc.BoundResources; ++i) {
+            D3D11_SHADER_INPUT_BIND_DESC bindDesc{};
+            if (FAILED(reflection->GetResourceBindingDesc(i, &bindDesc)) || !bindDesc.Name) {
+                continue;
+            }
+
+            const std::string_view name(bindDesc.Name);
+            if (name == "GFXInjected") {
+                def->usesGFXInjected = true;
+            } else if (name == "GFXDrawTag") {
+                def->usesGFXDrawTag = true;
+            } else if (name == "GFXModularFloats") {
+                def->usesGFXModularFloats = true;
+            } else if (name == "GFXModularInts") {
+                def->usesGFXModularInts = true;
+            } else if (name == "GFXModularBools") {
+                def->usesGFXModularBools = true;
+            }
+        }
+    }
+    reflection->Release();
+
+    if (def->usesGFXDrawTag) {
+        g_anyReplacementShaderUsesDrawTag.store(true, std::memory_order_release);
+    }
+}
+
 // Compile the HLSL shaders that were defined in the INI for each shader
 bool CompileShader_Internal(ShaderDefinition* def) {
     if (!def) return false;
@@ -5258,7 +5379,6 @@ bool CompileShader_Internal(ShaderDefinition* def) {
     shaderHeader += "\n";
     // Read the shader source from file and prepend the common header
     std::string shaderBody((std::istreambuf_iterator<char>(shaderFile)), std::istreambuf_iterator<char>());
-    const bool sourceMentionsDrawTag = shaderBody.find("GFXDrawTag") != std::string::npos;
     std::string shaderSource = shaderHeader;
     shaderSource += shaderBody;
     shaderFile.close();
@@ -5321,6 +5441,7 @@ bool CompileShader_Internal(ShaderDefinition* def) {
         REX::INFO("CompileShader_Internal: {} compiled successfully! Bytecode size: {} bytes",
                   def->shaderFile.string(), def->compiledShader->GetBufferSize());
     }
+    UpdateReplacementResourceUsageFromReflection(def);
     HRESULT hr = S_OK;
     // Set flag to prevent hook from analyzing the shader
     g_isCreatingReplacementShader = true;
@@ -5777,6 +5898,11 @@ void MaybeApplyHlslHotReload_Internal(ShaderDefinition* def) {
     if (def->loadedPixelShader)  { def->loadedPixelShader->Release();  def->loadedPixelShader  = nullptr; }
     if (def->loadedVertexShader) { def->loadedVertexShader->Release(); def->loadedVertexShader = nullptr; }
     if (def->compiledShader)     { def->compiledShader->Release();     def->compiledShader     = nullptr; }
+    def->usesGFXInjected = false;
+    def->usesGFXDrawTag = false;
+    def->usesGFXModularFloats = false;
+    def->usesGFXModularInts = false;
+    def->usesGFXModularBools = false;
     def->buggy = false;
     g_ShaderDB.ClearReplacementsForDefinition(def);
     REX::INFO("MaybeApplyHlslHotReload_Internal: dropped compiled state for definition '{}'", def->id);
