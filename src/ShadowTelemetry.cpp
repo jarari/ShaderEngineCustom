@@ -85,7 +85,7 @@ constexpr std::size_t kBSGraphicsContextShadowStateOffset = 0x1B70;
 constexpr std::size_t kRendererStateDepthPlatformTargetOffset = 0x4C;
 constexpr std::size_t kRendererStateDepthMapSlotOffset = 0x50;
 constexpr std::size_t kRendererStateDepthLogicalTargetOffset = 0x88;
-constexpr std::uint32_t kFirstCacheableDirectionalMapSlot = 1;
+constexpr std::uint32_t kFirstCacheableDirectionalMapSlot = 0;
 constexpr bool kShadowCacheLogEnabled = kDetailedShadowCacheLogging;
 
 constexpr double kLogIntervalSecs = 2.0;
@@ -180,7 +180,7 @@ std::int32_t QuantizeFloat(float value, float step) noexcept
 
 void* ActiveRendererShadowState() noexcept;
 
-std::uint64_t ShadowCameraSignature(void* camera) noexcept
+std::uint64_t ShadowCameraSignature(void* camera, std::uint32_t mapSlot) noexcept
 {
     if (!camera) {
         return 0;
@@ -194,14 +194,16 @@ std::uint64_t ShadowCameraSignature(void* camera) noexcept
     constexpr std::size_t kFrustumOffset = 0x160;
     constexpr std::size_t kFrustumFloatCount = 9;  // NiFrustum + minNear + maxFarNearRatio
     constexpr float kRotationStep = 0.0010f;
-    constexpr float kTranslationStep = 8.0f;
+    constexpr float kNearTranslationStep = 0.01f;
+    constexpr float kFarTranslationStep = 8.0f;
     constexpr float kFrustumStep = 4.0f;
+    const float translationStep = mapSlot == 0 ? kNearTranslationStep : kFarTranslationStep;
 
     std::array<std::int32_t, 16 + kFrustumFloatCount> quantized{};
     const auto* matrix = reinterpret_cast<const float*>(static_cast<const std::byte*>(camera) + kWorldToCamOffset);
     for (std::size_t i = 0; i < 16; ++i) {
         const float v = matrix[i];
-        const float step = std::abs(v) <= 4.0f ? kRotationStep : kTranslationStep;
+        const float step = std::abs(v) <= 4.0f ? kRotationStep : translationStep;
         quantized[i] = QuantizeFloat(v, step);
     }
 
@@ -213,26 +215,43 @@ std::uint64_t ShadowCameraSignature(void* camera) noexcept
     return HashBytes(quantized.data(), quantized.size() * sizeof(quantized[0]));
 }
 
-std::uint64_t DominantLightDirectionSignature() noexcept
+std::uint64_t GameplayCameraTranslationSignature(std::uint32_t mapSlot) noexcept
 {
-    if (g_customBufferData.g_SunValid <= 0.0f) {
+    if (mapSlot != 0) {
         return 0;
     }
 
-    const float x = g_customBufferData.g_SunDirX;
-    const float y = g_customBufferData.g_SunDirY;
-    const float z = g_customBufferData.g_SunDirZ;
+    constexpr float kGameplayCameraTranslationStep = 0.01f;
+    const std::array<std::int32_t, 3> quantized{
+        QuantizeFloat(g_customBufferData.cameraWorldRow3.x, kGameplayCameraTranslationStep),
+        QuantizeFloat(g_customBufferData.cameraWorldRow3.y, kGameplayCameraTranslationStep),
+        QuantizeFloat(g_customBufferData.cameraWorldRow3.z, kGameplayCameraTranslationStep),
+    };
+    return HashBytes(quantized.data(), quantized.size() * sizeof(quantized[0]));
+}
+
+std::uint64_t ShadowLightDirectionSignature(void* light) noexcept
+{
+    if (!light) {
+        return 0;
+    }
+
+    const float x = ReadField<float>(light, 0x200);
+    const float y = ReadField<float>(light, 0x204);
+    const float z = ReadField<float>(light, 0x208);
     const float lenSq = x * x + y * y + z * z;
     if (!std::isfinite(lenSq) || lenSq <= 1.0e-6f) {
         return 0;
     }
 
-    constexpr float kSunDirectionStep = 0.005f;
+    constexpr float kSunDirectionStep = 0.001f;
+    constexpr float kSunBlendStep = 0.001f;
     const float invLen = 1.0f / std::sqrt(lenSq);
-    const std::array<std::int32_t, 3> quantized{
+    const std::array<std::int32_t, 4> quantized{
         QuantizeFloat(x * invLen, kSunDirectionStep),
         QuantizeFloat(y * invLen, kSunDirectionStep),
         QuantizeFloat(z * invLen, kSunDirectionStep),
+        QuantizeFloat(ReadField<float>(light, 0x220), kSunBlendStep),
     };
     return HashBytes(quantized.data(), quantized.size() * sizeof(quantized[0]));
 }
@@ -1400,11 +1419,12 @@ Scope MakeScope(void* light, void* shadowMapData, LightKind kind) noexcept
     scope.key.kind = kind;
     scope.shadowMapDataIndex = ShadowMapDataIndex(light, shadowMapData);
     scope.camera = ReadField<void*>(shadowMapData, 0x40);
-    scope.key.cameraSig = ShadowCameraSignature(scope.camera);
-    scope.key.dominantLightSig = DominantLightDirectionSignature();
     scope.key.accumulator = ReadField<void*>(shadowMapData, kShadowMapAccumulatorOffset);
     scope.key.depthTarget = ReadField<std::uint32_t>(shadowMapData, kShadowMapDepthTargetOffset);
     scope.key.mapSlot = ReadField<std::uint32_t>(shadowMapData, kShadowMapMapSlotOffset);
+    scope.key.cameraSig = ShadowCameraSignature(scope.camera, scope.key.mapSlot) ^
+        (GameplayCameraTranslationSignature(scope.key.mapSlot) + 0x9e3779b97f4a7c15ull);
+    scope.key.dominantLightSig = ShadowLightDirectionSignature(light);
     scope.key.activeDepthStencilView = ActiveShadowDSV(scope.key);
     scope.key.activeDepthTexture = ActiveShadowTextureIdentity(
         static_cast<REX::W32::ID3D11DepthStencilView*>(scope.key.activeDepthStencilView));
@@ -1480,6 +1500,14 @@ bool ViewportClose(const ViewportSig& a, const ViewportSig& b) noexcept
            IsClose(a.dc, b.dc, kViewportTolerance);
 }
 
+bool ViewportStable(const Key& cached, const Key& current) noexcept
+{
+    if (cached.mapSlot == 0 || current.mapSlot == 0) {
+        return cached.viewport == current.viewport;
+    }
+    return ViewportClose(cached.viewport, current.viewport);
+}
+
 bool CacheKeyStable(const Key& cached, const Key& current) noexcept
 {
     return cached.cameraSig == current.cameraSig &&
@@ -1487,7 +1515,7 @@ bool CacheKeyStable(const Key& cached, const Key& current) noexcept
            cached.depthTarget == current.depthTarget &&
            cached.mapSlot == current.mapSlot &&
            cached.kind == current.kind &&
-           ViewportClose(cached.viewport, current.viewport);
+           ViewportStable(cached, current);
 }
 
 void MaybeLogShadowCache(
@@ -1537,7 +1565,7 @@ void MaybeLogShadowCache(
     const bool keyDepthEq = cache.key.depthTarget == scope.key.depthTarget;
     const bool keySlotEq = cache.key.mapSlot == scope.key.mapSlot;
     const bool keyKindEq = cache.key.kind == scope.key.kind;
-    const bool keyViewportEq = ViewportClose(cache.key.viewport, scope.key.viewport);
+    const bool keyViewportEq = ViewportStable(cache.key, scope.key);
 
     REX::INFO(
         "ShadowCache[directional idx={} mapSlot={} targetSplit={}]: decision={} eligibleNow={} hitNow={} "
@@ -2460,13 +2488,7 @@ void HookedRenderShadowMap(void* light, void* shadowMapData)
         decision = ctx.splitEmpty ? "passthrough-routed-empty" :
                    ctx.splitFailed ? "passthrough-split-setup-failed" :
                    "passthrough-unstable";
-        if (contextMatches && ctx.splitEmpty) {
-            if (!RunRoutedPassthroughShadowMap(ctx, light, shadowMapData)) {
-                RunPassthroughShadowMap(light, shadowMapData);
-            }
-        } else {
-            RunPassthroughShadowMap(light, shadowMapData);
-        }
+        RunPassthroughShadowMap(light, shadowMapData);
     } else {
         decision = "passthrough";
         RunOriginalRenderShadowMap(light, shadowMapData);

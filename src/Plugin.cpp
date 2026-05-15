@@ -2100,7 +2100,7 @@ namespace
     constexpr std::uint32_t kPassOcclusionShadowSkipBudget = 512;
     constexpr std::uint8_t kPassOcclusionMainHiddenFrames = 2;
     constexpr std::uint8_t kPassOcclusionShadowHiddenFrames = 3;
-    constexpr std::uint8_t kPassOcclusionMainMaxSkips = 2;
+    constexpr std::uint8_t kPassOcclusionMainMaxSkips = 4;
     constexpr std::uint8_t kPassOcclusionShadowMaxSkips = 1;
     constexpr std::uint64_t kPassOcclusionStaleFrames = 600;
     constexpr std::uint32_t kPassOcclusionPrunePeriod = 120;
@@ -2116,6 +2116,7 @@ namespace
     constexpr std::size_t kCullerArenaCurrentOffset = 0x20;
     constexpr std::size_t kCullerArenaTailOffset = 0x28;
     constexpr std::size_t kNiAVObjectTypeOffset = 0x158;
+    constexpr bool kPassOcclusionArenaGateEnabled = false;
 
     enum class PassOcclusionGeometryReject : std::uint8_t
     {
@@ -2172,6 +2173,20 @@ namespace
         std::uint64_t skipMain = 0;
         std::uint64_t skipShadow = 0;
         std::uint64_t earlySkipMain = 0;
+        std::uint64_t earlyNoPhase = 0;
+        std::uint64_t earlyCameraUnstable = 0;
+        std::uint64_t earlyNoCache = 0;
+        std::uint64_t earlyHiddenTooLow = 0;
+        std::uint64_t earlyMaxSkips = 0;
+        std::uint64_t earlyBudgetDenied = 0;
+        std::uint64_t arenaCalls = 0;
+        std::uint64_t arenaBlocks = 0;
+        std::uint64_t arenaEntries = 0;
+        std::uint64_t arenaGateNonZero = 0;
+        std::uint64_t arenaCandidates = 0;
+        std::uint64_t arenaPatched = 0;
+        std::uint64_t arenaRejectType = 0;
+        std::uint64_t arenaRejectNoObject = 0;
         std::uint64_t cameraStableFrames = 0;
         std::uint64_t cameraUnstableFrames = 0;
         std::uint64_t cameraInvalidFrames = 0;
@@ -2206,6 +2221,7 @@ namespace
             case 7:
             case 8:
             case 9:
+            case 10:
             case 14:
                 return true;
             default:
@@ -2348,7 +2364,6 @@ namespace
 
         if (depthTarget == static_cast<UINT>(MAIN_DEPTHSTENCIL_TARGET) &&
             hasRT &&
-            PhaseTelemetry::IsInDeferredPrePass() &&
             IsMainGBufferGroup(group)) {
             return PassOcclusionDomain::MainGBuffer;
         }
@@ -2500,10 +2515,15 @@ namespace
 
     bool ShouldEarlyCullRegisterObjectStandard(RE::BSGeometry* geometry)
     {
-        if (!PASS_LEVEL_OCCLUSION_ON ||
-            !PhaseTelemetry::IsInMainAccum() ||
-            !g_passOcclusionCameraStable ||
-            !geometry) {
+        if (!PASS_LEVEL_OCCLUSION_ON || !geometry) {
+            return false;
+        }
+        if (!PhaseTelemetry::IsInMainAccum()) {
+            ++g_passOcclusionTelemetry.earlyNoPhase;
+            return false;
+        }
+        if (!g_passOcclusionCameraStable) {
+            ++g_passOcclusionTelemetry.earlyCameraUnstable;
             return false;
         }
 
@@ -2515,13 +2535,21 @@ namespace
 
         auto it = g_passOcclusionEarlyGeometryCache.find(geometry);
         if (it == g_passOcclusionEarlyGeometryCache.end()) {
+            ++g_passOcclusionTelemetry.earlyNoCache;
             return false;
         }
 
         auto& early = it->second;
-        if (early.hiddenStreak < kPassOcclusionMainHiddenFrames ||
-            early.skippedSinceRefresh >= kPassOcclusionMainMaxSkips ||
-            !ConsumePassOcclusionSkipBudget(PassOcclusionDomain::MainGBuffer)) {
+        if (early.hiddenStreak < kPassOcclusionMainHiddenFrames) {
+            ++g_passOcclusionTelemetry.earlyHiddenTooLow;
+            return false;
+        }
+        if (early.skippedSinceRefresh >= kPassOcclusionMainMaxSkips) {
+            ++g_passOcclusionTelemetry.earlyMaxSkips;
+            return false;
+        }
+        if (!ConsumePassOcclusionSkipBudget(PassOcclusionDomain::MainGBuffer)) {
+            ++g_passOcclusionTelemetry.earlyBudgetDenied;
             return false;
         }
 
@@ -2562,6 +2590,13 @@ namespace
 
     void PatchPassOcclusionArenaGates(void* arena, std::vector<PassOcclusionArenaGatePatch>& patches)
     {
+        if constexpr (!kPassOcclusionArenaGateEnabled) {
+            (void)arena;
+            (void)patches;
+            return;
+        }
+
+        ++g_passOcclusionTelemetry.arenaCalls;
         if (!PASS_LEVEL_OCCLUSION_ON ||
             !PhaseTelemetry::IsInMainAccum() ||
             !g_passOcclusionCameraStable ||
@@ -2573,26 +2608,32 @@ namespace
         const auto endBlock = ResolveCullerArenaEnd(arenaBase);
         std::uintptr_t block = ResolveCullerArenaStart(arenaBase);
         for (std::uint32_t blockGuard = 0; block && block != endBlock && blockGuard < 4096; ++blockGuard) {
+            ++g_passOcclusionTelemetry.arenaBlocks;
             const auto count = *reinterpret_cast<std::uint32_t*>(block + kCullerBlockCountOffset);
             const auto safeCount = (std::min)(count, 1024u);
+            g_passOcclusionTelemetry.arenaEntries += safeCount;
             for (std::uint32_t i = 0; i < safeCount; ++i) {
                 auto* gate = reinterpret_cast<std::uint16_t*>(
                     block + kCullerBlockGateArrayOffset + static_cast<std::size_t>(i) * kCullerBlockGateStride);
                 if (*gate == 0) {
                     continue;
                 }
+                ++g_passOcclusionTelemetry.arenaGateNonZero;
 
                 const auto object = *reinterpret_cast<std::uintptr_t*>(
                     block + kCullerBlockObjectArrayOffset + static_cast<std::size_t>(i) * sizeof(void*));
                 if (!object) {
+                    ++g_passOcclusionTelemetry.arenaRejectNoObject;
                     continue;
                 }
 
                 const auto type = *reinterpret_cast<std::uint8_t*>(object + kNiAVObjectTypeOffset);
                 if (!IsStaticGeometryType(type)) {
+                    ++g_passOcclusionTelemetry.arenaRejectType;
                     continue;
                 }
 
+                ++g_passOcclusionTelemetry.arenaCandidates;
                 auto* geometry = reinterpret_cast<RE::BSGeometry*>(object);
                 if (!ShouldEarlyCullRegisterObjectStandard(geometry)) {
                     continue;
@@ -2600,6 +2641,7 @@ namespace
 
                 patches.push_back({ gate, *gate });
                 *gate = 0;
+                ++g_passOcclusionTelemetry.arenaPatched;
             }
 
             block = ReadArenaPtr(block, kCullerBlockNextOffset);
@@ -2807,6 +2849,10 @@ namespace
 
     void MaybeLogPassOcclusionTelemetry()
     {
+        if (g_passOcclusionFrame - g_passOcclusionLastTelemetryFrame < kPassOcclusionTelemetryPeriod) {
+            return;
+        }
+
         g_passOcclusionTelemetry = {};
         g_passOcclusionLastTelemetryFrame = g_passOcclusionFrame;
     }

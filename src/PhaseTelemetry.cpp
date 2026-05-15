@@ -377,6 +377,7 @@ Bucket s_subBuckets[static_cast<std::size_t>(SubPhase::Count)];
 // so child hooks fall through to passthrough.
 thread_local bool     tl_inFrame   = false;
 thread_local SubPhase tl_subphase  = SubPhase::None;
+std::atomic<bool> s_mainAccumActive{ false };
 
 inline void UpdateMax(std::atomic<std::uint64_t>& slot, std::uint64_t v) noexcept
 {
@@ -462,11 +463,12 @@ void MaybeLog()
 
 void HookedRenderPreUI()
 {
-    if (g_mode.load(std::memory_order_relaxed) != Mode::On) {
+    const bool telemetryOn = g_mode.load(std::memory_order_relaxed) == Mode::On;
+    if (!telemetryOn && !s_forceHooks.load(std::memory_order_relaxed)) {
         s_origRenderPreUI();
         return;
     }
-    if (!s_firstFrameLogged.exchange(true, std::memory_order_relaxed)) {
+    if (telemetryOn && !s_firstFrameLogged.exchange(true, std::memory_order_relaxed)) {
         REX::INFO("PhaseTelemetry: first DrawWorld::Render_PreUI call observed");
     }
     const bool wasInFrame = tl_inFrame;
@@ -479,9 +481,11 @@ void HookedRenderPreUI()
         std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
 
     tl_inFrame = wasInFrame;
-    RecordBucket(s_frame, ns);
+    if (telemetryOn) {
+        RecordBucket(s_frame, ns);
 
-    MaybeLog();
+        MaybeLog();
+    }
 }
 
 // Generic per-sub-phase body. Records into s_subBuckets[P] only if Render_PreUI
@@ -490,7 +494,8 @@ void HookedRenderPreUI()
 template <SubPhase P>
 void HookedSubPhase(VoidVoid_t orig)
 {
-    if (g_mode.load(std::memory_order_relaxed) != Mode::On) {
+    const bool telemetryOn = g_mode.load(std::memory_order_relaxed) == Mode::On;
+    if (!telemetryOn && !s_forceHooks.load(std::memory_order_relaxed)) {
         orig();
         return;
     }
@@ -498,7 +503,7 @@ void HookedSubPhase(VoidVoid_t orig)
         orig();
         return;
     }
-    if (!s_firstSubLogged[static_cast<std::size_t>(P)].exchange(true, std::memory_order_relaxed)) {
+    if (telemetryOn && !s_firstSubLogged[static_cast<std::size_t>(P)].exchange(true, std::memory_order_relaxed)) {
         REX::INFO("PhaseTelemetry: first DrawWorld::{} call observed", SubPhaseName(P));
     }
     const SubPhase prev = tl_subphase;
@@ -511,12 +516,16 @@ void HookedSubPhase(VoidVoid_t orig)
         std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
 
     tl_subphase = prev;
-    RecordBucket(s_subBuckets[static_cast<std::size_t>(P)], ns);
+    if (telemetryOn) {
+        RecordBucket(s_subBuckets[static_cast<std::size_t>(P)], ns);
+    }
 }
 
 void HookedMainAccumCore()
 {
+    s_mainAccumActive.store(true, std::memory_order_release);
     s_origMainAccum();
+    s_mainAccumActive.store(false, std::memory_order_release);
 }
 void HookedMainAccum()          { HookedSubPhase<SubPhase::MainAccum         >(&HookedMainAccumCore); }
 void HookedMainRenderSetup()    { HookedSubPhase<SubPhase::MainRenderSetup   >(s_origMainRenderSetup); }
@@ -655,7 +664,8 @@ bool IsInRenderPreUI()
 
 bool IsInMainAccum()
 {
-    return tl_inFrame && tl_subphase == SubPhase::MainAccum;
+    return (tl_inFrame && tl_subphase == SubPhase::MainAccum) ||
+           s_mainAccumActive.load(std::memory_order_acquire);
 }
 
 bool IsInDeferredPrePass()
