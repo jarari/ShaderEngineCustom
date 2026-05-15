@@ -1,6 +1,7 @@
 #include <PCH.h>
 #include "PhaseTelemetry.h"
 #include "LightSorter.h"
+#include "hooks.h"
 
 #include <chrono>
 #include <cstring>
@@ -17,31 +18,31 @@ std::atomic<bool> s_forceHooks{ false };
 //
 // The per-frame world render entry on OG 1.10.163 is
 //   Main::DrawWorld_And_UI                @ 0x140D3CBE0
-//     └─ DrawWorld::Render_PreUI          @ 0x142857480
-//          ├─ DrawWorld::LightUpdate
-//          ├─ DrawWorld::MainAccum            (cull + AccumulateSceneArray)
-//          ├─ DrawWorld::MainRenderSetup
-//          ├─ DrawWorld::OpaqueWireframe
-//          ├─ DrawWorld::DeferredPrePass      ← real G-buffer Pre
-//          ├─ DrawWorld::UpdateMotionBlur
-//          ├─ DrawWorld::DeferredDecals
-//          ├─ DrawWorld::ImagespaceSAO
-//          ├─ DrawWorld::NvidiaHBAO           (conditional)
-//          ├─ DrawWorld::DeferredLightsImpl
-//          ├─ DrawWorld::DeferredComposite
-//          ├─ DrawWorld::Forward              (alpha; eventually calls Post)
-//          └─ DrawWorld::Refraction
+//     -> DrawWorld::Render_PreUI          @ 0x142857480
+//          -> DrawWorld::LightUpdate
+//          -> DrawWorld::MainAccum            (cull + AccumulateSceneArray)
+//          -> DrawWorld::MainRenderSetup
+//          -> DrawWorld::OpaqueWireframe
+//          -> DrawWorld::DeferredPrePass      real G-buffer Pre
+//          -> DrawWorld::UpdateMotionBlur
+//          -> DrawWorld::DeferredDecals
+//          -> DrawWorld::ImagespaceSAO
+//          -> DrawWorld::NvidiaHBAO           (conditional)
+//          -> DrawWorld::DeferredLightsImpl
+//          -> DrawWorld::DeferredComposite
+//          -> DrawWorld::Forward              (alpha; eventually calls Post)
+//          -> DrawWorld::Refraction
 //
 // We hook Render_PreUI as the outer "Frame" bucket and each *hookable*
 // DrawWorld:: sub-phase as its own bucket. Five sub-phases are intentionally
 // skipped because their prologues contain a RIP-relative memory access inside
-// the first 14 bytes with no preceding clean boundary at byte ≥ 5
+// the first 14 bytes with no preceding clean boundary at byte ??5
 // (LightUpdate / OpaqueWireframe / UpdateMotionBlur / ImagespaceSAO /
 // Refraction). Our gateway templates don't relocate rel32 displacements; their
-// wall time will fall into the "unaccounted" residual = Frame total − Σ children.
+// wall time is tracked directly by the relocated gateway path.
 //
 // OG REL::IDs are from tools/version-1-10-163-0-e.txt. AE IDs are set to 0
-// per user direction ("I don't care about NG/AE crashing") — the Initialize()
+// per user direction ("I don't care about NG/AE crashing") ??the Initialize()
 // path declines to install if the resolved address is outside .text. On AE
 // the entire module no-ops cleanly; no telemetry, but no crash either.
 //
@@ -52,11 +53,11 @@ std::atomic<bool> s_forceHooks{ false };
 //                                            (RIP-rel mov at byte 9)
 //   MainRenderSetup     339369   E9-5   6B   sub rsp,0x38; xor edx,edx
 //                                            (RIP-rel lea at byte 6)
-//   DeferredPrePass      56596   JMP14 15B   3× stack save mov [rsp+disp8],reg
-//   DeferredDecals      631771   JMP14 17B   mov [rsp+0x18],rbx + 5 pushes + lea rbp
-//   NvidiaHBAO          253972   JMP14 15B   mov rax,rsp + 3 saves
-//   DeferredLightsImpl 1108521   JMP14 18B   mov rax,rsp; push rbp; lea rbp; sub rsp
-//   DeferredComposite   728427   JMP14 15B   mov rax,rsp + 2 saves + 5 pushes
+//   DeferredPrePass      56596   E9-5  15B   stack save mov [rsp+disp8],reg
+//   DeferredDecals      631771   E9-5  17B   mov [rsp+0x18],rbx + 5 pushes + lea rbp
+//   NvidiaHBAO          253972   E9-5  15B   mov rax,rsp + 3 saves
+//   DeferredLightsImpl 1108521   E9-5  18B   mov rax,rsp; push rbp; lea rbp; sub rsp
+//   DeferredComposite   728427   E9-5  15B   mov rax,rsp + 2 saves + 5 pushes
 //   Forward             656535   E9-5   6B   mov [rsp+8],rbx; push rdi
 //                                            (RIP-rel mov at byte 10)
 
@@ -82,11 +83,11 @@ REL::Relocation<std::uintptr_t> ptr_Refraction         { REL::ID{ 1572250, 0 } }
 constexpr std::size_t kPrologueRenderPreUI         =  8;  // E9-5 patch
 constexpr std::size_t kPrologueMainAccum           =  9;  // E9-5 patch
 constexpr std::size_t kPrologueMainRenderSetup     =  6;  // E9-5 patch
-constexpr std::size_t kPrologueDeferredPrePass     = 15;  // JMP14
-constexpr std::size_t kPrologueDeferredDecals      = 17;  // JMP14
-constexpr std::size_t kPrologueNvidiaHBAO          = 15;  // JMP14
-constexpr std::size_t kPrologueDeferredLightsImpl  = 18;  // JMP14
-constexpr std::size_t kPrologueDeferredComposite   = 15;  // JMP14
+constexpr std::size_t kPrologueDeferredPrePass     = 15;  // E9-5 patch
+constexpr std::size_t kPrologueDeferredDecals      = 17;  // E9-5 patch
+constexpr std::size_t kPrologueNvidiaHBAO          = 15;  // E9-5 patch
+constexpr std::size_t kPrologueDeferredLightsImpl  = 18;  // E9-5 patch
+constexpr std::size_t kPrologueDeferredComposite   = 15;  // E9-5 patch
 constexpr std::size_t kPrologueForward             =  6;  // E9-5 patch
 constexpr std::size_t kPrologueTier0_SubAndRipRel  = 11;  // E9-5 + relocator
 
@@ -108,204 +109,8 @@ VoidVoid_t s_origUpdateMotionBlur   = nullptr;
 VoidVoid_t s_origImagespaceSAO      = nullptr;
 VoidVoid_t s_origRefraction         = nullptr;
 
-// --- Gateway templates -----------------------------------------------------
-//
-// CreateBranchGateway:  patches target with a 14-byte JMP14 (FF 25 + 8-byte
-// absolute). Use when prologueSize >= 14 AND captured bytes contain no
-// RIP-relative ops.
-//
-// CreateBranchGateway5: patches target with a 5-byte E9 rel32. Use when the
-// only clean boundary >= 5 is below 14 (e.g. a RIP-relative op starts at byte
-// 8 and we need to cut at 8). Captured bytes still must contain no RIP-rel.
-//
-// Both copy `prologueSize` bytes from the target into a freshly-allocated
-// gateway region and append a JMP14 back to `target + prologueSize`.
-
-template <class T>
-T CreateBranchGateway(REL::Relocation<std::uintptr_t>& target, std::size_t prologueSize, void* hook)
-{
-    const auto targetAddress = target.address();
-    auto& trampoline = REL::GetTrampoline();
-    auto* gateway = static_cast<std::byte*>(trampoline.allocate(prologueSize + sizeof(REL::ASM::JMP14)));
-    std::memcpy(gateway, reinterpret_cast<void*>(targetAddress), prologueSize);
-    const REL::ASM::JMP14 jumpBack{ targetAddress + prologueSize };
-    std::memcpy(gateway + prologueSize, &jumpBack, sizeof(jumpBack));
-    target.replace_func(prologueSize, hook);
-    return reinterpret_cast<T>(gateway);
-}
-
-template <class T>
-T CreateBranchGateway5(REL::Relocation<std::uintptr_t>& target, std::size_t prologueSize, void* hook)
-{
-    const auto targetAddress = target.address();
-    auto& trampoline = REL::GetTrampoline();
-    auto* gateway = static_cast<std::byte*>(trampoline.allocate(prologueSize + sizeof(REL::ASM::JMP14)));
-    std::memcpy(gateway, reinterpret_cast<void*>(targetAddress), prologueSize);
-    const REL::ASM::JMP14 jumpBack{ targetAddress + prologueSize };
-    std::memcpy(gateway + prologueSize, &jumpBack, sizeof(jumpBack));
-    trampoline.write_jmp5(targetAddress, reinterpret_cast<std::uintptr_t>(hook));
-    return reinterpret_cast<T>(gateway);
-}
-
-// --- RIP-relative prologue rewriter ----------------------------------------
-//
-// Emits a relocated copy of `prologueSize` original bytes into `gateway`.
-// Non-RIP-rel instructions are copied verbatim. RIP-relative instructions are
-// **rewritten** to use absolute 64-bit addressing instead of patched disp32,
-// because in practice commonlibf4 allocates its trampoline arena ~2 GB below
-// the FO4 image, while the rip-rel globals in DrawWorld:: prologues sit ~0.1 GB
-// above the image — total displacement from the gateway exceeds INT32_MAX,
-// so disp32-patching can never succeed regardless of arena position.
-//
-// Rewrites (each grows the instruction by 6 bytes):
-//
-//   48 8B 0D <disp32>   mov rcx, [rip+disp]   (7B)
-//      → 48 B9 <abs64> ; 48 8B 09             (13B)  ; mov rcx, abs ; mov rcx, [rcx]
-//   48 8B 05 <disp32>   mov rax, [rip+disp]   (7B)
-//      → 48 B8 <abs64> ; 48 8B 00             (13B)
-//   80 3D <disp32> <imm8>  cmp byte [rip+disp], imm8   (7B)
-//      → 48 B8 <abs64> ; 80 38 <imm8>         (13B)  ; uses rax as scratch
-//
-// The cmp rewrite clobbers rax. Safe for our 5 targets because:
-//   - rax at function entry is undefined (caller's leftover).
-//   - The cmp's only useful output is RFLAGS, consumed by the jcc immediately
-//     after our captured range. RFLAGS survives the JMP14-back to target+11.
-//   - Verified per-target: no captured prologue does anything with rax after
-//     the cmp.
-//
-// Worst-case gateway expansion = 13/7 ≈ 1.86×. With prologueSize=11 the
-// expanded body is at most 11 + (1 rip-rel × +6) = 17 bytes, plus the 14-byte
-// JMP14-back = 31 bytes per Tier 0 hook.
-//
-// Returns the byte count written to `gateway` (excluding the trailing JMP14),
-// or 0 on failure.
-
-constexpr std::size_t kMaxRelocatedPrologueBytes = 32;  // 11B captured × 13/7 + headroom
-
-std::size_t EmitRelocatedPrologue(std::uint8_t* gateway,
-                                  std::uintptr_t targetAddr,
-                                  const std::uint8_t* original,
-                                  std::size_t prologueSize)
-{
-    std::size_t s = 0;  // read cursor in original
-    std::size_t d = 0;  // write cursor in gateway
-
-    while (s < prologueSize) {
-        const std::uint8_t b0 = original[s];
-
-        // 48 83 /N ib = sub/add/etc r/m64, imm8 with mod=11 (reg form) — 4B verbatim.
-        if (b0 == 0x48 && s + 3 < prologueSize) {
-            const std::uint8_t op    = original[s + 1];
-            const std::uint8_t modrm = original[s + 2];
-            if (op == 0x83 && (modrm & 0xC0) == 0xC0) {
-                std::memcpy(gateway + d, original + s, 4);
-                s += 4;
-                d += 4;
-                continue;
-            }
-            // 48 8B <modrm with mod=00 rm=101> = mov reg, [rip+disp32]
-            if (op == 0x8B && (modrm & 0xC7) == 0x05 && s + 7 <= prologueSize) {
-                std::int32_t disp32;
-                std::memcpy(&disp32, original + s + 3, 4);
-                const std::uintptr_t absAddr =
-                    targetAddr + s + 7 + static_cast<std::intptr_t>(disp32);
-                const std::uint8_t reg = (modrm >> 3) & 0x07;  // dest reg, low 3 bits
-                if (d + 13 > kMaxRelocatedPrologueBytes) return 0;
-                // mov reg, imm64
-                gateway[d + 0] = 0x48;
-                gateway[d + 1] = static_cast<std::uint8_t>(0xB8 + reg);
-                std::memcpy(gateway + d + 2, &absAddr, 8);
-                // mov reg, [reg] — modrm = (mod=00) | (reg<<3) | rm=reg
-                gateway[d + 10] = 0x48;
-                gateway[d + 11] = 0x8B;
-                gateway[d + 12] = static_cast<std::uint8_t>((reg << 3) | reg);
-                s += 7;
-                d += 13;
-                continue;
-            }
-        }
-        // 80 /N <modrm with mod=00 rm=101> imm8 = cmp/etc byte [rip+disp32], imm8
-        if (b0 == 0x80 && s + 1 < prologueSize) {
-            const std::uint8_t modrm = original[s + 1];
-            if ((modrm & 0xC7) == 0x05 && s + 7 <= prologueSize) {
-                std::int32_t disp32;
-                std::memcpy(&disp32, original + s + 2, 4);
-                const std::uint8_t imm8 = original[s + 6];
-                const std::uintptr_t absAddr =
-                    targetAddr + s + 7 + static_cast<std::intptr_t>(disp32);
-                const std::uint8_t opExt = (modrm >> 3) & 0x07;  // /N field
-                if (d + 13 > kMaxRelocatedPrologueBytes) return 0;
-                // mov rax, imm64
-                gateway[d + 0] = 0x48;
-                gateway[d + 1] = 0xB8;
-                std::memcpy(gateway + d + 2, &absAddr, 8);
-                // <op> byte [rax], imm8 — modrm = (mod=00) | (opExt<<3) | rm=000 (rax)
-                gateway[d + 10] = 0x80;
-                gateway[d + 11] = static_cast<std::uint8_t>(opExt << 3);
-                gateway[d + 12] = imm8;
-                s += 7;
-                d += 13;
-                continue;
-            }
-        }
-
-        REX::WARN("EmitRelocatedPrologue: reject @ off {} of {} (b0={:02x} next1={:02x} next2={:02x})",
-                  s, prologueSize, b0,
-                  s + 1 < prologueSize ? original[s + 1] : 0,
-                  s + 2 < prologueSize ? original[s + 2] : 0);
-        return 0;
-    }
-    return d;
-}
-
-// E9-5 gateway variant that REWRITES RIP-relative instructions in the captured
-// prologue to use absolute addressing. Returns nullptr (without patching) if
-// the rewriter can't decode the captured bytes.
-template <class T>
-T CreateBranchGateway5Relocated(REL::Relocation<std::uintptr_t>& target,
-                                std::size_t prologueSize, void* hook)
-{
-    const auto targetAddress = target.address();
-    auto& trampoline = REL::GetTrampoline();
-
-    // Worst-case allocation: 13/7 expansion + 14-byte JMP14.
-    auto* gateway = static_cast<std::byte*>(
-        trampoline.allocate(kMaxRelocatedPrologueBytes + sizeof(REL::ASM::JMP14)));
-    auto* gw = reinterpret_cast<std::uint8_t*>(gateway);
-
-    const auto* original = reinterpret_cast<const std::uint8_t*>(targetAddress);
-    const std::size_t written = EmitRelocatedPrologue(gw, targetAddress, original, prologueSize);
-    if (written == 0) {
-        return nullptr;
-    }
-
-    // Diagnostic: show original vs rewritten bytes.
-    {
-        char origStr[64] = {}, gwStr[96] = {};
-        char* p = origStr;
-        for (std::size_t k = 0; k < prologueSize && k < 16; ++k) {
-            if (k) *p++ = ' ';
-            std::snprintf(p, 3, "%02x", original[k]); p += 2;
-        }
-        p = gwStr;
-        for (std::size_t k = 0; k < written && k < 24; ++k) {
-            if (k) *p++ = ' ';
-            std::snprintf(p, 3, "%02x", gw[k]); p += 2;
-        }
-        REX::INFO("EmitRelocatedPrologue: tgt={:#x} gw={:#x} orig({}B)={} | rewritten({}B)={}",
-                  targetAddress, reinterpret_cast<std::uintptr_t>(gw),
-                  prologueSize, origStr, written, gwStr);
-    }
-
-    // Append JMP14 back to (targetAddress + prologueSize). The original's
-    // prologueSize bytes are the ones we've semantically replicated; execution
-    // resumes at target + prologueSize in the original.
-    const REL::ASM::JMP14 jumpBack{ targetAddress + prologueSize };
-    std::memcpy(gw + written, &jumpBack, sizeof(jumpBack));
-
-    trampoline.write_jmp5(targetAddress, reinterpret_cast<std::uintptr_t>(hook));
-    return reinterpret_cast<T>(gateway);
-}
+// Gateway creation lives in hooks.h. PhaseTelemetry uses the 5-byte gateway path everywhere,
+// with the relocated variant for tier-0 prologues that contain RIP-relative instructions.
 
 // --- Per-phase buckets ----------------------------------------------------
 //
@@ -372,7 +177,7 @@ struct Bucket {
 Bucket s_frame;
 Bucket s_subBuckets[static_cast<std::size_t>(SubPhase::Count)];
 
-// thread_local — render thread runs Render_PreUI and all its children
+// thread_local ??render thread runs Render_PreUI and all its children
 // sequentially. If a worker path ever entered, the bool defaults to false
 // so child hooks fall through to passthrough.
 thread_local bool     tl_inFrame   = false;
@@ -489,7 +294,7 @@ void HookedRenderPreUI()
 }
 
 // Generic per-sub-phase body. Records into s_subBuckets[P] only if Render_PreUI
-// is on the stack (tl_inFrame). Otherwise passthrough — Render_PreUI must own
+// is on the stack (tl_inFrame). Otherwise passthrough ??Render_PreUI must own
 // the lifetime for our model to apply.
 template <SubPhase P>
 void HookedSubPhase(VoidVoid_t orig)
@@ -553,7 +358,7 @@ void HookedForwardCore()
     s_origForward();
 }
 void HookedForward()            { HookedSubPhase<SubPhase::Forward           >(&HookedForwardCore); }
-// Tier 0 — installed via E9-5 + relocator.
+// Tier 0 ??installed via E9-5 + relocator.
 void HookedLightUpdate()        { HookedSubPhase<SubPhase::LightUpdate       >(s_origLightUpdate); }
 void HookedOpaqueWireframe()    { HookedSubPhase<SubPhase::OpaqueWireframe   >(s_origOpaqueWireframe); }
 void HookedUpdateMotionBlur()   { HookedSubPhase<SubPhase::UpdateMotionBlur  >(s_origUpdateMotionBlur); }
@@ -562,36 +367,29 @@ void HookedRefraction()         { HookedSubPhase<SubPhase::Refraction        >(s
 
 // --- Install helpers ------------------------------------------------------
 
-enum class HookFlavor : std::uint8_t { JMP14, E9_5, E9_5_Reloc };
+enum class HookFlavor : std::uint8_t { E9_5, E9_5_Reloc };
 
 bool InstallOne(const char* name, REL::Relocation<std::uintptr_t>& target,
                 std::size_t prologueSize, HookFlavor flavor,
                 void* hook, void** outOrig)
 {
     const std::uintptr_t addr = target.address();
-    if (addr < 0x140000000ull) {
-        REX::WARN("PhaseTelemetry::Initialize: {} address resolution failed (got {:#x}); REL::ID likely missing for this runtime. Skipping.",
-                  name, addr);
-        return false;
-    }
+
     const auto* original = reinterpret_cast<const std::uint8_t*>(addr);
     std::uint8_t captured[24] = {};
     const std::size_t capLen = std::min<std::size_t>(prologueSize, sizeof(captured));
     std::memcpy(captured, original, capLen);
 
     void* gateway = nullptr;
-    if (flavor == HookFlavor::JMP14) {
-        gateway = CreateBranchGateway<void*>(target, prologueSize, hook);
-    } else if (flavor == HookFlavor::E9_5) {
-        gateway = CreateBranchGateway5<void*>(target, prologueSize, hook);
+    if (flavor == HookFlavor::E9_5) {
+        gateway = Hooks::CreateBranchGateway5<void*>(target, prologueSize, hook);
     } else {
-        gateway = CreateBranchGateway5Relocated<void*>(target, prologueSize, hook);
+        gateway = Hooks::CreateBranchGateway5Relocated<void*>(target, prologueSize, hook);
     }
     if (!gateway) {
         REX::WARN("PhaseTelemetry::Initialize: gateway install failed for {} @ {:#x} (flavor {})",
                   name, addr,
-                  flavor == HookFlavor::JMP14 ? "JMP14"
-                  : flavor == HookFlavor::E9_5 ? "E9-5"
+                  flavor == HookFlavor::E9_5 ? "E9-5"
                   : "E9-5+reloc (relocator rejected captured bytes)");
         return false;
     }
@@ -608,9 +406,8 @@ bool InstallOne(const char* name, REL::Relocation<std::uintptr_t>& target,
     REX::INFO(
         "PhaseTelemetry::Initialize: hooked {} @ {:#x} (prologue={}B {} captured = {})",
         name, addr, prologueSize,
-        flavor == HookFlavor::JMP14    ? "JMP14"
-        : flavor == HookFlavor::E9_5   ? "E9-5"
-                                       : "E9-5+reloc",
+        flavor == HookFlavor::E9_5 ? "E9-5"
+        : "E9-5+reloc",
         capStr);
     return true;
 }
@@ -686,7 +483,7 @@ bool Initialize()
     }
     const auto mode = g_mode.load(std::memory_order_relaxed);
 
-    // The DrawWorld:: hooks aren't owned by PhaseTelemetry alone — LightSorter
+    // The DrawWorld:: hooks aren't owned by PhaseTelemetry alone ??LightSorter
     // runs its OnEnter/OnExit logic from inside our HookedDeferredLightsImpl
     // wrapper, and renderer hooks can request phase context without enabling
     // telemetry logging. If either piggy-back consumer is on but
@@ -698,7 +495,7 @@ bool Initialize()
     const bool forced = s_forceHooks.load(std::memory_order_relaxed);
     const bool needHooks = (mode == Mode::On) || lightSorterOn || forced;
 
-    REX::INFO("PhaseTelemetry::Initialize: mode={} (hooks {} — telemetry={}, "
+    REX::INFO("PhaseTelemetry::Initialize: mode={} (hooks {} ??telemetry={}, "
               "LightSorter={}, forced={})",
               mode == Mode::On ? "on" : "off",
               needHooks ? "installing" : "skipped",
@@ -725,23 +522,23 @@ bool Initialize()
                      reinterpret_cast<void*>(&HookedMainRenderSetup),
                      reinterpret_cast<void**>(&s_origMainRenderSetup));
     ok &= InstallOne("DrawWorld::DeferredPrePass",
-                     ptr_DeferredPrePass, kPrologueDeferredPrePass, HookFlavor::JMP14,
+                     ptr_DeferredPrePass, kPrologueDeferredPrePass, HookFlavor::E9_5,
                      reinterpret_cast<void*>(&HookedDeferredPrePass),
                      reinterpret_cast<void**>(&s_origDeferredPrePass));
     ok &= InstallOne("DrawWorld::DeferredDecals",
-                     ptr_DeferredDecals, kPrologueDeferredDecals, HookFlavor::JMP14,
+                     ptr_DeferredDecals, kPrologueDeferredDecals, HookFlavor::E9_5,
                      reinterpret_cast<void*>(&HookedDeferredDecals),
                      reinterpret_cast<void**>(&s_origDeferredDecals));
     ok &= InstallOne("DrawWorld::NvidiaHBAO",
-                     ptr_NvidiaHBAO, kPrologueNvidiaHBAO, HookFlavor::JMP14,
+                     ptr_NvidiaHBAO, kPrologueNvidiaHBAO, HookFlavor::E9_5,
                      reinterpret_cast<void*>(&HookedNvidiaHBAO),
                      reinterpret_cast<void**>(&s_origNvidiaHBAO));
     ok &= InstallOne("DrawWorld::DeferredLightsImpl",
-                     ptr_DeferredLightsImpl, kPrologueDeferredLightsImpl, HookFlavor::JMP14,
+                     ptr_DeferredLightsImpl, kPrologueDeferredLightsImpl, HookFlavor::E9_5,
                      reinterpret_cast<void*>(&HookedDeferredLightsImpl),
                      reinterpret_cast<void**>(&s_origDeferredLightsImpl));
     ok &= InstallOne("DrawWorld::DeferredComposite",
-                     ptr_DeferredComposite, kPrologueDeferredComposite, HookFlavor::JMP14,
+                     ptr_DeferredComposite, kPrologueDeferredComposite, HookFlavor::E9_5,
                      reinterpret_cast<void*>(&HookedDeferredComposite),
                      reinterpret_cast<void**>(&s_origDeferredComposite));
     ok &= InstallOne("DrawWorld::Forward",
@@ -749,7 +546,7 @@ bool Initialize()
                      reinterpret_cast<void*>(&HookedForward),
                      reinterpret_cast<void**>(&s_origForward));
 
-    // Tier 0 — the five previously-skipped phases. All share a
+    // Tier 0 ??the five previously-skipped phases. All share a
     // `sub rsp,0x38; <rip-rel mov/cmp at byte 4>` prologue; we capture 11 B
     // and the relocator adjusts the disp32 of the rip-rel instruction.
     ok &= InstallOne("DrawWorld::LightUpdate",

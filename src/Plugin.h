@@ -793,11 +793,37 @@ struct ShaderDB {
 
 // --- Functions ---
 
+struct D3D11PSSetShaderResult {
+    REX::W32::ID3D11PixelShader* shader = nullptr;
+    ShaderDefinition* activeReplacementDef = nullptr;
+    bool usingReplacementPixelShader = false;
+    bool customPassFired = false;
+};
+
+struct BSRenderPassLayout
+{
+    BSRenderPassLayout* next;                  // 00
+    RE::BSShader* shader;                      // 08
+    RE::BSShaderProperty* shaderProperty;      // 10
+    RE::BSGeometry* geometry;                  // 18
+    std::byte pad20[0x28 - 0x20];              // 20
+    void* commandBuffer;                       // 28
+    std::byte pad30[0x38 - 0x30];              // 30
+    BSRenderPassLayout* listNext;              // 38
+    BSRenderPassLayout* passGroupNext;         // 40
+    std::uint32_t techniqueID;                 // 48
+};
+static_assert(offsetof(BSRenderPassLayout, shaderProperty) == 0x10);
+static_assert(offsetof(BSRenderPassLayout, geometry) == 0x18);
+static_assert(offsetof(BSRenderPassLayout, commandBuffer) == 0x28);
+static_assert(offsetof(BSRenderPassLayout, listNext) == 0x38);
+static_assert(offsetof(BSRenderPassLayout, passGroupNext) == 0x40);
+static_assert(offsetof(BSRenderPassLayout, techniqueID) == 0x48);
+
 ShaderDBEntry AnalyzeShader_Internal(REX::W32::ID3D11PixelShader* pixelShader, REX::W32::ID3D11VertexShader* vertexShader, std::vector<uint8_t> bytecode, SIZE_T BytecodeLength);
 bool CompileShader_Internal(ShaderDefinition* def);
 bool DoesEntryMatchDefinition_Internal(ShaderDBEntry const& entry, ShaderDefinition* def);
 void DumpOriginalShader_Internal(ShaderDBEntry const& entry, ShaderDefinition* def);
-REX::W32::ID3D11ShaderResourceView* GetDepthBufferSRV_Internal();
 void ClearActorDrawTaggedGeometry_Internal();
 void ReleaseDrawTagBuffers_Internal();
 void ShutdownPassOcclusionCache_Internal();
@@ -815,9 +841,13 @@ void RematchAllShaders_Internal();
 void MaybeApplyHlslHotReload_Internal(ShaderDefinition* def);
 void ShaderDumpWorker();
 void ShutdownShaderDumping_Internal();
-void UIDrawShaderSettingsOverlay();
-void UIDrawShaderDebugOverlay();
-void UIDrawCustomBufferMonitorOverlay();
 void UILockShaderList_Internal();
 void UIUnlockShaderList_Internal();
-void UpdateCustomBuffer_Internal();
+std::uint64_t GetD3DDrawCallsLastFrame_Internal();
+void ArmCustomPassDrawBatch(REX::W32::ID3D11PixelShader* originalPS);
+bool FireArmedCustomPassDrawBatch(REX::W32::ID3D11DeviceContext* context, const char* source);
+void PassOcclusionOnFramePresent_Internal();
+bool IsPrecombineShadowGeometry_Internal(RE::BSGeometry* geometry);
+bool IsActorDrawTaggedGeometry_Internal(RE::BSGeometry* geometry);
+bool IsRenderBatchesActive_Internal();
+BSRenderPassLayout* GetRenderBatchNodeHead_Internal(void* batchRenderer, int group, unsigned int subIdx);

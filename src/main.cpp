@@ -1,4 +1,4 @@
-﻿#include <Global.h>
+#include <Global.h>
 #include <CustomPass.h>
 #include <GpuScalar.h>
 #include <LightCullPolicy.h>
@@ -1191,7 +1191,7 @@ void LoadConfig(HMODULE hModule) {
                 def->hlslFileWatcher->Start();
             }
         }
-        // CustomPass shaders get their own per-pass watchers — without these
+        // CustomPass shaders get their own per-pass watchers ? without these
         // the SSRTGI / denoise / composite shaders would only recompile on a
         // full Shader.ini reload, which is painful for iteration.
         CustomPass::g_registry.StartFileWatchers();
@@ -1210,7 +1210,7 @@ void LoadConfig(HMODULE hModule) {
     // invalidates the ShaderCache include memo before the next compile reads
     // it. Without this, editing only an include leaves running shaders on
     // stale bytecode AND poisons the on-disk cache the next time any
-    // dependent shader is recompiled. Only spun up in DEVELOPMENT mode —
+    // dependent shader is recompiled. Only spun up in DEVELOPMENT mode ?
     // the include dir is immutable in production.
     if (DEVELOPMENT && !g_includeDirWatcher) {
         g_includeDirWatcher = std::make_unique<IncludeDirWatcher>(g_commonShaderHeaderPath);
@@ -1407,17 +1407,17 @@ F4SE_PLUGIN_LOAD(const F4SE::LoadInterface* a_f4se)
     g_taskInterface = F4SE::GetTaskInterface();
     // Allocate Trampoline size
     auto& trampoline = REL::GetTrampoline();
-    // Budget covers ShaderEngine's pre-existing CreateBranchGateway hooks
+    // Budget covers ShaderEngine's pre-existing branch gateway hooks
     // (~210 B on OG) plus the 5-byte branch hooks for Update3DModel/Reset3D
     // (each ~19 B gateway + 14 B abs-jump thunk in this same arena) plus
-    // PhaseTelemetry's DrawWorld:: per-phase hooks (14 sites × ~30 B ≈ 420 B),
+    // PhaseTelemetry's DrawWorld:: per-phase hooks (14 sites × ~30 B ? 420 B),
     // plus ShadowTelemetry's direct call-site patches. 4 KB leaves headroom
     // for write_call thunks and future measurement hooks.
     trampoline.create(4096);
     // Install the shader creation hooks very early.
     InstallShaderCreationHooks_Internal();
     InstallDrawTaggingHooks_Internal();
-    // Phase telemetry — installs per-DrawWorld:: hooks to attribute wall time
+    // Phase telemetry ? installs per-DrawWorld:: hooks to attribute wall time
     // + draw count per sub-phase under DrawWorld::Render_PreUI. Default off
     // = no logging. Render-pass occlusion requests those hooks only when its
     // A/B path is actually enabled.
@@ -1426,7 +1426,7 @@ F4SE_PLUGIN_LOAD(const F4SE::LoadInterface* a_f4se)
     }
     PhaseTelemetry::Initialize();
     ShadowTelemetry::Initialize();
-    // LightSorter — stable-partitions the point-light array by stencil flag
+    // LightSorter ? stable-partitions the point-light array by stencil flag
     // before DrawWorld::DeferredLightsImpl, then restores. No own hook;
     // PhaseTelemetry's HookedDeferredLightsImpl calls OnEnter/OnExit.
     LightSorter::Initialize();
@@ -1484,7 +1484,7 @@ extern "C"
             g_includeDirWatcher.reset();
         }
         // Stop the background precompile worker BEFORE we release any D3D11
-        // resources — a worker mid-CompileShader_Internal could otherwise
+        // resources ? a worker mid-CompileShader_Internal could otherwise
         // call CreatePixelShader on a torn-down device.
         if (g_precompileWorker) {
             g_precompileWorker->Stop();

@@ -2,6 +2,7 @@
 #include "ShadowTelemetry.h"
 #include "PhaseTelemetry.h"
 #include "Global.h"
+#include "hooks.h"
 
 #include <array>
 #include <chrono>
@@ -352,12 +353,11 @@ REX::W32::ID3D11DepthStencilView* ActiveShadowDSV(const Key& key) noexcept
 REX::W32::ID3D11DeviceContext* ActiveD3DContext() noexcept
 {
     void* context = nullptr;
-    if (ptr_BSGraphicsTLSIndex.address() >= 0x140000000ull) {
-        const auto tlsIndex = *ptr_BSGraphicsTLSIndex;
+    const auto tlsIndex = *ptr_BSGraphicsTLSIndex;
         auto** tlsSlots = reinterpret_cast<void**>(__readgsqword(0x58));
         auto* tlsBase = tlsSlots ? static_cast<std::byte*>(tlsSlots[tlsIndex]) : nullptr;
         context = ReadField<void*>(tlsBase, kBSGraphicsTLSD3DContextOffset);
-    }
+    
 
     if (context) {
         return static_cast<REX::W32::ID3D11DeviceContext*>(context);
@@ -416,14 +416,13 @@ REX::W32::ID3D11DepthStencilView* ActiveShadowDSVFromRendererState(const Key& ke
 void* ActiveRendererShadowState() noexcept
 {
     void* context = nullptr;
-    if (ptr_BSGraphicsTLSIndex.address() >= 0x140000000ull) {
-        const auto tlsIndex = *ptr_BSGraphicsTLSIndex;
+    const auto tlsIndex = *ptr_BSGraphicsTLSIndex;
         auto** tlsSlots = reinterpret_cast<void**>(__readgsqword(0x58));
         auto* tlsBase = tlsSlots ? static_cast<std::byte*>(tlsSlots[tlsIndex]) : nullptr;
         context = ReadField<void*>(tlsBase, kBSGraphicsTLSContextOffset);
-    }
+    
 
-    if (!context && ptr_BSGraphicsDefaultContext.address() >= 0x140000000ull) {
+    if (!context) {
         context = *ptr_BSGraphicsDefaultContext;
     }
 
@@ -1237,10 +1236,7 @@ void* ConstructScratchAccumulator(std::byte* storage, bool& constructed, std::ui
     if (constructed) {
         return storage;
     }
-
-    if (ptr_BSShaderAccumulatorCtor.address() < 0x140000000ull) {
-        return nullptr;
-    }
+
 
     std::memset(storage, 0, kAccumulatorSize);
     void* accumulator = ptr_BSShaderAccumulatorCtor(storage, kShadowAccumulatorCtorMode);
@@ -1252,16 +1248,8 @@ void* ConstructScratchAccumulator(std::byte* storage, bool& constructed, std::ui
     // rendering. Keep one plugin-owned reference so SetAccumulator(nullptr)
     // cannot drive the count to zero and call DeleteThis on our static storage.
     WriteField<std::uint32_t>(accumulator, kAccumulatorRefCountOffset, 1);
-    if (ptr_SetRenderMode.address() >= 0x140000000ull) {
-        ptr_SetRenderMode(accumulator, kShadowRenderMode);
-    } else {
-        WriteField<std::uint32_t>(accumulator, kAccumulatorRenderModeOffset, kShadowRenderMode);
-    }
-    if (ptr_SetDepthPassIndex.address() >= 0x140000000ull) {
-        ptr_SetDepthPassIndex(accumulator, splitIndex);
-    } else {
-        WriteField<std::uint32_t>(accumulator, kAccumulatorDepthPassIndexOffset, splitIndex);
-    }
+    ptr_SetRenderMode(accumulator, kShadowRenderMode);
+    ptr_SetDepthPassIndex(accumulator, splitIndex);
     constructed = true;
     return accumulator;
 }
@@ -1290,20 +1278,10 @@ void ClearScratchAccumulator(void* accumulator) noexcept
         return;
     }
 
-    if (ptr_ClearActivePasses.address() >= 0x140000000ull) {
-        ptr_ClearActivePasses(accumulator, true);
-    }
-    if (ptr_ClearRenderPasses.address() >= 0x140000000ull) {
-        ptr_ClearRenderPasses(accumulator);
-    }
-    if (ptr_SetShadowSceneNode.address() >= 0x140000000ull) {
-        ptr_SetShadowSceneNode(accumulator, nullptr);
-    } else {
-        WriteField<void*>(accumulator, kAccumulatorActiveShadowSceneNodeOffset, nullptr);
-    }
-    if (ptr_SetShadowLight.address() >= 0x140000000ull) {
-        ptr_SetShadowLight(accumulator, nullptr);
-    }
+    ptr_ClearActivePasses(accumulator, true);
+    ptr_ClearRenderPasses(accumulator);
+    ptr_SetShadowSceneNode(accumulator, nullptr);
+    ptr_SetShadowLight(accumulator, nullptr);
 }
 
 void ConfigureScratchAccumulator(void* scratch, void* vanilla, std::uint32_t slotIndex) noexcept
@@ -1314,24 +1292,12 @@ void ConfigureScratchAccumulator(void* scratch, void* vanilla, std::uint32_t slo
 
     ClearScratchAccumulator(scratch);
     const auto renderMode = ReadField<std::uint32_t>(vanilla, kAccumulatorRenderModeOffset, kShadowRenderMode);
-    if (ptr_SetRenderMode.address() >= 0x140000000ull) {
-        ptr_SetRenderMode(scratch, renderMode);
-    } else {
-        WriteField<std::uint32_t>(scratch, kAccumulatorRenderModeOffset, renderMode);
-    }
+    ptr_SetRenderMode(scratch, renderMode);
 
     auto* shadowSceneNode = ReadField<void*>(vanilla, kAccumulatorActiveShadowSceneNodeOffset);
-    if (ptr_SetShadowSceneNode.address() >= 0x140000000ull) {
-        ptr_SetShadowSceneNode(scratch, shadowSceneNode);
-    } else {
-        WriteField<void*>(scratch, kAccumulatorActiveShadowSceneNodeOffset, shadowSceneNode);
-    }
+    ptr_SetShadowSceneNode(scratch, shadowSceneNode);
 
-    if (ptr_SetDepthPassIndex.address() >= 0x140000000ull) {
-        ptr_SetDepthPassIndex(scratch, slotIndex);
-    } else {
-        WriteField<std::uint32_t>(scratch, kAccumulatorDepthPassIndexOffset, slotIndex);
-    }
+    ptr_SetDepthPassIndex(scratch, slotIndex);
 
     // Copy the small render-flag/silhouette block, but leave owned containers
     // and renderer internals on the scratch accumulator's own storage.
@@ -2591,11 +2557,7 @@ void HookedRenderShadowMapFlush(void* renderer)
 }
 
 bool PatchCall(const char* label, std::uintptr_t callSite, void* hook, std::uintptr_t* outOriginal)
-{
-    if (callSite < 0x140000000ull) {
-        REX::WARN("ShadowTelemetry::Initialize: {} call site failed to resolve ({:#x})", label, callSite);
-        return false;
-    }
+{
     REL::Relocation<std::uintptr_t> rel{ callSite };
     const auto original = rel.write_call<5>(hook);
     if (outOriginal && !*outOriginal) {
@@ -2604,50 +2566,6 @@ bool PatchCall(const char* label, std::uintptr_t callSite, void* hook, std::uint
     REX::INFO("ShadowTelemetry::Initialize: patched {} call site @ {:#x} -> original {:#x}",
               label, callSite, original);
     return true;
-}
-
-template <class T>
-T CreateBranchGateway5(REL::Relocation<std::uintptr_t>& target, std::size_t prologueSize, void* hook)
-{
-    const auto targetAddress = target.address();
-    if (targetAddress < 0x140000000ull) {
-        return nullptr;
-    }
-
-    auto& trampoline = REL::GetTrampoline();
-    auto* gateway = static_cast<std::byte*>(trampoline.allocate(prologueSize + sizeof(REL::ASM::JMP14)));
-    if (!gateway) {
-        return nullptr;
-    }
-
-    std::memcpy(gateway, reinterpret_cast<void*>(targetAddress), prologueSize);
-
-    if (prologueSize >= 5 && gateway[0] == std::byte{ 0xE9 }) {
-        std::int32_t oldRel32 = 0;
-        std::memcpy(&oldRel32, gateway + 1, sizeof(oldRel32));
-        const auto absoluteDest = static_cast<std::int64_t>(targetAddress) + 5 + oldRel32;
-        const auto newRel64 = absoluteDest - (reinterpret_cast<std::int64_t>(gateway) + 5);
-        if (newRel64 < (std::numeric_limits<std::int32_t>::min)() ||
-            newRel64 > (std::numeric_limits<std::int32_t>::max)()) {
-            REX::WARN(
-                "ShadowTelemetry::CreateBranchGateway5: captured JMP destination {:#x} is unreachable from gateway {} via rel32",
-                static_cast<std::uintptr_t>(absoluteDest),
-                static_cast<void*>(gateway));
-            return nullptr;
-        }
-        const auto newRel32 = static_cast<std::int32_t>(newRel64);
-        std::memcpy(gateway + 1, &newRel32, sizeof(newRel32));
-    } else if (prologueSize >= 5 && gateway[0] == std::byte{ 0xE8 }) {
-        REX::WARN(
-            "ShadowTelemetry::CreateBranchGateway5: captured CALL rel32 at target {:#x} cannot be safely relocated",
-            targetAddress);
-        return nullptr;
-    }
-
-    const REL::ASM::JMP14 jumpBack{ targetAddress + prologueSize };
-    std::memcpy(gateway + prologueSize, &jumpBack, sizeof(jumpBack));
-    trampoline.write_jmp5(targetAddress, reinterpret_cast<std::uintptr_t>(hook));
-    return reinterpret_cast<T>(gateway);
 }
 
 }  // anonymous namespace
@@ -3004,13 +2922,9 @@ bool Initialize()
     std::uintptr_t originalFlush = 0;
     std::uintptr_t originalScene = 0;
 
-    if (SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON && !s_origDestroyRenderTargets) {
-        if (ptr_DestroyRenderTargets.address() < 0x140000000ull) {
-            REX::WARN("ShadowTelemetry::Initialize: RenderTargetManager::DestroyRenderTargets REL::ID failed to resolve");
-            return false;
-        }
+    if (SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON && !s_origDestroyRenderTargets) {
 
-        s_origDestroyRenderTargets = CreateBranchGateway5<RenderTargetManagerDestroyRenderTargets_t>(
+        s_origDestroyRenderTargets = Hooks::CreateBranchGateway5<RenderTargetManagerDestroyRenderTargets_t>(
             ptr_DestroyRenderTargets,
             kDestroyRenderTargetsPrologueSizeOG,
             reinterpret_cast<void*>(&HookedDestroyRenderTargets));
@@ -3021,13 +2935,9 @@ bool Initialize()
         REX::INFO("ShadowTelemetry::Initialize: RenderTargetManager::DestroyRenderTargets hook installed");
     }
 
-    if (SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON && !s_origAccumulateFromLists) {
-        if (ptr_AccumulateFromLists.address() < 0x140000000ull) {
-            REX::WARN("ShadowTelemetry::Initialize: BSShadowDirectionalLight::AccumulateFromLists REL::ID failed to resolve");
-            return false;
-        }
+    if (SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON && !s_origAccumulateFromLists) {
 
-        s_origAccumulateFromLists = CreateBranchGateway5<AccumulateFromLists_t>(
+        s_origAccumulateFromLists = Hooks::CreateBranchGateway5<AccumulateFromLists_t>(
             ptr_AccumulateFromLists,
             kAccumulateFromListsPrologueSizeOG,
             reinterpret_cast<void*>(&HookedAccumulateFromLists));

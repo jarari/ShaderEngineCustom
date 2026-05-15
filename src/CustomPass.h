@@ -329,7 +329,7 @@ public:
     size_t ResourceCount() const;
     size_t PassCount() const;
 
-    // Render the ImGui debug window. Called from Plugin.cpp's Present hook.
+    // Render the ImGui debug window. Implemented by the ImGui menu module.
     void DrawDebugOverlay();
 
 private:
