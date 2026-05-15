@@ -194,9 +194,9 @@ std::uint64_t ShadowCameraSignature(void* camera, std::uint32_t mapSlot) noexcep
     constexpr std::size_t kWorldToCamOffset = 0x120;
     constexpr std::size_t kFrustumOffset = 0x160;
     constexpr std::size_t kFrustumFloatCount = 9;  // NiFrustum + minNear + maxFarNearRatio
-    constexpr float kRotationStep = 0.0010f;
-    constexpr float kNearTranslationStep = 0.01f;
-    constexpr float kFarTranslationStep = 8.0f;
+    constexpr float kRotationStep = 0.1000f;
+    constexpr float kNearTranslationStep = 0.10f;
+    constexpr float kFarTranslationStep = 12.0f;
     constexpr float kFrustumStep = 4.0f;
     const float translationStep = mapSlot == 0 ? kNearTranslationStep : kFarTranslationStep;
 

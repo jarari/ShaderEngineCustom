@@ -1,0 +1,15 @@
+*.c text eol=crlf
+*.cc text eol=crlf
+*.cpp text eol=crlf
+*.cxx text eol=crlf
+*.h text eol=crlf
+*.hh text eol=crlf
+*.hpp text eol=crlf
+*.hxx text eol=crlf
+*.inl text eol=crlf
+*.lua text eol=lf
+*.md text eol=lf
+
+# Existing blob has mixed CRLF/LF/CR bytes; keep raw diffs until a deliberate
+# one-time renormalization commit is made.
+src/ShadowTelemetry.cpp -text
