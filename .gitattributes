@@ -9,7 +9,3 @@
 *.inl text eol=crlf
 *.lua text eol=lf
 *.md text eol=lf
-
-# Existing blob has mixed CRLF/LF/CR bytes; keep raw diffs until a deliberate
-# one-time renormalization commit is made.
-src/ShadowTelemetry.cpp -text

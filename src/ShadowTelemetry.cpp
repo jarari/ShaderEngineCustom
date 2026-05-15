@@ -357,7 +357,7 @@ REX::W32::ID3D11DeviceContext* ActiveD3DContext() noexcept
         auto** tlsSlots = reinterpret_cast<void**>(__readgsqword(0x58));
         auto* tlsBase = tlsSlots ? static_cast<std::byte*>(tlsSlots[tlsIndex]) : nullptr;
         context = ReadField<void*>(tlsBase, kBSGraphicsTLSD3DContextOffset);
-    
+
 
     if (context) {
         return static_cast<REX::W32::ID3D11DeviceContext*>(context);
@@ -420,7 +420,7 @@ void* ActiveRendererShadowState() noexcept
         auto** tlsSlots = reinterpret_cast<void**>(__readgsqword(0x58));
         auto* tlsBase = tlsSlots ? static_cast<std::byte*>(tlsSlots[tlsIndex]) : nullptr;
         context = ReadField<void*>(tlsBase, kBSGraphicsTLSContextOffset);
-    
+
 
     if (!context) {
         context = *ptr_BSGraphicsDefaultContext;
@@ -1236,7 +1236,7 @@ void* ConstructScratchAccumulator(std::byte* storage, bool& constructed, std::ui
     if (constructed) {
         return storage;
     }
-
+
 
     std::memset(storage, 0, kAccumulatorSize);
     void* accumulator = ptr_BSShaderAccumulatorCtor(storage, kShadowAccumulatorCtorMode);
@@ -2557,7 +2557,7 @@ void HookedRenderShadowMapFlush(void* renderer)
 }
 
 bool PatchCall(const char* label, std::uintptr_t callSite, void* hook, std::uintptr_t* outOriginal)
-{
+{
     REL::Relocation<std::uintptr_t> rel{ callSite };
     const auto original = rel.write_call<5>(hook);
     if (outOriginal && !*outOriginal) {
@@ -2922,7 +2922,7 @@ bool Initialize()
     std::uintptr_t originalFlush = 0;
     std::uintptr_t originalScene = 0;
 
-    if (SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON && !s_origDestroyRenderTargets) {
+    if (SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON && !s_origDestroyRenderTargets) {
 
         s_origDestroyRenderTargets = Hooks::CreateBranchGateway5<RenderTargetManagerDestroyRenderTargets_t>(
             ptr_DestroyRenderTargets,
@@ -2935,7 +2935,7 @@ bool Initialize()
         REX::INFO("ShadowTelemetry::Initialize: RenderTargetManager::DestroyRenderTargets hook installed");
     }
 
-    if (SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON && !s_origAccumulateFromLists) {
+    if (SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON && !s_origAccumulateFromLists) {
 
         s_origAccumulateFromLists = Hooks::CreateBranchGateway5<AccumulateFromLists_t>(
             ptr_AccumulateFromLists,
