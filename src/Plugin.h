@@ -424,8 +424,78 @@ struct OutputCountRequirement {
     int value;
 };
 
+struct ReplacementTextureBinding {
+    int slot = -1;
+    std::filesystem::path file;
+    REX::W32::ID3D11ShaderResourceView* srv = nullptr;
+    bool loadTried = false;
+    bool loadFailed = false;
+
+    void Release()
+    {
+        if (srv) {
+            srv->Release();
+            srv = nullptr;
+        }
+        loadTried = false;
+        loadFailed = false;
+    }
+};
+
 // Shader definitions from INI file
 struct ShaderDefinition {
+    ShaderDefinition() = default;
+    ShaderDefinition(const ShaderDefinition&) = delete;
+    ShaderDefinition& operator=(const ShaderDefinition&) = delete;
+    ShaderDefinition(ShaderDefinition&& other) noexcept
+        : id(std::move(other.id))
+        , active(other.active)
+        , priority(other.priority)
+        , type(other.type)
+        , shaderUID(std::move(other.shaderUID))
+        , hash(std::move(other.hash))
+        , asmHash(std::move(other.asmHash))
+        , sizeRequirements(std::move(other.sizeRequirements))
+        , bufferSizes(std::move(other.bufferSizes))
+        , textureSlots(std::move(other.textureSlots))
+        , textureDimensions(std::move(other.textureDimensions))
+        , textureSlotMask(other.textureSlotMask)
+        , textureDimensionMask(other.textureDimensionMask)
+        , inputTextureCountRequirements(std::move(other.inputTextureCountRequirements))
+        , inputCountRequirements(std::move(other.inputCountRequirements))
+        , inputMask(other.inputMask)
+        , outputCountRequirements(std::move(other.outputCountRequirements))
+        , outputMask(other.outputMask)
+        , shaderFile(std::move(other.shaderFile))
+        , buggy(other.buggy)
+        , compiledShader(other.compiledShader)
+        , loadedPixelShader(other.loadedPixelShader)
+        , loadedVertexShader(other.loadedVertexShader)
+        , replacementTextures(std::move(other.replacementTextures))
+        , usesGFXInjected(other.usesGFXInjected)
+        , usesGFXDrawTag(other.usesGFXDrawTag)
+        , usesGFXModularFloats(other.usesGFXModularFloats)
+        , usesGFXModularInts(other.usesGFXModularInts)
+        , usesGFXModularBools(other.usesGFXModularBools)
+        , compileMutex(std::move(other.compileMutex))
+        , hlslFileWatcher(std::move(other.hlslFileWatcher))
+        , log(other.log)
+        , dump(other.dump)
+        , lightCullRadiusScaleValue(std::move(other.lightCullRadiusScaleValue))
+        , lightCullRadiusScaleResolved(other.lightCullRadiusScaleResolved)
+        , lightCullRadiusScaleGpuRef(other.lightCullRadiusScaleGpuRef)
+        , lightCullRadiusScaleResolveLogged(other.lightCullRadiusScaleResolveLogged)
+        , shaderValues(std::move(other.shaderValues))
+    {
+        other.compiledShader = nullptr;
+        other.loadedPixelShader = nullptr;
+        other.loadedVertexShader = nullptr;
+        for (auto& binding : other.replacementTextures) {
+            binding.srv = nullptr;
+        }
+    }
+    ShaderDefinition& operator=(ShaderDefinition&& other) = delete;
+
     std::string id;
     bool active = false;
     int priority = 0;
@@ -452,6 +522,7 @@ struct ShaderDefinition {
     ID3DBlob* compiledShader = nullptr;
     REX::W32::ID3D11PixelShader* loadedPixelShader = nullptr;
     REX::W32::ID3D11VertexShader* loadedVertexShader = nullptr;
+    std::vector<ReplacementTextureBinding> replacementTextures;
     bool usesGFXInjected = false;
     bool usesGFXDrawTag = false;
     bool usesGFXModularFloats = false;
@@ -488,6 +559,25 @@ struct ShaderDefinition {
     bool         lightCullRadiusScaleResolveLogged = false;    // one-shot warn
     // Collection of shader values defined for this shader, keyed by the byte offset in the SRV buffer
     std::vector<ShaderValue> shaderValues;
+
+    ~ShaderDefinition()
+    {
+        if (loadedPixelShader) {
+            loadedPixelShader->Release();
+            loadedPixelShader = nullptr;
+        }
+        if (loadedVertexShader) {
+            loadedVertexShader->Release();
+            loadedVertexShader = nullptr;
+        }
+        if (compiledShader) {
+            compiledShader->Release();
+            compiledShader = nullptr;
+        }
+        for (auto& binding : replacementTextures) {
+            binding.Release();
+        }
+    }
 };
 
 // Shader DB Entry primary key is the original shader pointer

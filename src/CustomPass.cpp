@@ -361,6 +361,7 @@ void Registry::Reset() {
     drawPassCacheGeneration.fetch_add(1, std::memory_order_acq_rel);
     drawBatchCache.clear();
     hasDrawTimePasses.store(false, std::memory_order_release);
+    hasGlobalResourceBindings.store(false, std::memory_order_release);
     snapshotCache.Release();
     for (auto& p : passes) p->Release();
     passes.clear();
@@ -433,6 +434,9 @@ bool Registry::ParseResourceSection(const std::string& name,
     std::lock_guard lk(mutex);
     Resource* raw = res.get();
     resourceIndex[name] = raw;
+    if (raw->spec.srvSlot >= 0) {
+        hasGlobalResourceBindings.store(true, std::memory_order_release);
+    }
     resources.push_back(std::move(res));
     REX::INFO("CustomPass: registered customResource '{}' (slot t{})", name, raw->spec.srvSlot);
     return true;
@@ -1538,6 +1542,10 @@ void Registry::BindGlobalResourceSRVs(REX::W32::ID3D11DeviceContext* context, bo
         if (pixelStage) context->PSSetShaderResources((UINT)res->spec.srvSlot, 1, &res->srv);
         else            context->VSSetShaderResources((UINT)res->spec.srvSlot, 1, &res->srv);
     }
+}
+
+bool Registry::HasGlobalResourceBindings() const noexcept {
+    return hasGlobalResourceBindings.load(std::memory_order_acquire);
 }
 
 void Registry::EnqueuePrecompileJobs() {

@@ -721,6 +721,34 @@ int LoadShaderDefinitionsFromFile(const std::filesystem::path& shaderFolderPath,
                         def.shaderFile = shaderPath;
                     }
                 }
+                // Bind file-backed textures whenever this definition's replacement shader is active.
+                // Format: bindTexture=40:foo.dds,41:bar.png. Paths are relative to this shader folder.
+                else if (lowerKey == "bindtexture" || lowerKey == "replacementtexture" || lowerKey == "shadertexture") {
+                    std::istringstream ss(value);
+                    std::string token;
+                    while (std::getline(ss, token, ',')) {
+                        const size_t colon = token.find(':');
+                        if (colon == std::string::npos) {
+                            REX::WARN("LoadShaderDefinitionsFromFile: Invalid bindTexture entry for {}: {}", shaderId, token);
+                            continue;
+                        }
+
+                        ReplacementTextureBinding binding{};
+                        try {
+                            binding.slot = std::stoi(token.substr(0, colon));
+                        } catch (...) {
+                            REX::WARN("LoadShaderDefinitionsFromFile: Invalid bindTexture slot for {}: {}", shaderId, token);
+                            continue;
+                        }
+
+                        std::filesystem::path texturePath = token.substr(colon + 1);
+                        if (texturePath.is_relative()) {
+                            texturePath = shaderFolderPath / texturePath;
+                        }
+                        binding.file = texturePath;
+                        def.replacementTextures.push_back(std::move(binding));
+                    }
+                }
                 // Default to false
                 else if (lowerKey == "log") {
                     if (ToLower(value) == "true" || value == "1") {

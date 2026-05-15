@@ -825,6 +825,7 @@ REX::W32::ID3D11VertexShader* D3D11OnVSSetShader_Internal(
                 }
                 vertexShader = replacementVertexShader;
                 ShaderResources::BindInjectedVertexShaderResources(context);
+                ShaderResources::BindReplacementTextureResources(context, matchedDefinition, /*pixelStage=*/false);
             } else {
                 if (matchedDefinition && !matchedDefinition->buggy) {
                     if (DEBUGGING) {
@@ -838,6 +839,7 @@ REX::W32::ID3D11VertexShader* D3D11OnVSSetShader_Internal(
                         }
                         vertexShader = g_ShaderDB.GetReplacementShader(vertexShader);
                         ShaderResources::BindInjectedVertexShaderResources(context);
+                        ShaderResources::BindReplacementTextureResources(context, matchedDefinition, /*pixelStage=*/false);
                     } else {
                         REX::WARN("MyVSSetShader: Failed to compile replacement shader for definition '{}'", matchedDefinition->id);
                         matchedDefinition->buggy = true;

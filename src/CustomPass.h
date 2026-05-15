@@ -320,6 +320,7 @@ public:
     // Called from BindInjectedPixelShaderResources to keep customResource
     // SRVs bound on their declared slots after engine state changes.
     void BindGlobalResourceSRVs(REX::W32::ID3D11DeviceContext* context, bool pixelStage);
+    bool HasGlobalResourceBindings() const noexcept;
 
     // Resolve a hook id (existing [shaderId] section) to its first ShaderUID,
     // used by triggerHookId. Called once after Shader.ini load completes.
@@ -372,6 +373,7 @@ private:
     std::unordered_map<std::string, Resource*>      resourceIndex;  // by name
     SnapshotSrvCache                                snapshotCache;
     std::atomic_bool                                hasDrawTimePasses{ false };
+    std::atomic_bool                                hasGlobalResourceBindings{ false };
     std::atomic<std::uint64_t>                      drawPassCacheGeneration{ 1 };
     mutable std::mutex                              mutex;
     uint32_t                                        currentFrame = 0;

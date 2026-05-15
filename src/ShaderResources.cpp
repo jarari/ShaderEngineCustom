@@ -3,6 +3,7 @@
 #include <CustomPass.h>
 #include <Plugin.h>
 #include <ShaderResources.h>
+#include <wincodec.h>
 
 // Global custom resource to pass data to shaders.
 REX::W32::ID3D11Buffer* g_customSRVBuffer = nullptr;
@@ -37,6 +38,7 @@ namespace ShaderResources
         bool g_activeReplacementPixelShaderUsesModularInts = false;
         bool g_activeReplacementPixelShaderUsesModularBools = false;
         bool g_activeReplacementPixelShaderNeedsResourceRebind = false;
+        ShaderDefinition* g_activeReplacementPixelShaderDef = nullptr;
 
         thread_local std::uint32_t g_commandBufferReplayDepth = 0;
 
@@ -152,7 +154,176 @@ namespace ShaderResources
                     def->usesGFXDrawTag ||
                     def->usesGFXModularFloats ||
                     def->usesGFXModularInts ||
-                    def->usesGFXModularBools);
+                    def->usesGFXModularBools ||
+                    !def->replacementTextures.empty() ||
+                    CustomPass::g_registry.HasGlobalResourceBindings());
+        }
+
+        bool IsSupportedTextureExtension(const std::filesystem::path& path)
+        {
+            const auto ext = ToLower(path.extension().string());
+            return ext == ".dds" || ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".bmp";
+        }
+
+        IWICImagingFactory* GetWICFactory()
+        {
+            static IWICImagingFactory* factory = nullptr;
+            static std::once_flag initOnce;
+            std::call_once(initOnce, [] {
+                const HRESULT coHr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+                if (FAILED(coHr) && coHr != RPC_E_CHANGED_MODE) {
+                    REX::WARN("ReplacementTexture: CoInitializeEx failed (0x{:08X})", static_cast<unsigned>(coHr));
+                }
+
+                const HRESULT hr = CoCreateInstance(
+                    CLSID_WICImagingFactory,
+                    nullptr,
+                    CLSCTX_INPROC_SERVER,
+                    IID_PPV_ARGS(&factory));
+                if (FAILED(hr)) {
+                    REX::WARN("ReplacementTexture: failed to create WIC factory (0x{:08X})", static_cast<unsigned>(hr));
+                    factory = nullptr;
+                }
+            });
+            return factory;
+        }
+
+        bool CreateWICTextureSRV(REX::W32::ID3D11Device* device,
+                                 const std::filesystem::path& file,
+                                 REX::W32::ID3D11ShaderResourceView** outSRV)
+        {
+            if (!device || !outSRV) {
+                return false;
+            }
+            *outSRV = nullptr;
+
+            IWICImagingFactory* factory = GetWICFactory();
+            if (!factory) {
+                return false;
+            }
+
+            IWICBitmapDecoder* decoder = nullptr;
+            HRESULT hr = factory->CreateDecoderFromFilename(
+                file.c_str(),
+                nullptr,
+                GENERIC_READ,
+                WICDecodeMetadataCacheOnLoad,
+                &decoder);
+            if (FAILED(hr)) {
+                REX::WARN("ReplacementTexture: WIC failed to open {} (0x{:08X})", file.string(), static_cast<unsigned>(hr));
+                return false;
+            }
+
+            IWICBitmapFrameDecode* frame = nullptr;
+            hr = decoder->GetFrame(0, &frame);
+            decoder->Release();
+            if (FAILED(hr) || !frame) {
+                REX::WARN("ReplacementTexture: WIC failed to read first frame from {} (0x{:08X})", file.string(), static_cast<unsigned>(hr));
+                return false;
+            }
+
+            UINT width = 0;
+            UINT height = 0;
+            hr = frame->GetSize(&width, &height);
+            if (FAILED(hr) || width == 0 || height == 0) {
+                frame->Release();
+                REX::WARN("ReplacementTexture: WIC invalid texture size for {} (0x{:08X})", file.string(), static_cast<unsigned>(hr));
+                return false;
+            }
+
+            IWICFormatConverter* converter = nullptr;
+            hr = factory->CreateFormatConverter(&converter);
+            if (FAILED(hr) || !converter) {
+                frame->Release();
+                REX::WARN("ReplacementTexture: WIC failed to create format converter for {} (0x{:08X})", file.string(), static_cast<unsigned>(hr));
+                return false;
+            }
+
+            hr = converter->Initialize(
+                frame,
+                GUID_WICPixelFormat32bppRGBA,
+                WICBitmapDitherTypeNone,
+                nullptr,
+                0.0,
+                WICBitmapPaletteTypeCustom);
+            frame->Release();
+            if (FAILED(hr)) {
+                converter->Release();
+                REX::WARN("ReplacementTexture: WIC failed to convert {} to RGBA8 (0x{:08X})", file.string(), static_cast<unsigned>(hr));
+                return false;
+            }
+
+            const UINT stride = width * 4;
+            const UINT imageSize = stride * height;
+            std::vector<std::uint8_t> pixels(imageSize);
+            hr = converter->CopyPixels(nullptr, stride, imageSize, pixels.data());
+            converter->Release();
+            if (FAILED(hr)) {
+                REX::WARN("ReplacementTexture: WIC failed to copy pixels from {} (0x{:08X})", file.string(), static_cast<unsigned>(hr));
+                return false;
+            }
+
+            REX::W32::D3D11_TEXTURE2D_DESC desc{};
+            desc.width = width;
+            desc.height = height;
+            desc.mipLevels = 1;
+            desc.arraySize = 1;
+            desc.format = REX::W32::DXGI_FORMAT_R8G8B8A8_UNORM;
+            desc.sampleDesc.count = 1;
+            desc.usage = REX::W32::D3D11_USAGE_DEFAULT;
+            desc.bindFlags = REX::W32::D3D11_BIND_SHADER_RESOURCE;
+
+            REX::W32::D3D11_SUBRESOURCE_DATA initial{};
+            initial.sysMem = pixels.data();
+            initial.sysMemPitch = stride;
+
+            REX::W32::ID3D11Texture2D* texture = nullptr;
+            hr = device->CreateTexture2D(&desc, &initial, &texture);
+            if (FAILED(hr) || !texture) {
+                REX::WARN("ReplacementTexture: CreateTexture2D failed for {} (0x{:08X})", file.string(), static_cast<unsigned>(hr));
+                return false;
+            }
+
+            hr = device->CreateShaderResourceView(texture, nullptr, outSRV);
+            texture->Release();
+            if (FAILED(hr) || !*outSRV) {
+                REX::WARN("ReplacementTexture: CreateShaderResourceView failed for {} (0x{:08X})", file.string(), static_cast<unsigned>(hr));
+                return false;
+            }
+
+            return true;
+        }
+
+        bool EnsureReplacementTextureSRV(REX::W32::ID3D11Device* device, ReplacementTextureBinding& binding)
+        {
+            if (!device || binding.slot < 0) {
+                return false;
+            }
+            if (binding.srv) {
+                return true;
+            }
+            if (binding.loadFailed) {
+                return false;
+            }
+
+            binding.loadTried = true;
+            if (!std::filesystem::exists(binding.file)) {
+                REX::WARN("ReplacementTexture: file not found: {}", binding.file.string());
+                binding.loadFailed = true;
+                return false;
+            }
+            if (!IsSupportedTextureExtension(binding.file)) {
+                REX::WARN("ReplacementTexture: unsupported texture extension: {}", binding.file.string());
+                binding.loadFailed = true;
+                return false;
+            }
+
+            if (!CreateWICTextureSRV(device, binding.file, &binding.srv)) {
+                binding.loadFailed = true;
+                return false;
+            }
+            REX::INFO("ReplacementTexture: loaded {} into t{}", binding.file.string(), binding.slot);
+            return true;
         }
 
         void BindCustomShaderResources(REX::W32::ID3D11DeviceContext* context,
@@ -376,9 +547,10 @@ namespace ShaderResources
             } else if (DEBUGGING) {
                 REX::WARN("BindInjectedPixelShaderResources: No depth SRV available for t{}", DEPTHBUFFER_SLOT);
             }
-
-            CustomPass::g_registry.BindGlobalResourceSRVs(context, /*pixelStage=*/true);
         }
+
+        CustomPass::g_registry.BindGlobalResourceSRVs(context, /*pixelStage=*/true);
+        BindReplacementTextureResources(context, g_activeReplacementPixelShaderDef, /*pixelStage=*/true);
 
         g_bindingInjectedPixelResources = false;
     }
@@ -391,6 +563,35 @@ namespace ShaderResources
 
         BindCustomShaderResources(context, false, true, false, true, true, true);
         CustomPass::g_registry.BindGlobalResourceSRVs(context, /*pixelStage=*/false);
+    }
+
+    void BindReplacementTextureResources(
+        REX::W32::ID3D11DeviceContext* context,
+        ShaderDefinition* def,
+        bool pixelStage)
+    {
+        if (!context || !def || def->replacementTextures.empty()) {
+            return;
+        }
+
+        REX::W32::ID3D11Device* device = nullptr;
+        context->GetDevice(&device);
+        if (!device) {
+            return;
+        }
+
+        for (auto& binding : def->replacementTextures) {
+            if (binding.slot < 0 || !EnsureReplacementTextureSRV(device, binding)) {
+                continue;
+            }
+            if (pixelStage) {
+                context->PSSetShaderResources(static_cast<UINT>(binding.slot), 1, &binding.srv);
+            } else {
+                context->VSSetShaderResources(static_cast<UINT>(binding.slot), 1, &binding.srv);
+            }
+        }
+
+        device->Release();
     }
 
     REX::W32::ID3D11ShaderResourceView* GetDepthBufferSRV_Internal()
@@ -499,6 +700,7 @@ namespace ShaderResources
     void SetActiveReplacementPixelShaderUsage(const ShaderDefinition* def, bool active) noexcept
     {
         g_activeReplacementPixelShader = active;
+        g_activeReplacementPixelShaderDef = active ? const_cast<ShaderDefinition*>(def) : nullptr;
         g_activeReplacementPixelShaderUsesGFXInjected = active && def && def->usesGFXInjected;
         g_activeReplacementPixelShaderUsesDrawTag = active && def && def->usesGFXDrawTag;
         g_activeReplacementPixelShaderUsesModularFloats = active && def && def->usesGFXModularFloats;
