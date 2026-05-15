@@ -89,6 +89,10 @@ bool SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON = false;
 // Custom resource view slot in shader
 UINT CUSTOMBUFFER_SLOT = 31;
 UINT DRAWTAG_SLOT = 26;
+std::vector<RaceGroupFormRef> g_raceGroupFormRefs;
+std::unordered_map<std::uint32_t, std::uint32_t> g_raceGroupMaskByRaceFormID;
+std::shared_mutex g_raceGroupLock;
+bool g_raceGroupsResolved = false;
 // Packed shader settings resource view slots
 UINT MODULAR_FLOATS_SLOT = 29;
 UINT MODULAR_INTS_SLOT = 28;
@@ -312,6 +316,55 @@ bool SaveShaderEngineConfig(std::string* errorMessage)
 uint32_t ParseHexFormID(const std::string &hexStr)
 {
     return static_cast<uint32_t>(std::stoul(hexStr, nullptr, 16));
+}
+
+std::optional<std::uint32_t> ParseRaceGroupIndex(const std::string& lowerKey)
+{
+    constexpr std::string_view prefix = "race_group_";
+    if (lowerKey.rfind(prefix, 0) != 0) {
+        return std::nullopt;
+    }
+
+    const std::string suffix = lowerKey.substr(prefix.size());
+    if (suffix.empty() ||
+        !std::all_of(suffix.begin(), suffix.end(), [](unsigned char c) { return std::isdigit(c); })) {
+        return std::nullopt;
+    }
+
+    const auto index = static_cast<std::uint32_t>(std::stoul(suffix));
+    return index < 32 ? std::make_optional(index) : std::nullopt;
+}
+
+std::vector<RaceGroupFormRef> ParseRaceGroupFormRefs(std::uint32_t groupIndex, const std::string& value)
+{
+    std::vector<RaceGroupFormRef> refs;
+    const std::uint32_t groupMask = 1u << groupIndex;
+    std::stringstream ss(value);
+    std::string token;
+    while (std::getline(ss, token, ',')) {
+        if (token.empty()) {
+            continue;
+        }
+
+        const auto sep = token.find('|');
+        if (sep == std::string::npos || sep == 0 || sep + 1 >= token.size()) {
+            REX::WARN("LoadConfig: Invalid RACE_GROUP_{} entry '{}'", groupIndex, token);
+            continue;
+        }
+
+        RaceGroupFormRef ref;
+        ref.pluginName = token.substr(0, sep);
+        ref.groupMask = groupMask;
+        try {
+            ref.formID = static_cast<std::uint32_t>(std::stoul(token.substr(sep + 1), nullptr, 0));
+        } catch (...) {
+            REX::WARN("LoadConfig: Invalid RACE_GROUP_{} FormID '{}'", groupIndex, token);
+            continue;
+        }
+
+        refs.push_back(std::move(ref));
+    }
+    return refs;
 }
 // Helper to enumerate directories
 std::vector<std::filesystem::path> GetSubdirectories(const std::filesystem::path& path) {
@@ -873,6 +926,7 @@ void LoadConfig(HMODULE hModule) {
     }
     // Parse main INI file for global settings
     std::string line;
+    std::vector<RaceGroupFormRef> parsedRaceGroupRefs;
     while (std::getline(file, line)) {
         auto[key, value] = GetKeyValueFromLine(line);
         if (key.empty()) continue;
@@ -929,6 +983,15 @@ void LoadConfig(HMODULE hModule) {
             } catch (...) {
                 REX::WARN("LoadConfig: Invalid DRAWTAG_SLOT value: {}. Using default: {}", value, DRAWTAG_SLOT);
             }
+            continue;
+        }
+        else if (auto groupIndex = ParseRaceGroupIndex(lowerKey)) {
+            auto refs = ParseRaceGroupFormRefs(*groupIndex, value);
+            REX::INFO("LoadConfig: RACE_GROUP_{} loaded {} entr{}", *groupIndex, refs.size(), refs.size() == 1 ? "y" : "ies");
+            parsedRaceGroupRefs.insert(
+                parsedRaceGroupRefs.end(),
+                std::make_move_iterator(refs.begin()),
+                std::make_move_iterator(refs.end()));
             continue;
         }
         else if (lowerKey == "modular_floats_slot") {
@@ -1090,6 +1153,13 @@ void LoadConfig(HMODULE hModule) {
         }
     }
     file.close();
+    {
+        std::unique_lock lock(g_raceGroupLock);
+        g_raceGroupFormRefs = std::move(parsedRaceGroupRefs);
+        g_raceGroupMaskByRaceFormID.clear();
+        g_raceGroupsResolved = false;
+        REX::INFO("LoadConfig: queued {} race group form reference(s)", g_raceGroupFormRefs.size());
+    }
     // Scan for shader definitions in subdirectories
     if (g_shaderFolderPath.empty()) {
         g_shaderFolderPath = configPath.parent_path() / "ShaderEngine";

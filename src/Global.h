@@ -77,6 +77,10 @@ extern std::filesystem::path g_commonShaderHeaderPath;
 // Global custom buffer data structure instance for updating CB13
 extern GFXBoosterAccessData g_customBufferData;
 extern DrawTagData g_drawTagData;
+extern std::vector<RaceGroupFormRef> g_raceGroupFormRefs;
+extern std::unordered_map<std::uint32_t, std::uint32_t> g_raceGroupMaskByRaceFormID;
+extern std::shared_mutex g_raceGroupLock;
+extern bool g_raceGroupsResolved;
 // Index into g_rendererData->renderTargets[] that the engine uses for the
 // G-buffer normal target. Bethesda's deferred renderer doesn't expose a
 // canonical name, and the index is not 100% stable across runtime versions,

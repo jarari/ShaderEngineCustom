@@ -159,8 +159,18 @@ struct alignas(16) DrawTagData
     // actor materialTag with equipment distinguish facegen meshes — e.g. for
     // toon face shading or eye-white tinting on custom races.
     float isHead;
-    float pad1;
-    float pad2;
+    // Bitmask populated from ShaderEngine.ini RACE_GROUP_N entries.
+    std::uint32_t raceGroupMask;
+    // Bit 0 = actor race was resolved. raceGroupMask==0 with this bit set means
+    // "known race, no configured group"; without it means unknown/unresolved.
+    std::uint32_t raceFlags;
+};
+
+struct RaceGroupFormRef
+{
+    std::string pluginName;
+    std::uint32_t formID = 0;
+    std::uint32_t groupMask = 0;
 };
 
 // Shader settings value

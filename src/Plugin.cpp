@@ -281,6 +281,46 @@ struct CommandBufferShaderResource
 };
 static_assert(sizeof(CommandBufferShaderResource) == 16);
 
+struct StaticDrawTagKey
+{
+    std::uint32_t materialTag = 0;
+    std::uint32_t isHead = 0;
+    std::uint32_t raceGroupMask = 0;
+    std::uint32_t raceFlags = 0;
+
+    bool operator==(const StaticDrawTagKey& rhs) const noexcept
+    {
+        return materialTag == rhs.materialTag &&
+               isHead == rhs.isHead &&
+               raceGroupMask == rhs.raceGroupMask &&
+               raceFlags == rhs.raceFlags;
+    }
+};
+
+struct StaticDrawTagKeyHash
+{
+    std::size_t operator()(const StaticDrawTagKey& key) const noexcept
+    {
+        std::size_t h = std::hash<std::uint32_t>{}(key.materialTag);
+        auto mix = [&h](std::uint32_t v) {
+            h ^= std::hash<std::uint32_t>{}(v) + 0x9e3779b9u + (h << 6) + (h >> 2);
+        };
+        mix(key.isHead);
+        mix(key.raceGroupMask);
+        mix(key.raceFlags);
+        return h;
+    }
+};
+
+struct StaticDrawTagResource
+{
+    REX::W32::ID3D11Buffer* buffer = nullptr;
+    REX::W32::ID3D11ShaderResourceView* srv = nullptr;
+};
+
+static std::unordered_map<StaticDrawTagKey, StaticDrawTagResource, StaticDrawTagKeyHash> g_staticDrawTagResources;
+static std::mutex g_staticDrawTagResourcesMutex;
+
 static REX::W32::ID3D11Buffer*              g_actorTagBuffer = nullptr;
 static REX::W32::ID3D11ShaderResourceView*  g_actorTagSRV = nullptr;
 static REX::W32::ID3D11Buffer*              g_unknownTagBuffer = nullptr;
@@ -312,7 +352,12 @@ static bool     g_inCombat = false;    // value sampled 30 frames ago
 // Global interior flag
 static bool     g_inInterior = false; // value sampled 30 frames ago
 
-static REX::W32::ID3D11ShaderResourceView* UpdateDrawTagBuffer(REX::W32::ID3D11DeviceContext* context, float materialTag, float isHead);
+static REX::W32::ID3D11ShaderResourceView* UpdateDrawTagBuffer(
+    REX::W32::ID3D11DeviceContext* context,
+    float materialTag,
+    float isHead,
+    std::uint32_t raceGroupMask,
+    std::uint32_t raceFlags);
 static void BindDrawTagForCurrentDraw(REX::W32::ID3D11DeviceContext* context, bool force = false);
 static void EnsureD3DDrawHooksPresent();
 // Forward decl: HookedBSBatchRendererDraw (defined further up the file via
@@ -328,14 +373,14 @@ namespace
         kActor = 1
     };
 
-    // Wrapper-side tag used to pick which static SRV a per-geometry wrapper
-    // points at. kActor and kActorHead both seed materialTag = kActor; they
-    // differ only in the isHead flag carried through the structured buffer.
-    enum class WrapperTag : std::uint8_t
+    constexpr std::uint32_t kDrawTagRaceResolved = 1u << 0;
+
+    struct DrawTagClassification
     {
-        kUnknown,
-        kActor,
-        kActorHead
+        float materialTag = static_cast<float>(DrawMaterialTag::kUnknown);
+        float isHead = 0.0f;
+        std::uint32_t raceGroupMask = 0;
+        std::uint32_t raceFlags = 0;
     };
 
     struct BSRenderPassLayout
@@ -1948,8 +1993,12 @@ namespace
 
     thread_local float g_currentDrawTag = static_cast<float>(DrawMaterialTag::kUnknown);
     thread_local float g_currentDrawTagIsHead = 0.0f;
+    thread_local std::uint32_t g_currentDrawTagRaceGroupMask = 0;
+    thread_local std::uint32_t g_currentDrawTagRaceFlags = 0;
     thread_local std::vector<float> g_drawTagStack;
     thread_local std::vector<float> g_drawTagIsHeadStack;
+    thread_local std::vector<std::uint32_t> g_drawTagRaceGroupMaskStack;
+    thread_local std::vector<std::uint32_t> g_drawTagRaceFlagsStack;
     std::unordered_set<RE::BSGeometry*> g_actorDrawTaggedGeometry;
     // Subset of g_actorDrawTaggedGeometry consisting of geometry reachable from
     // the actor's BSFaceGenNiNode subtree (head/face/eyes/hair). Used by the
@@ -1963,6 +2012,8 @@ namespace
     // actor scenegraph. Maintained alongside the full per-ref set during full
     // refreshes; mutated alone during head-only refreshes.
     std::unordered_map<std::uint32_t, std::unordered_set<RE::BSGeometry*>> g_actorHeadDrawTaggedGeometryByRef;
+    std::unordered_map<RE::BSGeometry*, std::uint32_t> g_actorRaceGroupMaskByGeometry;
+    std::unordered_map<RE::BSGeometry*, std::uint32_t> g_actorRaceFlagsByGeometry;
     std::shared_mutex g_actorDrawTaggedGeometryLock;
 
     template <class T>
@@ -2036,9 +2087,9 @@ namespace
         return reinterpret_cast<T>(gateway);
     }
 
-    void SetCommandBufferDrawTagWrapper(RE::BSGeometry* geometry, WrapperTag tag);
+    void SetCommandBufferDrawTagWrapper(RE::BSGeometry* geometry, const DrawTagClassification& classification);
     void ResetCommandBufferDrawTagWrappers();
-    FakeStructuredResource* GetCommandBufferDrawTagWrapper(RE::BSGeometry* geometry, WrapperTag tag);
+    FakeStructuredResource* GetCommandBufferDrawTagWrapper(RE::BSGeometry* geometry, const DrawTagClassification& classification);
     bool EnsureDrawTagWrapperResources();
 
     enum class PassOcclusionDomain : std::uint8_t
@@ -3020,6 +3071,85 @@ namespace
         }
     }
 
+    void ResolveRaceGroupsIfNeeded()
+    {
+        {
+            std::shared_lock lock(g_raceGroupLock);
+            if (g_raceGroupsResolved) {
+                return;
+            }
+        }
+
+        std::unique_lock lock(g_raceGroupLock);
+        if (g_raceGroupsResolved) {
+            return;
+        }
+
+        auto* dataHandler = RE::TESDataHandler::GetSingleton();
+        if (!dataHandler) {
+            return;
+        }
+
+        g_raceGroupMaskByRaceFormID.clear();
+        for (const auto& ref : g_raceGroupFormRefs) {
+            if (ref.pluginName.empty() || ref.formID == 0 || ref.groupMask == 0) {
+                continue;
+            }
+
+            auto* race = dataHandler->LookupForm<RE::TESRace>(ref.formID, ref.pluginName);
+            if (!race) {
+                REX::WARN(
+                    "ResolveRaceGroups: could not resolve race {}|0x{:X}",
+                    ref.pluginName,
+                    ref.formID);
+                continue;
+            }
+
+            g_raceGroupMaskByRaceFormID[race->GetFormID()] |= ref.groupMask;
+        }
+
+        g_raceGroupsResolved = true;
+        REX::INFO(
+            "ResolveRaceGroups: resolved {} configured race reference(s) into {} race form(s)",
+            g_raceGroupFormRefs.size(),
+            g_raceGroupMaskByRaceFormID.size());
+    }
+
+    std::pair<std::uint32_t, std::uint32_t> GetRaceTagForRace(RE::TESRace* race)
+    {
+        if (!race) {
+            return { 0, 0 };
+        }
+
+        ResolveRaceGroupsIfNeeded();
+
+        std::uint32_t mask = 0;
+        {
+            std::shared_lock lock(g_raceGroupLock);
+            auto it = g_raceGroupMaskByRaceFormID.find(race->GetFormID());
+            if (it != g_raceGroupMaskByRaceFormID.end()) {
+                mask = it->second;
+            }
+        }
+
+        return { mask, kDrawTagRaceResolved };
+    }
+
+    DrawTagClassification MakeUnknownDrawTagClassification()
+    {
+        return {};
+    }
+
+    DrawTagClassification MakeActorDrawTagClassification(bool isHead, std::uint32_t raceGroupMask, std::uint32_t raceFlags)
+    {
+        DrawTagClassification out{};
+        out.materialTag = static_cast<float>(DrawMaterialTag::kActor);
+        out.isHead = isHead ? 1.0f : 0.0f;
+        out.raceGroupMask = raceGroupMask;
+        out.raceFlags = raceFlags;
+        return out;
+    }
+
     void RemoveActorDrawTaggedGeometry(RE::NiAVObject* root)
     {
         if (!root) {
@@ -3031,13 +3161,15 @@ namespace
             if (geometry) {
                 g_actorDrawTaggedGeometry.erase(geometry);
                 g_actorHeadDrawTaggedGeometry.erase(geometry);
-                SetCommandBufferDrawTagWrapper(geometry, WrapperTag::kUnknown);
+                g_actorRaceGroupMaskByGeometry.erase(geometry);
+                g_actorRaceFlagsByGeometry.erase(geometry);
+                SetCommandBufferDrawTagWrapper(geometry, MakeUnknownDrawTagClassification());
             }
             return RE::BSVisit::BSVisitControl::kContinue;
         });
     }
 
-    void RefreshActorDrawTaggedGeometry(RE::TESObjectREFR* ref)
+    void RefreshActorDrawTaggedGeometry(RE::TESObjectREFR* ref, RE::TESRace* race)
     {
         if (!ref) {
             return;
@@ -3063,6 +3195,8 @@ namespace
             CollectActorDrawTaggedGeometry(reinterpret_cast<RE::NiAVObject*>(faceRaw), liveHeadGeometry);
         }
 
+        const auto [raceGroupMask, raceFlags] = GetRaceTagForRace(race);
+
         std::unique_lock lock(g_actorDrawTaggedGeometryLock);
         auto& currentSet = g_actorDrawTaggedGeometryByRef[handle];
 
@@ -3076,7 +3210,9 @@ namespace
             if (!liveGeometry.contains(*it)) {
                 g_actorDrawTaggedGeometry.erase(*it);
                 g_actorHeadDrawTaggedGeometry.erase(*it);
-                SetCommandBufferDrawTagWrapper(*it, WrapperTag::kUnknown);
+                g_actorRaceGroupMaskByGeometry.erase(*it);
+                g_actorRaceFlagsByGeometry.erase(*it);
+                SetCommandBufferDrawTagWrapper(*it, MakeUnknownDrawTagClassification());
                 it = currentSet.erase(it);
             } else {
                 ++it;
@@ -3087,12 +3223,13 @@ namespace
         // anything reachable from BSFaceGenNiNode, kActor otherwise.
         for (auto* geometry : liveGeometry) {
             const bool isHead = liveHeadGeometry.contains(geometry);
+            g_actorRaceGroupMaskByGeometry[geometry] = raceGroupMask;
+            g_actorRaceFlagsByGeometry[geometry] = raceFlags;
             if (currentSet.insert(geometry).second) {
                 g_actorDrawTaggedGeometry.insert(geometry);
                 if (isHead) {
                     g_actorHeadDrawTaggedGeometry.insert(geometry);
                 }
-                SetCommandBufferDrawTagWrapper(geometry, isHead ? WrapperTag::kActorHead : WrapperTag::kActor);
             } else {
                 // Pre-existing entry — head membership may have changed since
                 // the previous full refresh (e.g. a weapon attach that runs
@@ -3105,9 +3242,11 @@ namespace
                     } else {
                         g_actorHeadDrawTaggedGeometry.erase(geometry);
                     }
-                    SetCommandBufferDrawTagWrapper(geometry, isHead ? WrapperTag::kActorHead : WrapperTag::kActor);
                 }
             }
+            SetCommandBufferDrawTagWrapper(
+                geometry,
+                MakeActorDrawTagClassification(isHead, raceGroupMask, raceFlags));
         }
 
         currentHeadSet = std::move(liveHeadGeometry);
@@ -3117,7 +3256,7 @@ namespace
     // and diffs against the per-ref head subset. Body/equipment tags are never
     // touched, so high-frequency head events (FaceGen async completion,
     // expression rebuilds) cannot flicker body draws.
-    void RefreshActorHeadDrawTaggedGeometry(RE::TESObjectREFR* ref)
+    void RefreshActorHeadDrawTaggedGeometry(RE::TESObjectREFR* ref, RE::TESRace* race)
     {
         if (!ref) {
             return;
@@ -3136,6 +3275,8 @@ namespace
         std::unordered_set<RE::BSGeometry*> liveHeadGeometry;
         CollectActorDrawTaggedGeometry(reinterpret_cast<RE::NiAVObject*>(faceRaw), liveHeadGeometry);
 
+        const auto [raceGroupMask, raceFlags] = GetRaceTagForRace(race);
+
         std::unique_lock lock(g_actorDrawTaggedGeometryLock);
         auto& currentFullSet = g_actorDrawTaggedGeometryByRef[handle];
         auto& currentHeadSet = g_actorHeadDrawTaggedGeometryByRef[handle];
@@ -3147,7 +3288,9 @@ namespace
             if (!liveHeadGeometry.contains(*it)) {
                 g_actorDrawTaggedGeometry.erase(*it);
                 g_actorHeadDrawTaggedGeometry.erase(*it);
-                SetCommandBufferDrawTagWrapper(*it, WrapperTag::kUnknown);
+                g_actorRaceGroupMaskByGeometry.erase(*it);
+                g_actorRaceFlagsByGeometry.erase(*it);
+                SetCommandBufferDrawTagWrapper(*it, MakeUnknownDrawTagClassification());
                 currentFullSet.erase(*it);
                 it = currentHeadSet.erase(it);
             } else {
@@ -3161,9 +3304,27 @@ namespace
                 currentFullSet.insert(geometry);
                 g_actorDrawTaggedGeometry.insert(geometry);
                 g_actorHeadDrawTaggedGeometry.insert(geometry);
-                SetCommandBufferDrawTagWrapper(geometry, WrapperTag::kActorHead);
             }
+            g_actorRaceGroupMaskByGeometry[geometry] = raceGroupMask;
+            g_actorRaceFlagsByGeometry[geometry] = raceFlags;
+            SetCommandBufferDrawTagWrapper(
+                geometry,
+                MakeActorDrawTagClassification(true, raceGroupMask, raceFlags));
         }
+    }
+
+    void RefreshActorDrawTaggedGeometry(RE::Actor* actor)
+    {
+        RefreshActorDrawTaggedGeometry(
+            static_cast<RE::TESObjectREFR*>(actor),
+            actor ? actor->race : nullptr);
+    }
+
+    void RefreshActorHeadDrawTaggedGeometry(RE::Actor* actor)
+    {
+        RefreshActorHeadDrawTaggedGeometry(
+            static_cast<RE::TESObjectREFR*>(actor),
+            actor ? actor->race : nullptr);
     }
 
     void RefreshActorDrawTaggedGeometry(RE::BipedAnim* biped)
@@ -3173,14 +3334,9 @@ namespace
         }
 
         auto ref = biped->GetRequester().get();
-        RefreshActorDrawTaggedGeometry(ref.get());
+        auto* actor = ref ? ref->As<RE::Actor>() : nullptr;
+        RefreshActorDrawTaggedGeometry(actor);
     }
-
-    struct DrawTagClassification
-    {
-        float materialTag;
-        float isHead;
-    };
 
     DrawTagClassification ClassifyDrawTag(BSRenderPassLayout* pass)
     {
@@ -3198,22 +3354,32 @@ namespace
             if (g_actorHeadDrawTaggedGeometry.contains(pass->geometry)) {
                 out.isHead = 1.0f;
             }
+            if (auto it = g_actorRaceGroupMaskByGeometry.find(pass->geometry);
+                it != g_actorRaceGroupMaskByGeometry.end()) {
+                out.raceGroupMask = it->second;
+            }
+            if (auto it = g_actorRaceFlagsByGeometry.find(pass->geometry);
+                it != g_actorRaceFlagsByGeometry.end()) {
+                out.raceFlags = it->second;
+            }
         }
 
         return out;
     }
 
-    REX::W32::ID3D11ShaderResourceView* GetStaticDrawTagSRV(WrapperTag tag)
+    StaticDrawTagKey MakeStaticDrawTagKey(const DrawTagClassification& classification)
     {
-        switch (tag) {
-            case WrapperTag::kActor:     return g_actorTagSRV;
-            case WrapperTag::kActorHead: return g_actorHeadTagSRV;
-            case WrapperTag::kUnknown:
-            default:                     return g_unknownTagSRV;
-        }
+        return StaticDrawTagKey{
+            static_cast<std::uint32_t>(classification.materialTag + 0.5f),
+            static_cast<std::uint32_t>(classification.isHead + 0.5f),
+            classification.raceGroupMask,
+            classification.raceFlags
+        };
     }
 
-    void SetCommandBufferDrawTagWrapper(RE::BSGeometry* geometry, WrapperTag tag)
+    REX::W32::ID3D11ShaderResourceView* GetOrCreateStaticDrawTagSRV(const DrawTagClassification& classification);
+
+    void SetCommandBufferDrawTagWrapper(RE::BSGeometry* geometry, const DrawTagClassification& classification)
     {
         if (!geometry || !g_tagWrapperResourcesReady) {
             return;
@@ -3222,7 +3388,9 @@ namespace
         std::unique_lock lock(g_commandBufferDrawTagWrappersLock);
         auto it = g_commandBufferDrawTagWrappers.find(geometry);
         if (it == g_commandBufferDrawTagWrappers.end()) {
-            if (tag == WrapperTag::kUnknown) {
+            if (classification.materialTag < 0.5f &&
+                classification.raceGroupMask == 0 &&
+                classification.raceFlags == 0) {
                 return;
             }
             it = g_commandBufferDrawTagWrappers.emplace(geometry, nullptr).first;
@@ -3234,7 +3402,7 @@ namespace
             wrapper->fenceCount = 0;
         }
 
-        wrapper->srv.store(GetStaticDrawTagSRV(tag), std::memory_order_release);
+        wrapper->srv.store(GetOrCreateStaticDrawTagSRV(classification), std::memory_order_release);
     }
 
     void ResetCommandBufferDrawTagWrappers()
@@ -3247,7 +3415,7 @@ namespace
         }
     }
 
-    FakeStructuredResource* GetCommandBufferDrawTagWrapper(RE::BSGeometry* geometry, WrapperTag tag)
+    FakeStructuredResource* GetCommandBufferDrawTagWrapper(RE::BSGeometry* geometry, const DrawTagClassification& classification)
     {
         if (!geometry) {
             return &g_unknownTagWrapper;
@@ -3260,7 +3428,7 @@ namespace
             wrapper->fenceCount = 0;
         }
 
-        wrapper->srv.store(GetStaticDrawTagSRV(tag), std::memory_order_release);
+        wrapper->srv.store(GetOrCreateStaticDrawTagSRV(classification), std::memory_order_release);
         return wrapper.get();
     }
 
@@ -3268,9 +3436,13 @@ namespace
     {
         g_drawTagStack.push_back(g_currentDrawTag);
         g_drawTagIsHeadStack.push_back(g_currentDrawTagIsHead);
+        g_drawTagRaceGroupMaskStack.push_back(g_currentDrawTagRaceGroupMask);
+        g_drawTagRaceFlagsStack.push_back(g_currentDrawTagRaceFlags);
         const auto classification = ClassifyDrawTag(pass);
         g_currentDrawTag = classification.materialTag;
         g_currentDrawTagIsHead = classification.isHead;
+        g_currentDrawTagRaceGroupMask = classification.raceGroupMask;
+        g_currentDrawTagRaceFlags = classification.raceFlags;
     }
 
     void PopCurrentDrawTag()
@@ -3287,6 +3459,20 @@ namespace
             g_drawTagIsHeadStack.pop_back();
         } else {
             g_currentDrawTagIsHead = 0.0f;
+        }
+
+        if (!g_drawTagRaceGroupMaskStack.empty()) {
+            g_currentDrawTagRaceGroupMask = g_drawTagRaceGroupMaskStack.back();
+            g_drawTagRaceGroupMaskStack.pop_back();
+        } else {
+            g_currentDrawTagRaceGroupMask = 0;
+        }
+
+        if (!g_drawTagRaceFlagsStack.empty()) {
+            g_currentDrawTagRaceFlags = g_drawTagRaceFlagsStack.back();
+            g_drawTagRaceFlagsStack.pop_back();
+        } else {
+            g_currentDrawTagRaceFlags = 0;
         }
     }
 
@@ -3787,6 +3973,74 @@ namespace
         EndPassOcclusionDecision(g_rendererData ? g_rendererData->context : nullptr, decision);
     }
 
+    REX::W32::ID3D11ShaderResourceView* GetOrCreateStaticDrawTagSRV(const DrawTagClassification& classification)
+    {
+        if (!g_rendererData) {
+            g_rendererData = RE::BSGraphics::GetRendererData();
+        }
+        if (!g_rendererData || !g_rendererData->device) {
+            return g_unknownTagSRV;
+        }
+
+        const auto key = MakeStaticDrawTagKey(classification);
+        std::lock_guard cacheLock(g_staticDrawTagResourcesMutex);
+        if (auto it = g_staticDrawTagResources.find(key); it != g_staticDrawTagResources.end()) {
+            return it->second.srv;
+        }
+
+        DrawTagData seed{};
+        seed.materialTag = classification.materialTag;
+        seed.isHead = classification.isHead;
+        seed.raceGroupMask = classification.raceGroupMask;
+        seed.raceFlags = classification.raceFlags;
+
+        REX::W32::D3D11_BUFFER_DESC desc{};
+        desc.usage = REX::W32::D3D11_USAGE_IMMUTABLE;
+        desc.byteWidth = sizeof(DrawTagData);
+        desc.bindFlags = REX::W32::D3D11_BIND_SHADER_RESOURCE;
+        desc.cpuAccessFlags = 0;
+        desc.miscFlags = REX::W32::D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+        desc.structureByteStride = sizeof(DrawTagData);
+
+        REX::W32::D3D11_SUBRESOURCE_DATA initialData{};
+        initialData.sysMem = &seed;
+
+        StaticDrawTagResource resource{};
+        HRESULT hr = g_rendererData->device->CreateBuffer(&desc, &initialData, &resource.buffer);
+        if (FAILED(hr)) {
+            REX::WARN(
+                "GetOrCreateStaticDrawTagSRV: CreateBuffer failed 0x{:08X} tag={} head={} raceMask=0x{:08X} raceFlags=0x{:08X}",
+                hr,
+                classification.materialTag,
+                classification.isHead,
+                classification.raceGroupMask,
+                classification.raceFlags);
+            return g_unknownTagSRV;
+        }
+
+        REX::W32::D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc{};
+        srvDesc.format = REX::W32::DXGI_FORMAT_UNKNOWN;
+        srvDesc.viewDimension = REX::W32::D3D11_SRV_DIMENSION_BUFFER;
+        srvDesc.buffer.firstElement = 0;
+        srvDesc.buffer.numElements = 1;
+
+        hr = g_rendererData->device->CreateShaderResourceView(resource.buffer, &srvDesc, &resource.srv);
+        if (FAILED(hr)) {
+            REX::WARN(
+                "GetOrCreateStaticDrawTagSRV: CreateSRV failed 0x{:08X} tag={} head={} raceMask=0x{:08X} raceFlags=0x{:08X}",
+                hr,
+                classification.materialTag,
+                classification.isHead,
+                classification.raceGroupMask,
+                classification.raceFlags);
+            resource.buffer->Release();
+            return g_unknownTagSRV;
+        }
+
+        auto [it, inserted] = g_staticDrawTagResources.emplace(key, resource);
+        return it->second.srv;
+    }
+
     // Lazy-create the two immutable structured buffers + SRVs and wire them
     // into the static FakeStructuredResource wrappers. Called from the
     // BuildCommandBuffer hook on first invocation, by which time the
@@ -3806,70 +4060,12 @@ namespace
         }
         auto* device = g_rendererData->device;
 
-        auto createTagSRV = [device](float tagValue,
-                                     float isHeadValue,
-                                     REX::W32::ID3D11Buffer*& outBuffer,
-                                     REX::W32::ID3D11ShaderResourceView*& outSRV) -> bool
-        {
-            DrawTagData seed{};
-            seed.materialTag = tagValue;
-            seed.isHead = isHeadValue;
-            seed.pad1 = 0.0f;
-            seed.pad2 = 0.0f;
+        (void)device;
 
-            REX::W32::D3D11_BUFFER_DESC desc{};
-            desc.usage = REX::W32::D3D11_USAGE_IMMUTABLE;
-            desc.byteWidth = sizeof(DrawTagData);
-            desc.bindFlags = REX::W32::D3D11_BIND_SHADER_RESOURCE;
-            desc.cpuAccessFlags = 0;
-            desc.miscFlags = REX::W32::D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
-            desc.structureByteStride = sizeof(DrawTagData);
-
-            REX::W32::D3D11_SUBRESOURCE_DATA initialData{};
-            initialData.sysMem = &seed;
-
-            HRESULT hr = device->CreateBuffer(&desc, &initialData, &outBuffer);
-            if (FAILED(hr)) {
-                REX::WARN("EnsureDrawTagWrapperResources: CreateBuffer (tag={}) failed 0x{:08X}", tagValue, hr);
-                return false;
-            }
-
-            REX::W32::D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc{};
-            srvDesc.format = REX::W32::DXGI_FORMAT_UNKNOWN;
-            srvDesc.viewDimension = REX::W32::D3D11_SRV_DIMENSION_BUFFER;
-            srvDesc.buffer.firstElement = 0;
-            srvDesc.buffer.numElements = 1;
-
-            hr = device->CreateShaderResourceView(outBuffer, &srvDesc, &outSRV);
-            if (FAILED(hr)) {
-                REX::WARN("EnsureDrawTagWrapperResources: CreateSRV (tag={}) failed 0x{:08X}", tagValue, hr);
-                outBuffer->Release();
-                outBuffer = nullptr;
-                return false;
-            }
-
-            return true;
-        };
-
-        auto releaseTagSRV = [](REX::W32::ID3D11Buffer*& buffer,
-                                REX::W32::ID3D11ShaderResourceView*& srv)
-        {
-            if (srv) {
-                srv->Release();
-                srv = nullptr;
-            }
-            if (buffer) {
-                buffer->Release();
-                buffer = nullptr;
-            }
-        };
-
-        if (!createTagSRV(static_cast<float>(DrawMaterialTag::kUnknown), 0.0f, g_unknownTagBuffer, g_unknownTagSRV) ||
-            !createTagSRV(static_cast<float>(DrawMaterialTag::kActor),   0.0f, g_actorTagBuffer,   g_actorTagSRV) ||
-            !createTagSRV(static_cast<float>(DrawMaterialTag::kActor),   1.0f, g_actorHeadTagBuffer, g_actorHeadTagSRV)) {
-            releaseTagSRV(g_unknownTagBuffer,   g_unknownTagSRV);
-            releaseTagSRV(g_actorTagBuffer,     g_actorTagSRV);
-            releaseTagSRV(g_actorHeadTagBuffer, g_actorHeadTagSRV);
+        g_unknownTagSRV = GetOrCreateStaticDrawTagSRV(MakeUnknownDrawTagClassification());
+        g_actorTagSRV = GetOrCreateStaticDrawTagSRV(MakeActorDrawTagClassification(false, 0, 0));
+        g_actorHeadTagSRV = GetOrCreateStaticDrawTagSRV(MakeActorDrawTagClassification(true, 0, 0));
+        if (!g_unknownTagSRV || !g_actorTagSRV || !g_actorHeadTagSRV) {
             return false;
         }
 
@@ -3919,14 +4115,22 @@ namespace
             return OriginalBuildCommandBuffer(this_, param);
         }
 
-        // Classify the pass.
-        WrapperTag wrapperTag = WrapperTag::kUnknown;
+        DrawTagClassification classification{};
         if (geom) {
             std::shared_lock lock(g_actorDrawTaggedGeometryLock);
             if (g_actorDrawTaggedGeometry.contains(geom)) {
-                wrapperTag = g_actorHeadDrawTaggedGeometry.contains(geom)
-                                 ? WrapperTag::kActorHead
-                                 : WrapperTag::kActor;
+                const bool isHead = g_actorHeadDrawTaggedGeometry.contains(geom);
+                std::uint32_t raceGroupMask = 0;
+                std::uint32_t raceFlags = 0;
+                if (auto it = g_actorRaceGroupMaskByGeometry.find(geom);
+                    it != g_actorRaceGroupMaskByGeometry.end()) {
+                    raceGroupMask = it->second;
+                }
+                if (auto it = g_actorRaceFlagsByGeometry.find(geom);
+                    it != g_actorRaceFlagsByGeometry.end()) {
+                    raceFlags = it->second;
+                }
+                classification = MakeActorDrawTagClassification(isHead, raceGroupMask, raceFlags);
             }
         }
 
@@ -3949,7 +4153,7 @@ namespace
         }
 
         auto& ourRec = tempArr[origCount];
-        ourRec.resourceWrapper = static_cast<void*>(GetCommandBufferDrawTagWrapper(geom, wrapperTag));
+        ourRec.resourceWrapper = static_cast<void*>(GetCommandBufferDrawTagWrapper(geom, classification));
         ourRec.slot  = static_cast<std::uint8_t>(DRAWTAG_SLOT);
         ourRec.stage = 1;  // PS
         ourRec.kind  = 0;  // engine reads SRV from wrapper+0x08
@@ -3970,14 +4174,14 @@ namespace
     RE::NiAVObject* HookedActorLoad3D(RE::TESObjectREFR* ref, bool backgroundLoading)
     {
         auto* loaded3D = OriginalActorLoad3D(ref, backgroundLoading);
-        RefreshActorDrawTaggedGeometry(ref);
+        RefreshActorDrawTaggedGeometry(static_cast<RE::Actor*>(ref));
         return loaded3D;
     }
 
     RE::NiAVObject* HookedPlayerCharacterLoad3D(RE::TESObjectREFR* ref, bool backgroundLoading)
     {
         auto* loaded3D = OriginalPlayerCharacterLoad3D(ref, backgroundLoading);
-        RefreshActorDrawTaggedGeometry(ref);
+        RefreshActorDrawTaggedGeometry(static_cast<RE::Actor*>(ref));
         return loaded3D;
     }
 
@@ -3987,13 +4191,13 @@ namespace
     void HookedActorSet3D(RE::TESObjectREFR* ref, RE::NiAVObject* a_object, bool a_queue3DTasks)
     {
         OriginalActorSet3D(ref, a_object, a_queue3DTasks);
-        RefreshActorDrawTaggedGeometry(ref);
+        RefreshActorDrawTaggedGeometry(static_cast<RE::Actor*>(ref));
     }
 
     void HookedPlayerCharacterSet3D(RE::TESObjectREFR* ref, RE::NiAVObject* a_object, bool a_queue3DTasks)
     {
         OriginalPlayerCharacterSet3D(ref, a_object, a_queue3DTasks);
-        RefreshActorDrawTaggedGeometry(ref);
+        RefreshActorDrawTaggedGeometry(static_cast<RE::Actor*>(ref));
     }
 
     // OnHeadInitialized — engine callback fired after BSFaceGenManager finishes
@@ -4002,13 +4206,13 @@ namespace
     void HookedActorOnHeadInitialized(RE::TESObjectREFR* ref)
     {
         OriginalActorOnHeadInitialized(ref);
-        RefreshActorHeadDrawTaggedGeometry(ref);
+        RefreshActorHeadDrawTaggedGeometry(static_cast<RE::Actor*>(ref));
     }
 
     void HookedPlayerCharacterOnHeadInitialized(RE::TESObjectREFR* ref)
     {
         OriginalPlayerCharacterOnHeadInitialized(ref);
-        RefreshActorHeadDrawTaggedGeometry(ref);
+        RefreshActorHeadDrawTaggedGeometry(static_cast<RE::Actor*>(ref));
     }
 
     // Actor::Update3DModel — runtime model rebuild. Most LooksMenu/SAF/
@@ -4046,6 +4250,8 @@ void ClearActorDrawTaggedGeometry_Internal()
     g_actorHeadDrawTaggedGeometry.clear();
     g_actorDrawTaggedGeometryByRef.clear();
     g_actorHeadDrawTaggedGeometryByRef.clear();
+    g_actorRaceGroupMaskByGeometry.clear();
+    g_actorRaceFlagsByGeometry.clear();
     ResetCommandBufferDrawTagWrappers();
 }
 
@@ -4065,31 +4271,36 @@ void ReleaseDrawTagBuffers_Internal()
         }
         g_commandBufferDrawTagWrappers.clear();
     }
+    {
+        std::lock_guard lock(g_staticDrawTagResourcesMutex);
+        for (auto& [key, resource] : g_staticDrawTagResources) {
+            if (resource.srv) {
+                resource.srv->Release();
+                resource.srv = nullptr;
+            }
+            if (resource.buffer) {
+                resource.buffer->Release();
+                resource.buffer = nullptr;
+            }
+        }
+        g_staticDrawTagResources.clear();
+    }
     g_unknownTagWrapper.srv.store(nullptr, std::memory_order_release);
     g_actorTagWrapper.srv.store(nullptr, std::memory_order_release);
     g_actorHeadTagWrapper.srv.store(nullptr, std::memory_order_release);
     g_tagWrapperResourcesReady = false;
 
-    if (g_unknownTagSRV) {
-        g_unknownTagSRV->Release();
-        g_unknownTagSRV = nullptr;
-    }
+    g_unknownTagSRV = nullptr;
     if (g_unknownTagBuffer) {
         g_unknownTagBuffer->Release();
         g_unknownTagBuffer = nullptr;
     }
-    if (g_actorTagSRV) {
-        g_actorTagSRV->Release();
-        g_actorTagSRV = nullptr;
-    }
+    g_actorTagSRV = nullptr;
     if (g_actorTagBuffer) {
         g_actorTagBuffer->Release();
         g_actorTagBuffer = nullptr;
     }
-    if (g_actorHeadTagSRV) {
-        g_actorHeadTagSRV->Release();
-        g_actorHeadTagSRV = nullptr;
-    }
+    g_actorHeadTagSRV = nullptr;
     if (g_actorHeadTagBuffer) {
         g_actorHeadTagBuffer->Release();
         g_actorHeadTagBuffer = nullptr;
@@ -4199,7 +4410,12 @@ static void UpdateStructuredSRV(REX::W32::ID3D11DeviceContext* context, REX::W32
     }
 }
 
-static REX::W32::ID3D11ShaderResourceView* UpdateDrawTagBuffer(REX::W32::ID3D11DeviceContext* context, float materialTag, float isHead)
+static REX::W32::ID3D11ShaderResourceView* UpdateDrawTagBuffer(
+    REX::W32::ID3D11DeviceContext* context,
+    float materialTag,
+    float isHead,
+    std::uint32_t raceGroupMask,
+    std::uint32_t raceFlags)
 {
     if (!g_rendererData) {
         g_rendererData = RE::BSGraphics::GetRendererData();
@@ -4268,15 +4484,15 @@ static REX::W32::ID3D11ShaderResourceView* UpdateDrawTagBuffer(REX::W32::ID3D11D
         auto* data = static_cast<DrawTagData*>(mapped.data);
         data->materialTag = materialTag;
         data->isHead = isHead;
-        data->pad1 = 0.0f;
-        data->pad2 = 0.0f;
+        data->raceGroupMask = raceGroupMask;
+        data->raceFlags = raceFlags;
         context->Unmap(ringBuffer, 0);
     }
 
     g_drawTagData.materialTag = materialTag;
     g_drawTagData.isHead = isHead;
-    g_drawTagData.pad1 = 0.0f;
-    g_drawTagData.pad2 = 0.0f;
+    g_drawTagData.raceGroupMask = raceGroupMask;
+    g_drawTagData.raceFlags = raceFlags;
 
     return ringSRV;
 }
@@ -4388,7 +4604,12 @@ static void BindDrawTagForCurrentDraw(REX::W32::ID3D11DeviceContext* context, bo
         return;
     }
 
-    auto* drawTagSRV = UpdateDrawTagBuffer(context, g_currentDrawTag, g_currentDrawTagIsHead);
+    auto* drawTagSRV = UpdateDrawTagBuffer(
+        context,
+        g_currentDrawTag,
+        g_currentDrawTagIsHead,
+        g_currentDrawTagRaceGroupMask,
+        g_currentDrawTagRaceFlags);
     if (!drawTagSRV) {
         return;
     }
@@ -6619,6 +6840,8 @@ void UIDrawCustomBufferMonitorOverlay() {
         if (beginColumns("custom_buffer_drawtag_columns")) {
             renderFloat("materialTag", drawTag.materialTag, previousDrawTag.materialTag, 0.5f);
             renderFloat("isHead",      drawTag.isHead,      previousDrawTag.isHead,      0.5f);
+            renderUInt("raceGroupMask", drawTag.raceGroupMask, previousDrawTag.raceGroupMask);
+            renderUInt("raceFlags",     drawTag.raceFlags,     previousDrawTag.raceFlags);
             endColumns();
         }
     }

@@ -21,6 +21,10 @@ SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON=false
 CUSTOMBUFFER_SLOT=31
 ; Per-draw classification tag resource view slot
 DRAWTAG_SLOT=26
+; Race group definitions exposed to shaders through GFXDrawTag[0].raceGroupMask.
+; Format: RACE_GROUP_N=PluginName.esm|FormID,... where N is 0-31.
+; Group 0 defaults to Fallout 4 vanilla humanoid races for toon-rim exclusion.
+RACE_GROUP_0=Fallout4.esm|0x13746,Fallout4.esm|0x1A009,Fallout4.esm|0xEAFB6,Fallout4.esm|0x11D83F,Fallout4.esm|0x11EB96,Fallout4.esm|0x2261A4,Fallout4.esm|0x10BD65,Fallout4.esm|0xE8D09
 ; G-buffer normal target index (into RendererData.renderTargets[]).
 ; Default 20 = kGbufferNormal for the OG runtime; override only if the
 ; deferred renderer layout differs on your runtime. -1 disables the
@@ -355,9 +359,43 @@ std::string GetCommonShaderHeaderHLSLTop()
         {
             float materialTag;
             float isHead;
-            float pad1;
-            float pad2;
+            uint raceGroupMask;
+            uint raceFlags;
         };
+
+        #define GFX_RACE_FLAG_RESOLVED 0x00000001u
+        #define GFX_RACE_GROUP_0       0x00000001u
+        #define GFX_RACE_GROUP_1       0x00000002u
+        #define GFX_RACE_GROUP_2       0x00000004u
+        #define GFX_RACE_GROUP_3       0x00000008u
+        #define GFX_RACE_GROUP_4       0x00000010u
+        #define GFX_RACE_GROUP_5       0x00000020u
+        #define GFX_RACE_GROUP_6       0x00000040u
+        #define GFX_RACE_GROUP_7       0x00000080u
+        #define GFX_RACE_GROUP_8       0x00000100u
+        #define GFX_RACE_GROUP_9       0x00000200u
+        #define GFX_RACE_GROUP_10      0x00000400u
+        #define GFX_RACE_GROUP_11      0x00000800u
+        #define GFX_RACE_GROUP_12      0x00001000u
+        #define GFX_RACE_GROUP_13      0x00002000u
+        #define GFX_RACE_GROUP_14      0x00004000u
+        #define GFX_RACE_GROUP_15      0x00008000u
+        #define GFX_RACE_GROUP_16      0x00010000u
+        #define GFX_RACE_GROUP_17      0x00020000u
+        #define GFX_RACE_GROUP_18      0x00040000u
+        #define GFX_RACE_GROUP_19      0x00080000u
+        #define GFX_RACE_GROUP_20      0x00100000u
+        #define GFX_RACE_GROUP_21      0x00200000u
+        #define GFX_RACE_GROUP_22      0x00400000u
+        #define GFX_RACE_GROUP_23      0x00800000u
+        #define GFX_RACE_GROUP_24      0x01000000u
+        #define GFX_RACE_GROUP_25      0x02000000u
+        #define GFX_RACE_GROUP_26      0x04000000u
+        #define GFX_RACE_GROUP_27      0x08000000u
+        #define GFX_RACE_GROUP_28      0x10000000u
+        #define GFX_RACE_GROUP_29      0x20000000u
+        #define GFX_RACE_GROUP_30      0x40000000u
+        #define GFX_RACE_GROUP_31      0x80000000u
         )";
 }
 
