@@ -215,12 +215,8 @@ std::uint64_t ShadowCameraSignature(void* camera, std::uint32_t mapSlot) noexcep
     return HashBytes(quantized.data(), quantized.size() * sizeof(quantized[0]));
 }
 
-std::uint64_t GameplayCameraTranslationSignature(std::uint32_t mapSlot) noexcept
+std::uint64_t GameplayCameraTranslationSignature() noexcept
 {
-    if (mapSlot != 0) {
-        return 0;
-    }
-
     constexpr float kGameplayCameraTranslationStep = 0.01f;
     const std::array<std::int32_t, 3> quantized{
         QuantizeFloat(g_customBufferData.cameraWorldRow3.x, kGameplayCameraTranslationStep),
@@ -1423,7 +1419,7 @@ Scope MakeScope(void* light, void* shadowMapData, LightKind kind) noexcept
     scope.key.depthTarget = ReadField<std::uint32_t>(shadowMapData, kShadowMapDepthTargetOffset);
     scope.key.mapSlot = ReadField<std::uint32_t>(shadowMapData, kShadowMapMapSlotOffset);
     scope.key.cameraSig = ShadowCameraSignature(scope.camera, scope.key.mapSlot) ^
-        (GameplayCameraTranslationSignature(scope.key.mapSlot) + 0x9e3779b97f4a7c15ull);
+        (GameplayCameraTranslationSignature() + 0x9e3779b97f4a7c15ull);
     scope.key.dominantLightSig = ShadowLightDirectionSignature(light);
     scope.key.activeDepthStencilView = ActiveShadowDSV(scope.key);
     scope.key.activeDepthTexture = ActiveShadowTextureIdentity(
