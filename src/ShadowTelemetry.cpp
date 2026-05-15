@@ -54,8 +54,8 @@ REL::Relocation<BSShaderAccumulatorSetShadowSceneNode_t> ptr_SetShadowSceneNode{
 REL::Relocation<BSShaderAccumulatorSetDepthPassIndex_t> ptr_SetDepthPassIndex{ REL::ID{ 695248, 0 } };
 REL::Relocation<BSShaderAccumulatorSetShadowLight_t> ptr_SetShadowLight{ REL::ID{ 50100, 2317901 } };
 REL::Relocation<std::uintptr_t> ptr_DestroyRenderTargets{ REL::ID{ 456166, 0 } };
-REL::Relocation<std::uint32_t*> ptr_BSGraphicsTLSIndex{ REL::Offset{ 0x67337B4 } };
-REL::Relocation<void**> ptr_BSGraphicsDefaultContext{ REL::Offset{ 0x61DDC68 } };
+REL::Relocation<std::uint32_t*> ptr_BSGraphicsTLSIndex{ REL::ID{ 54676, 0 }, 0x74 };
+REL::Relocation<void**> ptr_BSGraphicsDefaultContext{ REL::ID{ 33539, 0 } };
 
 constexpr std::uintptr_t kDirectionalRenderShadowMapCallOffsetOG = 0x48;  // 0x1428CA758 - 0x1428CA710
 constexpr std::uintptr_t kRenderShadowMapFlushCallOffsetOG = 0xDE;        // 0x1428C98DE - 0x1428C9800

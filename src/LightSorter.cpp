@@ -11,7 +11,7 @@ namespace {
 
 // --- Engine layout (verified via Ghidra) -----------------------------------
 //
-// DAT_1467231b0 is the global ShadowSceneNode* used by DrawWorld::DeferredLightsImpl
+// DAT_1467231b0 is the OG global ShadowSceneNode* used by DrawWorld::DeferredLightsImpl
 // for point-light iteration. Its layout (offsets cross-checked against the
 // ShadowSceneNode::GetLight @ 0x1428117e0 single-line implementation):
 //
@@ -25,7 +25,7 @@ namespace {
 //   BSLight*
 //     +0x17d   uint8_t    stencilFlag     — cVar6 in the DeferredLightsImpl
 //                                            decompile; selects fast/slow path
-constexpr std::uintptr_t kAddr_ShadowSceneNode = 0x1467231B0ull;
+REL::Relocation<void**> ptr_ShadowSceneNode{ REL::ID{ 879298, 0 } };
 constexpr std::size_t    kSSN_PointPtrsOffset  = 0x158;
 constexpr std::size_t    kSSN_PointCountOffset = 0x168;
 constexpr std::size_t    kLight_StencilFlagOff = 0x17d;
@@ -46,7 +46,8 @@ thread_local void**      tl_savedArrayBase = nullptr;  // where to restore
 inline void* ReadShadowSceneNode() noexcept
 {
     void* ssn = nullptr;
-    std::memcpy(&ssn, reinterpret_cast<const void*>(kAddr_ShadowSceneNode), sizeof(ssn));
+    const auto slot = ptr_ShadowSceneNode.get();
+    std::memcpy(&ssn, slot, sizeof(ssn));
     return ssn;
 }
 
