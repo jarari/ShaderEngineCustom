@@ -92,6 +92,8 @@ thread_local bool g_isCreatingReplacementShader = false;
 // which fires from MyDraw* hooks and needs to identify the currently bound
 // original (pre-replacement) PS to look up its matched ShaderDefinition.
 std::atomic<REX::W32::ID3D11PixelShader*> g_currentOriginalPixelShader{ nullptr };
+static thread_local const CustomPass::DrawPassBatch* g_armedCustomPassDrawBatch = nullptr;
+static thread_local std::uint64_t g_armedCustomPassDrawBatchGeneration = 0;
 // Global custom buffer data structure instance for updating CB13
 GFXBoosterAccessData g_customBufferData = {};
 DrawTagData g_drawTagData = {};
@@ -139,6 +141,24 @@ static std::atomic_bool g_anyReplacementShaderUsesDrawTag{ false };
 thread_local bool g_bindingInjectedPixelResources = false;
 static thread_local std::uint32_t g_commandBufferReplayDepth = 0;
 static REX::W32::ID3D11ShaderResourceView* g_lastSceneDepthSRV = nullptr;
+
+static void ArmCustomPassDrawBatch(REX::W32::ID3D11PixelShader* originalPS)
+{
+    g_armedCustomPassDrawBatch =
+        CustomPass::g_registry.ResolveDrawPassBatchForShader(
+            originalPS,
+            &g_armedCustomPassDrawBatchGeneration);
+}
+
+static bool FireArmedCustomPassDrawBatch(REX::W32::ID3D11DeviceContext* context, const char* source)
+{
+    return CustomPass::g_registry.FireResolvedDrawBatch(
+        context,
+        g_armedCustomPassDrawBatch,
+        g_armedCustomPassDrawBatchGeneration,
+        source);
+}
+
 struct alignas(16) ModularFloat4 {
     float x = 0.0f;
     float y = 0.0f;
@@ -3380,7 +3400,7 @@ namespace
         // tag buffer is current for every pass that classified as actor.
         if (g_rendererData && g_rendererData->context) {
             BindDrawTagForCurrentDraw(g_rendererData->context, true);
-            if (CustomPass::g_registry.OnBeforeDraw(g_rendererData->context, "engine-BSBatch")
+            if (FireArmedCustomPassDrawBatch(g_rendererData->context, "engine-BSBatch")
                 && g_activeReplacementPixelShaderNeedsResourceRebind) {
                 BindInjectedPixelShaderResources(g_rendererData->context);
             }
@@ -4828,7 +4848,7 @@ void STDMETHODCALLTYPE MyDrawIndexed(
     //BindDrawTagForCurrentDraw(This);
     // BeforeDrawForMatchedDef custom passes fire here, when the engine has
     // fully set up the pipeline for the upcoming draw. State is fresh.
-    if (CustomPass::g_registry.OnBeforeDraw(This, "d3d11-DrawIndexed") && g_activeReplacementPixelShaderNeedsResourceRebind) {
+    if (FireArmedCustomPassDrawBatch(This, "d3d11-DrawIndexed") && g_activeReplacementPixelShaderNeedsResourceRebind) {
         BindInjectedPixelShaderResources(This);
     }
     OriginalDrawIndexed(This, IndexCount, StartIndexLocation, BaseVertexLocation);
@@ -4852,7 +4872,7 @@ void STDMETHODCALLTYPE MyDraw(
         ShadowTelemetry::OnD3DDraw();
     }
     //BindDrawTagForCurrentDraw(This);
-    if (CustomPass::g_registry.OnBeforeDraw(This, "d3d11-Draw") && g_activeReplacementPixelShaderNeedsResourceRebind) {
+    if (FireArmedCustomPassDrawBatch(This, "d3d11-Draw") && g_activeReplacementPixelShaderNeedsResourceRebind) {
         BindInjectedPixelShaderResources(This);
     }
     OriginalDraw(This, VertexCount, StartVertexLocation);
@@ -4882,7 +4902,7 @@ void STDMETHODCALLTYPE MyDrawIndexedInstanced(
         ShadowTelemetry::OnD3DDraw();
     }
     //BindDrawTagForCurrentDraw(This);
-    if (CustomPass::g_registry.OnBeforeDraw(This, "d3d11-DrawIndexedInstanced") && g_activeReplacementPixelShaderNeedsResourceRebind) {
+    if (FireArmedCustomPassDrawBatch(This, "d3d11-DrawIndexedInstanced") && g_activeReplacementPixelShaderNeedsResourceRebind) {
         BindInjectedPixelShaderResources(This);
     }
     OriginalDrawIndexedInstanced(This, IndexCountPerInstance, InstanceCount, StartIndexLocation, BaseVertexLocation, StartInstanceLocation);
@@ -4910,7 +4930,7 @@ void STDMETHODCALLTYPE MyDrawInstanced(
         ShadowTelemetry::OnD3DDraw();
     }
     //BindDrawTagForCurrentDraw(This);
-    if (CustomPass::g_registry.OnBeforeDraw(This, "d3d11-DrawInstanced") && g_activeReplacementPixelShaderNeedsResourceRebind) {
+    if (FireArmedCustomPassDrawBatch(This, "d3d11-DrawInstanced") && g_activeReplacementPixelShaderNeedsResourceRebind) {
         BindInjectedPixelShaderResources(This);
     }
     OriginalDrawInstanced(This, VertexCountPerInstance, InstanceCount, StartVertexLocation, StartInstanceLocation);
@@ -4989,6 +5009,7 @@ void STDMETHODCALLTYPE MyPSSetShader(
     bool usingReplacementPixelShader = false;
     ShaderDefinition* activeReplacementDef = nullptr;
     g_currentOriginalPixelShader.store(pPixelShader, std::memory_order_release);
+    ArmCustomPassDrawBatch(pPixelShader);
 
     // Light-tracker capture at PS-bind time. Engine sets RTVs / blend /
     // scissor / cb2 / SRVs before PSSetShader, so all the per-pass state
@@ -5969,6 +5990,7 @@ void RematchAllShaders_Internal() {
     }
     if (DEBUGGING)
         REX::INFO("RematchAllShaders_Internal: Matched {} pixel shaders and {} vertex shaders", matchedPS, matchedVS);
+    CustomPass::g_registry.InvalidateDrawPassCache();
 }
 
 void UIDrawShaderSettingsOverlay() {

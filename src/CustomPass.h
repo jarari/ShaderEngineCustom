@@ -229,6 +229,12 @@ public:
     void Release();
 };
 
+struct DrawPassBatch {
+    REX::W32::ID3D11PixelShader* originalPS = nullptr;
+    ShaderDefinition* matchedDefinition = nullptr;
+    std::vector<Pass*> passes;
+};
+
 // --- Snapshot SRV cache ---------------------------------------------------
 
 // Maintains an SRV that views the texture currently bound as RTV0 at fire
@@ -292,6 +298,14 @@ public:
     // given draw — useful when ENB / ReShade context wrapping makes the
     // D3D11 vtable hooks unreliable. Returns true if a pass fired.
     bool OnBeforeDraw(REX::W32::ID3D11DeviceContext* context, const char* source);
+    const DrawPassBatch* ResolveDrawPassBatchForShader(
+        REX::W32::ID3D11PixelShader* originalPS,
+        std::uint64_t* generation = nullptr);
+    bool FireResolvedDrawBatch(REX::W32::ID3D11DeviceContext* context,
+                               const DrawPassBatch* batch,
+                               std::uint64_t generation,
+                               const char* source);
+    void InvalidateDrawPassCache();
 
     // Called from MyPresent. Performs:
     //   - resource allocation for new resources
@@ -336,6 +350,8 @@ private:
     // Returns true if any matched pass was active.
     bool                                FireBatch(REX::W32::ID3D11DeviceContext* context,
                                                   std::vector<Pass*>& matches);
+    bool                                FireSortedBatch(REX::W32::ID3D11DeviceContext* context,
+                                                        const std::vector<Pass*>& matches);
     // Internal: per-pass body shared by FirePass and FireBatch. Assumes
     // the caller has already captured `saved`; reads it for currentRTV
     // snapshot resolution and viewport fallback. Does NOT restore — the
@@ -352,8 +368,11 @@ private:
     std::unordered_multimap<std::string, Pass*>          hookIdIndex;  // BeforeHookId / BeforeDrawForHookId pre-resolution
     std::unordered_multimap<ShaderDefinition*, Pass*>    defIndex;     // BeforeMatchedDefinition
     std::unordered_multimap<ShaderDefinition*, Pass*>    drawDefIndex; // BeforeDrawForMatchedDef
+    std::unordered_map<REX::W32::ID3D11PixelShader*, std::unique_ptr<DrawPassBatch>> drawBatchCache;
     std::unordered_map<std::string, Resource*>      resourceIndex;  // by name
     SnapshotSrvCache                                snapshotCache;
+    std::atomic_bool                                hasDrawTimePasses{ false };
+    std::atomic<std::uint64_t>                      drawPassCacheGeneration{ 1 };
     mutable std::mutex                              mutex;
     uint32_t                                        currentFrame = 0;
 };

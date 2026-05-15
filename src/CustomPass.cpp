@@ -358,6 +358,9 @@ bool Registry::IsCustomSection(const std::string& sectionName) {
 
 void Registry::Reset() {
     std::lock_guard lk(mutex);
+    drawPassCacheGeneration.fetch_add(1, std::memory_order_acq_rel);
+    drawBatchCache.clear();
+    hasDrawTimePasses.store(false, std::memory_order_release);
     snapshotCache.Release();
     for (auto& p : passes) p->Release();
     passes.clear();
@@ -368,6 +371,13 @@ void Registry::Reset() {
     defIndex.clear();
     drawDefIndex.clear();
     resourceIndex.clear();
+}
+
+void Registry::InvalidateDrawPassCache() {
+    drawPassCacheGeneration.fetch_add(1, std::memory_order_acq_rel);
+    std::lock_guard lk(mutex);
+    drawBatchCache.clear();
+    hasDrawTimePasses.store(!drawDefIndex.empty(), std::memory_order_release);
 }
 
 bool Registry::ParseSection(const std::string& sectionName,
@@ -535,6 +545,8 @@ Resource* Registry::FindResource(const std::string& name) {
 
 void Registry::ResolveHookIdTriggers() {
     std::lock_guard lk(mutex);
+    drawPassCacheGeneration.fetch_add(1, std::memory_order_acq_rel);
+    drawBatchCache.clear();
     for (auto& [id, pass] : hookIdIndex) {
         // Bind to the actual ShaderDefinition* by id. The atDrawTime flag
         // (set during parsing for `beforeDrawForHook:`) chooses whether the
@@ -559,6 +571,7 @@ void Registry::ResolveHookIdTriggers() {
             }
         }
     }
+    hasDrawTimePasses.store(!drawDefIndex.empty(), std::memory_order_release);
 }
 
 bool Registry::EnsureCompiled(Pass& pass) {
@@ -974,7 +987,11 @@ bool Registry::FireBatch(REX::W32::ID3D11DeviceContext* context, std::vector<Pas
     // priority convention used elsewhere.
     std::stable_sort(matches.begin(), matches.end(),
         [](Pass* a, Pass* b) { return a->spec.priority < b->spec.priority; });
+    return FireSortedBatch(context, matches);
+}
 
+bool Registry::FireSortedBatch(REX::W32::ID3D11DeviceContext* context, const std::vector<Pass*>& matches) {
+    if (!context || matches.empty()) return false;
     // Single capture before the chain; single restore after. Per-pass
     // FirePassWithSaved calls do NOT touch capture/restore. This collapses
     // up to N (chain-length) save/restore cycles into one, which dominates
@@ -983,6 +1000,7 @@ bool Registry::FireBatch(REX::W32::ID3D11DeviceContext* context, std::vector<Pas
     SavedState saved; saved.Capture(context);
     bool firedAny = false;
     for (auto* p : matches) {
+        if (!p) continue;
         if (!p->spec.active) continue;
         FirePassWithSaved(context, *p, saved);
         firedAny = true;
@@ -1305,54 +1323,91 @@ void Registry::FirePassWithSaved(REX::W32::ID3D11DeviceContext* context, Pass& p
     // FireBatch) owns the snapshot lifecycle.
 }
 
-bool Registry::OnBeforeDraw(REX::W32::ID3D11DeviceContext* context, const char* source) {
-    if (!context) return false;
-
-    // Quick early-out: if there are no Draw-time triggers registered at all,
-    // skip the per-draw lookup work entirely. We do up to ~thousands of
-    // draws per frame so this matters.
-    {
-        std::lock_guard lk(mutex);
-        if (drawDefIndex.empty()) return false;
+const DrawPassBatch* Registry::ResolveDrawPassBatchForShader(
+    REX::W32::ID3D11PixelShader* originalPS,
+    std::uint64_t* generation)
+{
+    const auto gen = drawPassCacheGeneration.load(std::memory_order_acquire);
+    if (generation) {
+        *generation = gen;
+    }
+    if (!originalPS || !hasDrawTimePasses.load(std::memory_order_acquire)) {
+        return nullptr;
     }
 
-    auto* originalPS = ::g_currentOriginalPixelShader.load(std::memory_order_acquire);
+    {
+        std::lock_guard lk(mutex);
+        auto it = drawBatchCache.find(originalPS);
+        if (it != drawBatchCache.end()) {
+            return it->second && !it->second->passes.empty() ? it->second.get() : nullptr;
+        }
+    }
 
-    // Match-attempt counter (across all matched-def passes). When any
-    // Draw-time pass has log=true, we dump bindings for the first N=8
-    // matches so we can compare contexts. Lifts the previous "first fire
-    // only" gating, which only ever showed us one of potentially many
-    // calling contexts and made it impossible to identify the actual
-    // tonemap fire among them.
-    static std::atomic<uint32_t> matchSamples{ 0 };
-    constexpr uint32_t kMaxMatchSamples = 8;
-
-    if (!originalPS) return false;
-
-    std::vector<Pass*> matches;
+    ShaderDefinition* matchedDef = nullptr;
     {
         std::shared_lock dlk(g_ShaderDB.mutex);
         auto it = g_ShaderDB.entries.find(originalPS);
-        if (it == g_ShaderDB.entries.end()) return false;
-        ShaderDefinition* matchedDef = it->second.matchedDefinition;
-        if (!matchedDef) return false;
-        std::lock_guard lk(mutex);
-        auto range = drawDefIndex.equal_range(matchedDef);
-        for (auto p = range.first; p != range.second; ++p) matches.push_back(p->second);
+        if (it != g_ShaderDB.entries.end() &&
+            it->second.matched.load(std::memory_order_acquire)) {
+            matchedDef = it->second.matchedDefinition;
+        }
     }
-    if (matches.empty()) return false;
+
+    auto batch = std::make_unique<DrawPassBatch>();
+    batch->originalPS = originalPS;
+    batch->matchedDefinition = matchedDef;
+
+    std::lock_guard lk(mutex);
+    auto cached = drawBatchCache.find(originalPS);
+    if (cached != drawBatchCache.end()) {
+        return cached->second && !cached->second->passes.empty() ? cached->second.get() : nullptr;
+    }
+
+    if (matchedDef) {
+        auto range = drawDefIndex.equal_range(matchedDef);
+        for (auto it = range.first; it != range.second; ++it) {
+            if (it->second) {
+                batch->passes.push_back(it->second);
+            }
+        }
+        std::stable_sort(batch->passes.begin(), batch->passes.end(),
+            [](Pass* a, Pass* b) { return a->spec.priority < b->spec.priority; });
+    }
+
+    auto* result = batch.get();
+    drawBatchCache.emplace(originalPS, std::move(batch));
+    return result->passes.empty() ? nullptr : result;
+}
+
+bool Registry::FireResolvedDrawBatch(REX::W32::ID3D11DeviceContext* context,
+                                     const DrawPassBatch* batch,
+                                     std::uint64_t generation,
+                                     const char* source)
+{
+    if (!context || !batch || batch->passes.empty()) {
+        return false;
+    }
+    if (generation != drawPassCacheGeneration.load(std::memory_order_acquire)) {
+        return false;
+    }
+
+    // Match-attempt counter (across all matched-def passes). When any
+    // Draw-time pass has log=true, we dump bindings for the first N=8
+    // matches so we can compare contexts.
+    static std::atomic<uint32_t> matchSamples{ 0 };
+    constexpr uint32_t kMaxMatchSamples = 8;
 
     // Diagnostic: when a Draw-time pass has log=true, dump engine bindings
     // for the first kMaxMatchSamples match attempts irrespective of which
     // pass eventually fires. We do this BEFORE FirePass so the captured
     // bindings reflect the engine state, not state our pass already mutated.
     bool wantDiag = false;
-    for (auto* p : matches) if (p->spec.log) { wantDiag = true; break; }
+    for (auto* p : batch->passes) if (p && p->spec.log) { wantDiag = true; break; }
     if (wantDiag) {
         const uint32_t n = matchSamples.fetch_add(1, std::memory_order_relaxed) + 1;
         if (n <= kMaxMatchSamples) {
             REX::INFO("CustomPass::OnBeforeDraw match #{} from {}: PS={} (matched-def fire context)",
-                      n, source ? source : "?", static_cast<void*>(originalPS));
+                      n, source ? source : "?", static_cast<void*>(batch->originalPS));
             REX::W32::ID3D11RenderTargetView* rtvs[8] = {};
             REX::W32::ID3D11DepthStencilView* dsv = nullptr;
             context->OMGetRenderTargets(8, rtvs, &dsv);
@@ -1378,9 +1433,14 @@ bool Registry::OnBeforeDraw(REX::W32::ID3D11DeviceContext* context, const char* 
         }
     }
 
-    // Batched fire: one shared SavedState capture/restore across the
-    // entire priority-sorted chain.
-    return FireBatch(context, matches);
+    return FireSortedBatch(context, batch->passes);
+}
+
+bool Registry::OnBeforeDraw(REX::W32::ID3D11DeviceContext* context, const char* source) {
+    auto* originalPS = ::g_currentOriginalPixelShader.load(std::memory_order_acquire);
+    std::uint64_t generation = 0;
+    const auto* batch = ResolveDrawPassBatchForShader(originalPS, &generation);
+    return FireResolvedDrawBatch(context, batch, generation, source);
 }
 
 bool Registry::OnBeforeShaderBound(REX::W32::ID3D11DeviceContext* context,
