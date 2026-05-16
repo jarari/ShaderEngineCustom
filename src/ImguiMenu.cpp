@@ -15,6 +15,7 @@ static std::vector<void*> g_lockedShaderKeys; // snapshot of map keys (original 
 static bool g_showReplaced = true; // default disabled
 // UI: show/hide settings menu
 static bool g_showSettings = false; // default disabled
+static bool g_windowActive = true;
 static bool g_shaderSettingsSaveModalRequested = false;
 static bool g_shaderSettingsSaveSucceeded = false;
 static std::string g_shaderSettingsSaveMessage;
@@ -83,6 +84,16 @@ static void ApplyCommandBufferReplayDedupeSetting(bool enabled)
     REX::INFO("ShaderEngine Settings: COMMAND_BUFFER_REPLAY_DEDUPE_SRV set to {}", COMMAND_BUFFER_REPLAY_DEDUPE_SRV);
 }
 
+static void ApplyShaderEngineEffectsSetting(bool enabled)
+{
+    if (SHADERENGINE_EFFECTS_ON == enabled) {
+        return;
+    }
+
+    SHADERENGINE_EFFECTS_ON = enabled;
+    REX::INFO("ShaderEngine Settings: SHADERENGINE_EFFECTS_ON set to {}", SHADERENGINE_EFFECTS_ON);
+}
+
 static void SaveShaderSettingsWithFeedback()
 {
     std::string shaderError;
@@ -109,9 +120,20 @@ REX::W32::ID3D11PixelShader* g_flashPixelShader = nullptr;
 // UI: Imgui WndProc hook variables
 WNDPROC g_originalWndProc = nullptr;
 extern LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
+
+static bool IsAltTabSystemKey(UINT msg, WPARAM wParam)
+{
+    return (msg == WM_SYSKEYDOWN || msg == WM_SYSKEYUP) &&
+        (wParam == VK_TAB || wParam == VK_MENU || wParam == VK_LMENU || wParam == VK_RMENU);
+}
+
 LRESULT CALLBACK ImGuiWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    const auto callOriginal = [&]() -> LRESULT {
+        return CallWindowProc(g_originalWndProc, hwnd, msg, wParam, lParam);
+    };
+
     switch (msg) {
-        case WM_KEYDOWN:
+        case WM_KEYDOWN: {
             // Detect if the key is being held down (using the repeat count bit)
             bool isPressed = (lParam & 0x40000000) == 0x0;
             if (isPressed) {
@@ -125,13 +147,70 @@ LRESULT CALLBACK ImGuiWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                 }
             }
             break;
+        }
+        case WM_ACTIVATEAPP:
+            g_windowActive = (wParam != FALSE);
+            if (!g_windowActive) {
+                ::ClipCursor(nullptr);
+            }
+            break;
+        case WM_ACTIVATE:
+            g_windowActive = (LOWORD(wParam) != WA_INACTIVE);
+            if (!g_windowActive) {
+                ::ClipCursor(nullptr);
+            }
+            break;
+        case WM_KILLFOCUS:
+            g_windowActive = false;
+            ::ClipCursor(nullptr);
+            break;
+        case WM_SETFOCUS:
+            g_windowActive = true;
+            break;
     }
 
     if (g_imguiInitialized && g_showSettings){
         ImGui_ImplWin32_WndProcHandler(hwnd, msg, wParam, lParam);
-        return true;
+
+        switch (msg) {
+            case WM_ACTIVATE:
+            case WM_ACTIVATEAPP:
+            case WM_KILLFOCUS:
+            case WM_SETFOCUS:
+            case WM_SIZE:
+            case WM_SYSCOMMAND:
+                return callOriginal();
+            case WM_SYSKEYDOWN:
+            case WM_SYSKEYUP:
+                return IsAltTabSystemKey(msg, wParam) ? callOriginal() : 0;
+            case WM_KEYDOWN:
+            case WM_KEYUP:
+            case WM_CHAR:
+            case WM_DEADCHAR:
+            case WM_SYSCHAR:
+            case WM_SYSDEADCHAR:
+            case WM_INPUT:
+            case WM_MOUSEMOVE:
+            case WM_LBUTTONDOWN:
+            case WM_LBUTTONUP:
+            case WM_LBUTTONDBLCLK:
+            case WM_RBUTTONDOWN:
+            case WM_RBUTTONUP:
+            case WM_RBUTTONDBLCLK:
+            case WM_MBUTTONDOWN:
+            case WM_MBUTTONUP:
+            case WM_MBUTTONDBLCLK:
+            case WM_XBUTTONDOWN:
+            case WM_XBUTTONUP:
+            case WM_XBUTTONDBLCLK:
+            case WM_MOUSEWHEEL:
+            case WM_MOUSEHWHEEL:
+                return 0;
+        }
+
+        return callOriginal();
     }
-    return CallWindowProc(g_originalWndProc, hwnd, msg, wParam, lParam);
+    return callOriginal();
 }
 
 bool UIInitialize(HWND hwnd)
@@ -205,6 +284,11 @@ bool UIIsMenuOpen()
     return g_showSettings;
 }
 
+bool UIIsWindowActive()
+{
+    return g_windowActive;
+}
+
 const RECT* UIGetWindowRect()
 {
     return &g_windowRect;
@@ -266,6 +350,12 @@ void UIDrawShaderSettingsOverlay() {
     ImGui::SameLine();
     if (ImGui::Button("Save settings")) {
         SaveShaderSettingsWithFeedback();
+    }
+    ImGui::Separator();
+
+    bool shaderEngineEffectsOn = SHADERENGINE_EFFECTS_ON;
+    if (ImGui::Checkbox("Enable shader replacements and custom passes", &shaderEngineEffectsOn)) {
+        ApplyShaderEngineEffectsSetting(shaderEngineEffectsOn);
     }
     ImGui::Separator();
 

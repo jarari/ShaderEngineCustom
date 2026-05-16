@@ -1480,6 +1480,7 @@ bool Registry::FireResolvedDrawBatch(REX::W32::ID3D11DeviceContext* context,
 }
 
 bool Registry::OnBeforeDraw(REX::W32::ID3D11DeviceContext* context, const char* source) {
+    if (!SHADERENGINE_EFFECTS_ON) return false;
     auto* originalPS = ::g_currentOriginalPixelShader.load(std::memory_order_acquire);
     std::uint64_t generation = 0;
     const auto* batch = ResolveDrawPassBatchForShader(originalPS, &generation);
@@ -1488,6 +1489,7 @@ bool Registry::OnBeforeDraw(REX::W32::ID3D11DeviceContext* context, const char* 
 
 bool Registry::OnBeforeShaderBound(REX::W32::ID3D11DeviceContext* context,
                                    REX::W32::ID3D11PixelShader* originalPS) {
+    if (!SHADERENGINE_EFFECTS_ON) return false;
     if (!originalPS || !context) return false;
     std::vector<Pass*> matches;
     {
@@ -1513,6 +1515,7 @@ bool Registry::OnBeforeShaderBound(REX::W32::ID3D11DeviceContext* context,
 }
 
 void Registry::OnFramePresent(REX::W32::ID3D11DeviceContext* context) {
+    if (!SHADERENGINE_EFFECTS_ON) return;
     if (!context || !g_rendererData) return;
     ++currentFrame;
 

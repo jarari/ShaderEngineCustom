@@ -772,7 +772,7 @@ void D3D11OnPresent_Internal()
     // Custom-pass per-frame work: allocate resources, run any AtPresent passes,
     // ping-pong, advance frame counter. Done after the booster CB update so
     // GFXInjected[0] is fresh for any AtPresent pass.
-    if (g_rendererData && g_rendererData->context) {
+    if (SHADERENGINE_EFFECTS_ON && g_rendererData && g_rendererData->context) {
         CustomPass::g_registry.OnFramePresent(g_rendererData->context);
         // GPU scalar probes: dispatch each probe's 1-thread CS and read back
         // the previous frame's value. GFXInjected and modular value buffers
@@ -788,7 +788,9 @@ void D3D11OnPSSetShaderResources_Internal(REX::W32::ID3D11DeviceContext* context
     if (g_customPassRendering) {
         return;
     }
-    if (ShaderResources::ActiveReplacementPixelShaderNeedsResourceRebind() && !g_bindingInjectedPixelResources) {
+    if (SHADERENGINE_EFFECTS_ON &&
+        ShaderResources::ActiveReplacementPixelShaderNeedsResourceRebind() &&
+        !g_bindingInjectedPixelResources) {
         ShaderResources::BindInjectedPixelShaderResources(context);
     }
 }
@@ -827,6 +829,9 @@ void D3D11OnDraw_Internal(REX::W32::ID3D11DeviceContext* context, const char* so
         ShadowTelemetry::OnD3DDraw();
     }
     // BindDrawTagForCurrentDraw(context);
+    if (!SHADERENGINE_EFFECTS_ON) {
+        return;
+    }
     FireArmedCustomPassDrawBatch(context, source);
     if (ShaderResources::ActiveReplacementPixelShaderNeedsResourceRebind()) {
         ShaderResources::BindInjectedPixelShaderResources(context);
@@ -1467,12 +1472,19 @@ D3D11PSSetShaderResult D3D11OnPSSetShaderBefore_Internal(
     }
 
     g_currentOriginalPixelShader.store(pixelShader, std::memory_order_release);
-    ArmCustomPassDrawBatch(pixelShader);
+    if (SHADERENGINE_EFFECTS_ON) {
+        ArmCustomPassDrawBatch(pixelShader);
+    } else {
+        ArmCustomPassDrawBatch(nullptr);
+    }
 
     // Light-tracker capture at PS-bind time. Engine sets RTVs / blend /
     // scissor / cb2 / SRVs before PSSetShader, so all the per-pass state
     // we want is live at this moment. Cheap no-op when not capturing.
     LightTracker::OnPSBind(context, pixelShader);
+    if (!SHADERENGINE_EFFECTS_ON) {
+        return result;
+    }
     // Trigger any customPass blocks attached to this original shader. The
     // pass runs immediately before the hook forwards to the original
     // PSSetShader so the engine state we save/restore is the state the engine
@@ -1531,6 +1543,10 @@ void D3D11OnPSSetShaderAfter_Internal(
     if (g_customPassRendering) {
         return;
     }
+    if (!SHADERENGINE_EFFECTS_ON) {
+        ShaderResources::SetActiveReplacementPixelShaderUsage(nullptr, false);
+        return;
+    }
     ShaderResources::SetActiveReplacementPixelShaderUsage(result.activeReplacementDef, result.usingReplacementPixelShader);
     if (ShaderResources::ActiveReplacementPixelShaderNeedsResourceRebind()) {
         ShaderResources::BindInjectedPixelShaderResources(context);
@@ -1549,6 +1565,9 @@ REX::W32::ID3D11VertexShader* D3D11OnVSSetShader_Internal(
     REX::W32::ID3D11VertexShader* vertexShader)
 {
     if (g_customPassRendering) {
+        return vertexShader;
+    }
+    if (!SHADERENGINE_EFFECTS_ON) {
         return vertexShader;
     }
     if (vertexShader) {
@@ -2164,7 +2183,7 @@ namespace
     BOOL WINAPI HookedClipCursor(const RECT* rect)
     {
         if (g_imguiInitialized && UIIsMenuOpen()) {
-            rect = UIGetWindowRect();
+            rect = UIIsWindowActive() ? UIGetWindowRect() : nullptr;
         }
         return D3D11Hooks::OriginalClipCursor(rect);
     }

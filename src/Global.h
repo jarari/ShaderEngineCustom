@@ -26,6 +26,8 @@ extern REX::W32::ID3D11PixelShader* g_flashPixelShader;
 extern std::filesystem::path g_pluginPath;
 // Global debug flag
 extern bool DEBUGGING;
+// Master runtime kill switch for shader replacements and custom passes.
+extern bool SHADERENGINE_EFFECTS_ON;
 // Custom buffer update flag
 extern bool CUSTOMBUFFER_ON;
 // Experimental directional shadow-map static-depth cache. Off by default.

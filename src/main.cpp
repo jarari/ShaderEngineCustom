@@ -80,6 +80,8 @@ std::filesystem::path g_pluginPath;
 std::filesystem::path g_shaderFolderPath;
 // Global debug flag
 bool DEBUGGING = false;
+// Master runtime kill switch for shader replacements and custom passes.
+bool SHADERENGINE_EFFECTS_ON = true;
 // Custom buffer update flag
 bool CUSTOMBUFFER_ON = true;
 // Experimental directional shadow-map static-depth cache benchmark
@@ -310,6 +312,7 @@ bool SaveShaderEngineConfig(std::string* errorMessage)
 #if SHADERENGINE_ENABLE_SHADOW_TELEMETRY
         bool foundShadowTelemetry = false;
 #endif
+        bool foundShaderEngineEffects = false;
         bool foundShadowCache = false;
         bool foundCommandBufferReplayDedupeSrv = false;
         for (auto& line : lines) {
@@ -331,7 +334,10 @@ bool SaveShaderEngineConfig(std::string* errorMessage)
                 foundShadowTelemetry = true;
             } else
 #endif
-            if (lowerKey == "shadow_cache_directional_mapslot1_on") {
+            if (lowerKey == "shaderengine_effects_on") {
+                line = std::string("SHADERENGINE_EFFECTS_ON=") + (SHADERENGINE_EFFECTS_ON ? "true" : "false");
+                foundShaderEngineEffects = true;
+            } else if (lowerKey == "shadow_cache_directional_mapslot1_on") {
                 line = std::string("SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON=") + (SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON ? "true" : "false");
                 foundShadowCache = true;
             } else if (lowerKey == "command_buffer_replay_dedupe_srv") {
@@ -364,6 +370,14 @@ bool SaveShaderEngineConfig(std::string* errorMessage)
             lines.emplace_back(std::string("SHADOW_TELEMETRY_MODE=") + (enabled ? "on" : "off"));
         }
 #endif
+        if (!foundShaderEngineEffects) {
+            if (!lines.empty() && !lines.back().empty()) {
+                lines.emplace_back();
+            }
+            lines.emplace_back("; --- SHADERENGINE EFFECTS ---");
+            lines.emplace_back("; Master kill switch for shader replacements and custom passes.");
+            lines.emplace_back(std::string("SHADERENGINE_EFFECTS_ON=") + (SHADERENGINE_EFFECTS_ON ? "true" : "false"));
+        }
         if (!foundShadowCache) {
             if (!lines.empty() && !lines.back().empty()) {
                 lines.emplace_back();
@@ -1089,6 +1103,12 @@ void LoadConfig(HMODULE hModule) {
         else if (lowerKey == "custombuffer_on") {
             CUSTOMBUFFER_ON = (ToLower(value) == "true" || value == "1");
             REX::INFO("LoadConfig: CUSTOMBUFFER_ON set to {}", CUSTOMBUFFER_ON);
+            continue;
+        }
+        else if (lowerKey == "shaderengine_effects_on") {
+            const std::string v = ToLower(value);
+            SHADERENGINE_EFFECTS_ON = (v == "true" || v == "1" || v == "on");
+            REX::INFO("LoadConfig: SHADERENGINE_EFFECTS_ON set to {}", SHADERENGINE_EFFECTS_ON);
             continue;
         }
         else if (lowerKey == "shadow_cache_directional_mapslot1_on") {

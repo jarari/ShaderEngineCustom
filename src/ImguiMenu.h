@@ -5,6 +5,7 @@
 bool UIInitialize(HWND hwnd);
 void UIRenderFrame();
 bool UIIsMenuOpen();
+bool UIIsWindowActive();
 const RECT* UIGetWindowRect();
 
 LRESULT CALLBACK ImGuiWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);

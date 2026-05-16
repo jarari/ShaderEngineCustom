@@ -76,6 +76,11 @@ REX::W32::ID3D11ShaderResourceView* g_drawTagSRV = nullptr;
 
 void ArmCustomPassDrawBatch(REX::W32::ID3D11PixelShader* originalPS)
 {
+    if (!SHADERENGINE_EFFECTS_ON) {
+        g_armedCustomPassDrawBatch = nullptr;
+        g_armedCustomPassDrawBatchGeneration = 0;
+        return;
+    }
     g_armedCustomPassDrawBatch =
         CustomPass::g_registry.ResolveDrawPassBatchForShader(
             originalPS,
@@ -84,6 +89,9 @@ void ArmCustomPassDrawBatch(REX::W32::ID3D11PixelShader* originalPS)
 
 bool FireArmedCustomPassDrawBatch(REX::W32::ID3D11DeviceContext* context, const char* source)
 {
+    if (!SHADERENGINE_EFFECTS_ON) {
+        return false;
+    }
     return CustomPass::g_registry.FireResolvedDrawBatch(
         context,
         g_armedCustomPassDrawBatch,
@@ -2612,7 +2620,7 @@ namespace
         if (g_rendererData && g_rendererData->context) {
             BindDrawTagForCurrentDraw(g_rendererData->context, true);
             FireArmedCustomPassDrawBatch(g_rendererData->context, "engine-BSBatch");
-            if (ShaderResources::ActiveReplacementPixelShaderNeedsResourceRebind()) {
+            if (SHADERENGINE_EFFECTS_ON && ShaderResources::ActiveReplacementPixelShaderNeedsResourceRebind()) {
                 ShaderResources::BindInjectedPixelShaderResources(g_rendererData->context);
             }
         }
@@ -3506,7 +3514,7 @@ static void BindDrawTagForCurrentDraw(REX::W32::ID3D11DeviceContext* context, bo
     context->PSSetShaderResources(DRAWTAG_SLOT, 1, &drawTagSRV);
     g_bindingInjectedPixelResources = false;
 
-    if (ShaderResources::ActiveReplacementPixelShaderNeedsResourceRebind()) {
+    if (SHADERENGINE_EFFECTS_ON && ShaderResources::ActiveReplacementPixelShaderNeedsResourceRebind()) {
         ShaderResources::BindInjectedPixelShaderResources(context);
     }
 
