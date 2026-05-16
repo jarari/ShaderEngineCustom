@@ -58,8 +58,10 @@ std::atomic<bool> s_forceHooks{ false };
 //   NvidiaHBAO          253972   E9-5  15B   mov rax,rsp + 3 saves
 //   DeferredLightsImpl 1108521   E9-5  18B   mov rax,rsp; push rbp; lea rbp; sub rsp
 //   DeferredComposite   728427   E9-5  15B   mov rax,rsp + 2 saves + 5 pushes
-//   Forward             656535   E9-5   6B   mov [rsp+8],rbx; push rdi
-//                                            (RIP-rel mov at byte 10)
+//   Forward             656535   CALL-5 from Render_PreUI+0x1C9
+//                                            (avoids detouring the Forward prologue,
+//                                             which frame-generation/upscaling mods
+//                                             also hook)
 
 REL::Relocation<std::uintptr_t> ptr_RenderPreUI        { REL::ID{  984743, 0 } };
 REL::Relocation<std::uintptr_t> ptr_MainAccum          { REL::ID{  718911, 0 } };
@@ -88,8 +90,8 @@ constexpr std::size_t kPrologueDeferredDecals      = 17;  // E9-5 patch
 constexpr std::size_t kPrologueNvidiaHBAO          = 15;  // E9-5 patch
 constexpr std::size_t kPrologueDeferredLightsImpl  = 18;  // E9-5 patch
 constexpr std::size_t kPrologueDeferredComposite   = 15;  // E9-5 patch
-constexpr std::size_t kPrologueForward             =  6;  // E9-5 patch
 constexpr std::size_t kPrologueTier0_SubAndRipRel  = 11;  // E9-5 + relocator
+constexpr std::uintptr_t kRenderPreUIForwardCallOffsetOG = 0x1C9; // call DrawWorld::Forward @ 0x142857649
 
 // All hooked functions are `void(void)` on OG.
 using VoidVoid_t = void (*)();
@@ -516,6 +518,33 @@ bool InstallOne(const char* name, REL::Relocation<std::uintptr_t>& target,
     return true;
 }
 
+bool InstallCall(const char* name,
+                 std::uintptr_t callSite,
+                 std::uintptr_t expectedTarget,
+                 void* hook,
+                 void** outOrig)
+{
+    const auto* bytes = reinterpret_cast<const std::uint8_t*>(callSite);
+    if (bytes[0] != 0xE8) {
+        REX::WARN("PhaseTelemetry::Initialize: call-site install failed for {} @ {:#x}: expected E8, found {:02x}",
+                  name, callSite, bytes[0]);
+        return false;
+    }
+
+    REL::Relocation<std::uintptr_t> rel{ callSite };
+    const auto original = rel.write_call<5>(reinterpret_cast<std::uintptr_t>(hook));
+    *outOrig = reinterpret_cast<void*>(original);
+
+    if (original != expectedTarget) {
+        REX::WARN("PhaseTelemetry::Initialize: patched {} call site @ {:#x}, but original target was {:#x} (expected {:#x}); chaining current target",
+                  name, callSite, original, expectedTarget);
+    } else {
+        REX::INFO("PhaseTelemetry::Initialize: patched {} call site @ {:#x} -> original {:#x}",
+                  name, callSite, original);
+    }
+    return true;
+}
+
 bool s_installed = false;
 
 }  // anonymous namespace
@@ -708,10 +737,11 @@ bool Initialize()
                      ptr_DeferredComposite, kPrologueDeferredComposite, HookFlavor::E9_5,
                      reinterpret_cast<void*>(&HookedDeferredComposite),
                      reinterpret_cast<void**>(&s_origDeferredComposite));
-    ok &= InstallOne("DrawWorld::Forward",
-                     ptr_Forward, kPrologueForward, HookFlavor::E9_5,
-                     reinterpret_cast<void*>(&HookedForward),
-                     reinterpret_cast<void**>(&s_origForward));
+    ok &= InstallCall("DrawWorld::Render_PreUI -> DrawWorld::Forward",
+                      ptr_RenderPreUI.address() + kRenderPreUIForwardCallOffsetOG,
+                      ptr_Forward.address(),
+                      reinterpret_cast<void*>(&HookedForward),
+                      reinterpret_cast<void**>(&s_origForward));
 
     // Tier 0 ??the five previously-skipped phases. All share a
     // `sub rsp,0x38; <rip-rel mov/cmp at byte 4>` prologue; we capture 11 B
