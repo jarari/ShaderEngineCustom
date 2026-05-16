@@ -2374,8 +2374,8 @@ namespace
         // tag buffer is current for every pass that classified as actor.
         if (g_rendererData && g_rendererData->context) {
             BindDrawTagForCurrentDraw(g_rendererData->context, true);
-            if (FireArmedCustomPassDrawBatch(g_rendererData->context, "engine-BSBatch")
-                && ShaderResources::ActiveReplacementPixelShaderNeedsResourceRebind()) {
+            FireArmedCustomPassDrawBatch(g_rendererData->context, "engine-BSBatch");
+            if (ShaderResources::ActiveReplacementPixelShaderNeedsResourceRebind()) {
                 ShaderResources::BindInjectedPixelShaderResources(g_rendererData->context);
             }
         }

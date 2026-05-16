@@ -442,6 +442,26 @@ struct ReplacementTextureBinding {
     }
 };
 
+enum class ReplacementSRVSourceKind : uint8_t {
+    None,
+    Depth,
+    SceneHDR,
+    GBufferRT,
+    GBufferNormal,
+    GBufferAlbedo,
+    GBufferMaterial,
+    MotionVectors,
+    CustomResource
+};
+
+struct ReplacementSRVBinding {
+    int slot = -1;
+    ReplacementSRVSourceKind kind = ReplacementSRVSourceKind::None;
+    std::string resourceName;
+    int gbufferIndex = -1;
+    bool warnedMissing = false;
+};
+
 // Shader definitions from INI file
 struct ShaderDefinition {
     ShaderDefinition() = default;
@@ -472,6 +492,7 @@ struct ShaderDefinition {
         , loadedPixelShader(other.loadedPixelShader)
         , loadedVertexShader(other.loadedVertexShader)
         , replacementTextures(std::move(other.replacementTextures))
+        , replacementSRVs(std::move(other.replacementSRVs))
         , usesGFXInjected(other.usesGFXInjected)
         , usesGFXDrawTag(other.usesGFXDrawTag)
         , usesGFXModularFloats(other.usesGFXModularFloats)
@@ -523,6 +544,7 @@ struct ShaderDefinition {
     REX::W32::ID3D11PixelShader* loadedPixelShader = nullptr;
     REX::W32::ID3D11VertexShader* loadedVertexShader = nullptr;
     std::vector<ReplacementTextureBinding> replacementTextures;
+    std::vector<ReplacementSRVBinding> replacementSRVs;
     bool usesGFXInjected = false;
     bool usesGFXDrawTag = false;
     bool usesGFXModularFloats = false;

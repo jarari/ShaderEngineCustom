@@ -181,6 +181,64 @@ inline std::pair<std::string, std::string> GetKeyValueFromLine(const std::string
     std::string value = cleanLine.substr(eqPos + 1);
     return {key, value};
 }
+
+bool ParseReplacementSRVBinding(const std::string& token, ReplacementSRVBinding& out)
+{
+    const size_t colon = token.find(':');
+    if (colon == std::string::npos) {
+        return false;
+    }
+
+    try {
+        out.slot = std::stoi(token.substr(0, colon));
+    } catch (...) {
+        return false;
+    }
+
+    const std::string source = token.substr(colon + 1);
+    const std::string lowerSource = ToLower(source);
+    if (lowerSource == "depth") {
+        out.kind = ReplacementSRVSourceKind::Depth;
+        return true;
+    }
+    if (lowerSource == "scenehdr") {
+        out.kind = ReplacementSRVSourceKind::SceneHDR;
+        return true;
+    }
+    if (lowerSource == "gbuffernormal") {
+        out.kind = ReplacementSRVSourceKind::GBufferNormal;
+        return true;
+    }
+    if (lowerSource == "gbufferalbedo") {
+        out.kind = ReplacementSRVSourceKind::GBufferAlbedo;
+        return true;
+    }
+    if (lowerSource == "gbuffermaterial") {
+        out.kind = ReplacementSRVSourceKind::GBufferMaterial;
+        return true;
+    }
+    if (lowerSource == "motionvectors") {
+        out.kind = ReplacementSRVSourceKind::MotionVectors;
+        return true;
+    }
+    if (lowerSource.rfind("customresource:", 0) == 0) {
+        out.kind = ReplacementSRVSourceKind::CustomResource;
+        out.resourceName = source.substr(strlen("customResource:"));
+        return !out.resourceName.empty();
+    }
+    if (lowerSource.rfind("gbufferrt:", 0) == 0) {
+        out.kind = ReplacementSRVSourceKind::GBufferRT;
+        try {
+            out.gbufferIndex = std::stoi(source.substr(strlen("gbufferRT:")));
+        } catch (...) {
+            return false;
+        }
+        return true;
+    }
+
+    return false;
+}
+
 // Helper to get the directory of the plugin DLL OS agnostic
 std::filesystem::path GetPluginDirectory(HMODULE hModule) {
 #ifdef _WIN32
@@ -747,6 +805,24 @@ int LoadShaderDefinitionsFromFile(const std::filesystem::path& shaderFolderPath,
                         }
                         binding.file = texturePath;
                         def.replacementTextures.push_back(std::move(binding));
+                    }
+                }
+                // Bind engine/custom SRVs whenever this definition's replacement shader is active.
+                // Format: bindSRV=40:customResource:ssaoFinal,68:sceneHDR.
+                else if (lowerKey == "bindsrv" || lowerKey == "shaderresource" || lowerKey == "replacementsrv") {
+                    std::istringstream ss(value);
+                    std::string token;
+                    while (std::getline(ss, token, ',')) {
+                        ReplacementSRVBinding binding{};
+                        if (!ParseReplacementSRVBinding(token, binding)) {
+                            REX::WARN("LoadShaderDefinitionsFromFile: Invalid bindSRV entry for {}: {}", shaderId, token);
+                            continue;
+                        }
+                        if (binding.slot < 0 || binding.slot >= 128) {
+                            REX::WARN("LoadShaderDefinitionsFromFile: bindSRV slot out of range for {}: {}", shaderId, token);
+                            continue;
+                        }
+                        def.replacementSRVs.push_back(std::move(binding));
                     }
                 }
                 // Default to false

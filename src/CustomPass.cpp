@@ -2,6 +2,7 @@
 #include <PCH.h>
 #include <CustomPass.h>
 #include <RenderTargets.h>
+#include <ShaderResources.h>
 #include <d3d11.h>
 
 // Helpers shared with main.cpp (defined there).
@@ -23,6 +24,12 @@ extern ShaderDefDB g_shaderDefinitions;
 namespace CustomPass {
 
 Registry g_registry;
+
+}  // namespace CustomPass
+
+thread_local bool g_customPassRendering = false;
+
+namespace CustomPass {
 
 // --- FileWatcher --------------------------------------------------------
 
@@ -115,25 +122,31 @@ void ResolveScale(ScaleMode mode, uint32_t div, uint32_t absW, uint32_t absH,
 }
 
 bool ParseInputBinding(const std::string& token, InputBinding& out) {
-    // Format: "<slot>:<source>" where source is depth | currentRTV | customResource:NAME | gbufferRT:N
+    // Format: "<slot>:<source>" where source is depth | currentRTV | currentPSRV:N | customResource:NAME | gbufferRT:N
     auto colon = token.find(':');
     if (colon == std::string::npos) return false;
     try { out.slot = std::stoi(token.substr(0, colon)); } catch (...) { return false; }
     std::string source = token.substr(colon + 1);
+    const std::string lowerSource = ToLower(source);
 
-    if (source == "depth")            { out.kind = InputKind::Depth; return true; }
-    if (source == "currentRTV" || source == "currentRTV0") { out.kind = InputKind::CurrentRTV; return true; }
-    if (source == "gbufferNormal")    { out.kind = InputKind::GBufferNormal; return true; }
-    if (source == "gbufferAlbedo")    { out.kind = InputKind::GBufferAlbedo; return true; }
-    if (source == "gbufferMaterial")  { out.kind = InputKind::GBufferMaterial; return true; }
-    if (source == "motionVectors")    { out.kind = InputKind::MotionVectors; return true; }
-    if (source == "sceneHDR")         { out.kind = InputKind::SceneHDR; return true; }
-    if (source.rfind("customResource:", 0) == 0) {
+    if (lowerSource == "depth")            { out.kind = InputKind::Depth; return true; }
+    if (lowerSource == "currentrtv" || lowerSource == "currentrtv0") { out.kind = InputKind::CurrentRTV; return true; }
+    if (lowerSource == "gbuffernormal")    { out.kind = InputKind::GBufferNormal; return true; }
+    if (lowerSource == "gbufferalbedo")    { out.kind = InputKind::GBufferAlbedo; return true; }
+    if (lowerSource == "gbuffermaterial")  { out.kind = InputKind::GBufferMaterial; return true; }
+    if (lowerSource == "motionvectors")    { out.kind = InputKind::MotionVectors; return true; }
+    if (lowerSource == "scenehdr")         { out.kind = InputKind::SceneHDR; return true; }
+    if (lowerSource.rfind("currentpsrv:", 0) == 0) {
+        out.kind = InputKind::CurrentPSRV;
+        try { out.sourceSlot = std::stoi(source.substr(strlen("currentPSRV:"))); } catch (...) { return false; }
+        return true;
+    }
+    if (lowerSource.rfind("customresource:", 0) == 0) {
         out.kind = InputKind::Resource;
         out.resourceName = source.substr(strlen("customResource:"));
         return true;
     }
-    if (source.rfind("gbufferRT:", 0) == 0) {
+    if (lowerSource.rfind("gbufferrt:", 0) == 0) {
         out.kind = InputKind::GBufferRT;
         try { out.gbufferIndex = std::stoi(source.substr(strlen("gbufferRT:"))); } catch (...) { return false; }
         return true;
@@ -415,6 +428,7 @@ bool Registry::ParseResourceSection(const std::string& name,
         else if (lk == "scale")           ParseScale(value, res->spec.scaleMode, res->spec.scaleDiv, res->spec.absWidth, res->spec.absHeight);
         else if (lk == "miplevels")       { try { res->spec.mipLevels = static_cast<uint32_t>(std::stoul(value)); } catch (...) {} }
         else if (lk == "srvslot")         { try { res->spec.srvSlot = std::stoi(value); } catch (...) {} }
+        else if (lk == "global" || lk == "globalbind") res->spec.globalBind = (ToLower(value) == "true" || value == "1");
         else if (lk == "uav")             res->spec.needUav = (ToLower(value) == "true" || value == "1");
         else if (lk == "rtv")             res->spec.needRtv = (ToLower(value) == "true" || value == "1");
         else if (lk == "clearonpresent")  res->spec.clearOnPresent = (ToLower(value) == "true" || value == "1");
@@ -434,11 +448,12 @@ bool Registry::ParseResourceSection(const std::string& name,
     std::lock_guard lk(mutex);
     Resource* raw = res.get();
     resourceIndex[name] = raw;
-    if (raw->spec.srvSlot >= 0) {
+    if (raw->spec.globalBind && raw->spec.srvSlot >= 0) {
         hasGlobalResourceBindings.store(true, std::memory_order_release);
     }
     resources.push_back(std::move(res));
-    REX::INFO("CustomPass: registered customResource '{}' (slot t{})", name, raw->spec.srvSlot);
+    REX::INFO("CustomPass: registered customResource '{}' (slot t{}, global={})",
+        name, raw->spec.srvSlot, raw->spec.globalBind ? "true" : "false");
     return true;
 }
 
@@ -811,10 +826,13 @@ struct SavedState {
     REX::W32::ID3D11Buffer*                 indexBuf = nullptr;
     REX::W32::DXGI_FORMAT                   indexFormat = REX::W32::DXGI_FORMAT_UNKNOWN;
     UINT                                    indexOffset = 0;
-    static constexpr UINT                   kSrvCount = 16;
+    static constexpr UINT                   kSrvCount = 128;
     REX::W32::ID3D11ShaderResourceView*     psSrvs[kSrvCount] = {};
     REX::W32::ID3D11ShaderResourceView*     csSrvs[kSrvCount] = {};
-    static constexpr UINT                   kUavCount = 4;
+    static constexpr UINT                   kSamplerCount = 16;
+    REX::W32::ID3D11SamplerState*           psSamplers[kSamplerCount] = {};
+    REX::W32::ID3D11SamplerState*           csSamplers[kSamplerCount] = {};
+    static constexpr UINT                   kUavCount = 8;
     REX::W32::ID3D11UnorderedAccessView*    csUavs[kUavCount] = {};
 
     void Capture(REX::W32::ID3D11DeviceContext* ctx) {
@@ -832,6 +850,8 @@ struct SavedState {
         ctx->IAGetIndexBuffer(&indexBuf, &indexFormat, &indexOffset);
         ctx->PSGetShaderResources(0, kSrvCount, psSrvs);
         ctx->CSGetShaderResources(0, kSrvCount, csSrvs);
+        ctx->PSGetSamplers(0, kSamplerCount, psSamplers);
+        ctx->CSGetSamplers(0, kSamplerCount, csSamplers);
         ctx->CSGetUnorderedAccessViews(0, kUavCount, csUavs);
     }
     void Restore(REX::W32::ID3D11DeviceContext* ctx) {
@@ -848,6 +868,8 @@ struct SavedState {
         ctx->IASetIndexBuffer(indexBuf, indexFormat, indexOffset);
         ctx->PSSetShaderResources(0, kSrvCount, psSrvs);
         ctx->CSSetShaderResources(0, kSrvCount, csSrvs);
+        ctx->PSSetSamplers(0, kSamplerCount, psSamplers);
+        ctx->CSSetSamplers(0, kSamplerCount, csSamplers);
         UINT initial[kUavCount] = { 0, 0, 0, 0 };
         ctx->CSSetUnorderedAccessViews(0, kUavCount, csUavs, initial);
 
@@ -863,6 +885,8 @@ struct SavedState {
         if (indexBuf) indexBuf->Release();
         for (auto* s : psSrvs) if (s) s->Release();
         for (auto* s : csSrvs) if (s) s->Release();
+        for (auto* s : psSamplers) if (s) s->Release();
+        for (auto* s : csSamplers) if (s) s->Release();
         for (auto* u : csUavs) if (u) u->Release();
     }
 };
@@ -980,9 +1004,12 @@ void EnsureSamplers(REX::W32::ID3D11Device* dev) {
 
 void Registry::FirePass(REX::W32::ID3D11DeviceContext* context, Pass& pass) {
     if (!context) return;
+    const bool wasCustomPassRendering = ::g_customPassRendering;
+    ::g_customPassRendering = true;
     SavedState saved; saved.Capture(context);
     FirePassWithSaved(context, pass, saved);
     saved.Restore(context);
+    ::g_customPassRendering = wasCustomPassRendering;
 }
 
 bool Registry::FireBatch(REX::W32::ID3D11DeviceContext* context, std::vector<Pass*>& matches) {
@@ -1001,15 +1028,17 @@ bool Registry::FireSortedBatch(REX::W32::ID3D11DeviceContext* context, const std
     // up to N (chain-length) save/restore cycles into one, which dominates
     // CPU overhead when many passes share a trigger (e.g. SSAO + SSRTGI +
     // fake skin bloom firing at beforeDrawForHook:visualTonemap).
+    const bool wasCustomPassRendering = ::g_customPassRendering;
+    ::g_customPassRendering = true;
     SavedState saved; saved.Capture(context);
     bool firedAny = false;
     for (auto* p : matches) {
         if (!p) continue;
         if (!p->spec.active) continue;
-        FirePassWithSaved(context, *p, saved);
-        firedAny = true;
+        firedAny = FirePassWithSaved(context, *p, saved) || firedAny;
     }
     saved.Restore(context);
+    ::g_customPassRendering = wasCustomPassRendering;
     return firedAny;
 }
 
@@ -1042,10 +1071,10 @@ static bool EvaluateActiveWhen(Pass& pass) {
     return pass.activeWhenNegated ? !sv->current.b : sv->current.b;
 }
 
-void Registry::FirePassWithSaved(REX::W32::ID3D11DeviceContext* context, Pass& pass, SavedState& saved) {
-    if (!context || !g_rendererData || !g_rendererData->device) return;
-    if (!pass.spec.active) return;
-    if (!EvaluateActiveWhen(pass)) return;
+bool Registry::FirePassWithSaved(REX::W32::ID3D11DeviceContext* context, Pass& pass, SavedState& saved) {
+    if (!context || !g_rendererData || !g_rendererData->device) return false;
+    if (!pass.spec.active) return false;
+    if (!EvaluateActiveWhen(pass)) return false;
 
     // Hot-reload: if the watcher thread saw a disk change, drop compiled
     // state on this (main render) thread before EnsureCompiled re-builds.
@@ -1057,14 +1086,13 @@ void Registry::FirePassWithSaved(REX::W32::ID3D11DeviceContext* context, Pass& p
         pass.compileFailed = false;
     }
 
-    if (!EnsureCompiled(pass)) return;
-    if (!EnsurePassResources(pass)) return;
+    if (!EnsureCompiled(pass)) return false;
+    if (!EnsurePassResources(pass)) return false;
 
     // Per-frame gating
     if (pass.spec.oncePerFrame) {
         uint32_t prev = pass.lastFiredFrame.load(std::memory_order_acquire);
-        if (prev == currentFrame) return;
-        pass.lastFiredFrame.store(currentFrame, std::memory_order_release);
+        if (prev == currentFrame) return false;
     }
 
     auto* device = g_rendererData->device;
@@ -1088,7 +1116,10 @@ void Registry::FirePassWithSaved(REX::W32::ID3D11DeviceContext* context, Pass& p
     for (auto& in : pass.spec.inputs) {
         REX::W32::ID3D11ShaderResourceView* s = nullptr;
         switch (in.kind) {
-            case InputKind::Depth: s = g_depthSRV; break;
+            case InputKind::Depth:
+                g_depthSRV = ShaderResources::GetDepthBufferSRV_Internal();
+                s = g_depthSRV;
+                break;
             case InputKind::CurrentRTV: {
                 // Use the snapshot we captured BEFORE Restore (saved.rtvs[0]).
                 // The render target's underlying resource is the engine's HDR
@@ -1104,6 +1135,12 @@ void Registry::FirePassWithSaved(REX::W32::ID3D11DeviceContext* context, Pass& p
                         if (tex) { s = snapshotCache.Get(device, tex); tex->Release(); }
                         res->Release();
                     }
+                }
+                break;
+            }
+            case InputKind::CurrentPSRV: {
+                if (in.sourceSlot >= 0 && in.sourceSlot < (int)SavedState::kSrvCount) {
+                    s = saved.psSrvs[in.sourceSlot];
                 }
                 break;
             }
@@ -1228,7 +1265,7 @@ void Registry::FirePassWithSaved(REX::W32::ID3D11DeviceContext* context, Pass& p
         bool anyRTV = false;
         for (auto* rt : rtvBindings) if (rt) { anyRTV = true; break; }
         // Caller (FirePass or FireBatch) owns the Restore — just bail.
-        if (!fsVS || !pass.psShader || !anyRTV) return;
+        if (!fsVS || !pass.psShader || !anyRTV) return false;
 
         if (pass.spec.clearOnFire) {
             for (auto* rt : rtvBindings) if (rt) {
@@ -1252,8 +1289,6 @@ void Registry::FirePassWithSaved(REX::W32::ID3D11DeviceContext* context, Pass& p
         context->PSSetShader(pass.psShader, nullptr, 0);
 
         if (!srvBindings.empty()) context->PSSetShaderResources(0, (UINT)srvBindings.size(), srvBindings.data());
-        // Also re-bind injected resources (GFXInjected etc.) on their global slots.
-        BindGlobalResourceSRVs(context, /*pixelStage=*/true);
         // Re-publish the standard injected SRVs so the pass shader can read GFXInjected.
         if (g_customSRV) context->PSSetShaderResources(CUSTOMBUFFER_SLOT, 1, &g_customSRV);
         if (g_modularFloatsSRV) context->PSSetShaderResources(MODULAR_FLOATS_SLOT, 1, &g_modularFloatsSRV);
@@ -1270,7 +1305,7 @@ void Registry::FirePassWithSaved(REX::W32::ID3D11DeviceContext* context, Pass& p
     // ----- Compute pass --------------------------------------------------------
     else {
         // Caller owns the Restore — just bail.
-        if (!pass.csShader) return;
+        if (!pass.csShader) return false;
         context->CSSetShader(pass.csShader, nullptr, 0);
         if (!srvBindings.empty()) context->CSSetShaderResources(0, (UINT)srvBindings.size(), srvBindings.data());
         // Re-publish the standard injected SRVs so the CS pass can read
@@ -1314,6 +1349,9 @@ void Registry::FirePassWithSaved(REX::W32::ID3D11DeviceContext* context, Pass& p
     }
 
     const uint64_t fires = pass.totalFireCount.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (pass.spec.oncePerFrame) {
+        pass.lastFiredFrame.store(currentFrame, std::memory_order_release);
+    }
     if (pass.spec.log) {
         // Rate-limit: every fire for the first 5, then every 600th frame
         // (~10s at 60fps). Avoids dumping 180 lines/sec when log=true is on
@@ -1325,6 +1363,7 @@ void Registry::FirePassWithSaved(REX::W32::ID3D11DeviceContext* context, Pass& p
     }
     // No saved.Restore here — caller (FirePass single-pass wrapper or
     // FireBatch) owns the snapshot lifecycle.
+    return true;
 }
 
 const DrawPassBatch* Registry::ResolveDrawPassBatchForShader(
@@ -1538,7 +1577,7 @@ void Registry::BindGlobalResourceSRVs(REX::W32::ID3D11DeviceContext* context, bo
     if (!context) return;
     std::lock_guard lk(mutex);
     for (auto& res : resources) {
-        if (res->spec.srvSlot < 0 || !res->srv) continue;
+        if (!res->spec.globalBind || res->spec.srvSlot < 0 || !res->srv) continue;
         if (pixelStage) context->PSSetShaderResources((UINT)res->spec.srvSlot, 1, &res->srv);
         else            context->VSSetShaderResources((UINT)res->spec.srvSlot, 1, &res->srv);
     }
@@ -1546,6 +1585,29 @@ void Registry::BindGlobalResourceSRVs(REX::W32::ID3D11DeviceContext* context, bo
 
 bool Registry::HasGlobalResourceBindings() const noexcept {
     return hasGlobalResourceBindings.load(std::memory_order_acquire);
+}
+
+REX::W32::ID3D11ShaderResourceView* Registry::GetResourceSRV(const std::string& name) {
+    if (!g_rendererData || !g_rendererData->device) {
+        return nullptr;
+    }
+
+    std::lock_guard lk(mutex);
+    Resource* res = FindResource(name);
+    if (!res) {
+        return nullptr;
+    }
+    if (!res->srv) {
+        REX::W32::D3D11_TEXTURE2D_DESC bd{};
+        if (g_rendererData->renderTargets[RT::idx(RT::Color::kMain)].texture) {
+            g_rendererData->renderTargets[RT::idx(RT::Color::kMain)].texture->GetDesc(&bd);
+        }
+        if (bd.width == 0 || bd.height == 0) {
+            return nullptr;
+        }
+        res->EnsureAllocated(g_rendererData->device, bd.width, bd.height);
+    }
+    return res->srv;
 }
 
 void Registry::EnqueuePrecompileJobs() {

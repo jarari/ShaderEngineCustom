@@ -2,6 +2,7 @@
 #include <Global.h>
 #include <CustomPass.h>
 #include <Plugin.h>
+#include <RenderTargets.h>
 #include <ShaderResources.h>
 #include <wincodec.h>
 
@@ -155,6 +156,7 @@ namespace ShaderResources
                     def->usesGFXModularFloats ||
                     def->usesGFXModularInts ||
                     def->usesGFXModularBools ||
+                    !def->replacementSRVs.empty() ||
                     !def->replacementTextures.empty() ||
                     CustomPass::g_registry.HasGlobalResourceBindings());
         }
@@ -324,6 +326,65 @@ namespace ShaderResources
             }
             REX::INFO("ReplacementTexture: loaded {} into t{}", binding.file.string(), binding.slot);
             return true;
+        }
+
+        std::string ReplacementSRVSourceName(const ReplacementSRVBinding& binding)
+        {
+            switch (binding.kind) {
+            case ReplacementSRVSourceKind::Depth:
+                return "depth";
+            case ReplacementSRVSourceKind::SceneHDR:
+                return "sceneHDR";
+            case ReplacementSRVSourceKind::GBufferRT:
+                return std::format("gbufferRT:{}", binding.gbufferIndex);
+            case ReplacementSRVSourceKind::GBufferNormal:
+                return "gbufferNormal";
+            case ReplacementSRVSourceKind::GBufferAlbedo:
+                return "gbufferAlbedo";
+            case ReplacementSRVSourceKind::GBufferMaterial:
+                return "gbufferMaterial";
+            case ReplacementSRVSourceKind::MotionVectors:
+                return "motionVectors";
+            case ReplacementSRVSourceKind::CustomResource:
+                return std::format("customResource:{}", binding.resourceName);
+            default:
+                return "(none)";
+            }
+        }
+
+        REX::W32::ID3D11ShaderResourceView* ResolveReplacementSRV(ReplacementSRVBinding& binding)
+        {
+            if (!g_rendererData) {
+                return nullptr;
+            }
+
+            switch (binding.kind) {
+            case ReplacementSRVSourceKind::Depth:
+                g_depthSRV = GetDepthBufferSRV_Internal();
+                return g_depthSRV;
+            case ReplacementSRVSourceKind::SceneHDR:
+                return g_rendererData->renderTargets[RT::idx(RT::Color::kMain)].srView;
+            case ReplacementSRVSourceKind::GBufferRT:
+                if (binding.gbufferIndex >= 0 && binding.gbufferIndex < 101) {
+                    return g_rendererData->renderTargets[binding.gbufferIndex].srView;
+                }
+                return nullptr;
+            case ReplacementSRVSourceKind::GBufferNormal:
+                if (NORMAL_BUFFER_INDEX >= 0 && NORMAL_BUFFER_INDEX < 101) {
+                    return g_rendererData->renderTargets[NORMAL_BUFFER_INDEX].srView;
+                }
+                return nullptr;
+            case ReplacementSRVSourceKind::GBufferAlbedo:
+                return g_rendererData->renderTargets[RT::idx(RT::Color::kGbufferAlbedo)].srView;
+            case ReplacementSRVSourceKind::GBufferMaterial:
+                return g_rendererData->renderTargets[RT::idx(RT::Color::kGbufferMaterial)].srView;
+            case ReplacementSRVSourceKind::MotionVectors:
+                return g_rendererData->renderTargets[RT::idx(RT::Color::kMotionVectors)].srView;
+            case ReplacementSRVSourceKind::CustomResource:
+                return CustomPass::g_registry.GetResourceSRV(binding.resourceName);
+            default:
+                return nullptr;
+            }
         }
 
         void BindCustomShaderResources(REX::W32::ID3D11DeviceContext* context,
@@ -526,7 +587,7 @@ namespace ShaderResources
 
     void BindInjectedPixelShaderResources(REX::W32::ID3D11DeviceContext* context)
     {
-        if (!context || !g_activeReplacementPixelShaderNeedsResourceRebind) {
+        if (!context || g_customPassRendering || !g_activeReplacementPixelShaderNeedsResourceRebind) {
             return;
         }
 
@@ -550,6 +611,7 @@ namespace ShaderResources
         }
 
         CustomPass::g_registry.BindGlobalResourceSRVs(context, /*pixelStage=*/true);
+        BindReplacementSRVResources(context, g_activeReplacementPixelShaderDef, /*pixelStage=*/true);
         BindReplacementTextureResources(context, g_activeReplacementPixelShaderDef, /*pixelStage=*/true);
 
         g_bindingInjectedPixelResources = false;
@@ -592,6 +654,38 @@ namespace ShaderResources
         }
 
         device->Release();
+    }
+
+    void BindReplacementSRVResources(
+        REX::W32::ID3D11DeviceContext* context,
+        ShaderDefinition* def,
+        bool pixelStage)
+    {
+        if (!context || !def || def->replacementSRVs.empty()) {
+            return;
+        }
+
+        for (auto& binding : def->replacementSRVs) {
+            if (binding.slot < 0 || binding.slot >= 128) {
+                continue;
+            }
+
+            REX::W32::ID3D11ShaderResourceView* srv = ResolveReplacementSRV(binding);
+            if (!srv) {
+                if (!binding.warnedMissing) {
+                    REX::WARN("ReplacementSRV[{}]: source '{}' unavailable for t{}",
+                        def->id, ReplacementSRVSourceName(binding), binding.slot);
+                    binding.warnedMissing = true;
+                }
+                continue;
+            }
+
+            if (pixelStage) {
+                context->PSSetShaderResources(static_cast<UINT>(binding.slot), 1, &srv);
+            } else {
+                context->VSSetShaderResources(static_cast<UINT>(binding.slot), 1, &srv);
+            }
+        }
     }
 
     REX::W32::ID3D11ShaderResourceView* GetDepthBufferSRV_Internal()

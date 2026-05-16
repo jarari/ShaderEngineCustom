@@ -105,6 +105,10 @@ extern thread_local bool g_isCreatingReplacementShader;
 // thread_local for the same reason as above (also: PSSetShaderResources is
 // only ever hit on the render thread, so this is paranoia + symmetry).
 extern thread_local bool g_bindingInjectedPixelResources;
+// Set while customPass is issuing its own D3D calls. D3D hooks should treat
+// those calls as internal pass work, not as engine draws that need replacement
+// shader matching or replacement SRV rebinding.
+extern thread_local bool g_customPassRendering;
 // Global custom resource to pass data to shaders
 extern REX::W32::ID3D11Buffer* g_customSRVBuffer;
 extern REX::W32::ID3D11ShaderResourceView* g_customSRV;

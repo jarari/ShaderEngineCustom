@@ -682,6 +682,9 @@ void D3D11OnPresent_Internal()
 
 void D3D11OnPSSetShaderResources_Internal(REX::W32::ID3D11DeviceContext* context)
 {
+    if (g_customPassRendering) {
+        return;
+    }
     if (ShaderResources::ActiveReplacementPixelShaderNeedsResourceRebind() && !g_bindingInjectedPixelResources) {
         ShaderResources::BindInjectedPixelShaderResources(context);
     }
@@ -710,6 +713,9 @@ bool D3D11ShouldSuppressClearDepthStencilView_Internal(
 
 void D3D11OnDraw_Internal(REX::W32::ID3D11DeviceContext* context, const char* source)
 {
+    if (g_customPassRendering) {
+        return;
+    }
     g_d3dDrawCallsThisFrame.fetch_add(1, std::memory_order_relaxed);
     if (PhaseTelemetry::g_mode.load(std::memory_order_relaxed) == PhaseTelemetry::Mode::On) {
         PhaseTelemetry::OnD3DDraw();
@@ -718,7 +724,8 @@ void D3D11OnDraw_Internal(REX::W32::ID3D11DeviceContext* context, const char* so
         ShadowTelemetry::OnD3DDraw();
     }
     // BindDrawTagForCurrentDraw(context);
-    if (FireArmedCustomPassDrawBatch(context, source) && ShaderResources::ActiveReplacementPixelShaderNeedsResourceRebind()) {
+    FireArmedCustomPassDrawBatch(context, source);
+    if (ShaderResources::ActiveReplacementPixelShaderNeedsResourceRebind()) {
         ShaderResources::BindInjectedPixelShaderResources(context);
     }
 }
@@ -729,6 +736,9 @@ D3D11PSSetShaderResult D3D11OnPSSetShaderBefore_Internal(
 {
     D3D11PSSetShaderResult result{};
     result.shader = pixelShader;
+    if (g_customPassRendering) {
+        return result;
+    }
 
     g_currentOriginalPixelShader.store(pixelShader, std::memory_order_release);
     ArmCustomPassDrawBatch(pixelShader);
@@ -792,6 +802,9 @@ void D3D11OnPSSetShaderAfter_Internal(
     REX::W32::ID3D11DeviceContext* context,
     const D3D11PSSetShaderResult& result)
 {
+    if (g_customPassRendering) {
+        return;
+    }
     ShaderResources::SetActiveReplacementPixelShaderUsage(result.activeReplacementDef, result.usingReplacementPixelShader);
     if (ShaderResources::ActiveReplacementPixelShaderNeedsResourceRebind()) {
         ShaderResources::BindInjectedPixelShaderResources(context);
@@ -809,6 +822,9 @@ REX::W32::ID3D11VertexShader* D3D11OnVSSetShader_Internal(
     REX::W32::ID3D11DeviceContext* context,
     REX::W32::ID3D11VertexShader* vertexShader)
 {
+    if (g_customPassRendering) {
+        return vertexShader;
+    }
     if (vertexShader) {
         // Check if this shader is matched with a replacement shader in our DB
         if (g_ShaderDB.IsEntryMatched(vertexShader)) {
@@ -825,6 +841,7 @@ REX::W32::ID3D11VertexShader* D3D11OnVSSetShader_Internal(
                 }
                 vertexShader = replacementVertexShader;
                 ShaderResources::BindInjectedVertexShaderResources(context);
+                ShaderResources::BindReplacementSRVResources(context, matchedDefinition, /*pixelStage=*/false);
                 ShaderResources::BindReplacementTextureResources(context, matchedDefinition, /*pixelStage=*/false);
             } else {
                 if (matchedDefinition && !matchedDefinition->buggy) {
@@ -839,6 +856,7 @@ REX::W32::ID3D11VertexShader* D3D11OnVSSetShader_Internal(
                         }
                         vertexShader = g_ShaderDB.GetReplacementShader(vertexShader);
                         ShaderResources::BindInjectedVertexShaderResources(context);
+                        ShaderResources::BindReplacementSRVResources(context, matchedDefinition, /*pixelStage=*/false);
                         ShaderResources::BindReplacementTextureResources(context, matchedDefinition, /*pixelStage=*/false);
                     } else {
                         REX::WARN("MyVSSetShader: Failed to compile replacement shader for definition '{}'", matchedDefinition->id);
@@ -1028,6 +1046,10 @@ namespace
         REX::W32::ID3D11ClassLinkage* classLinkage,
         REX::W32::ID3D11VertexShader** vertexShader)
     {
+        if (g_isCreatingReplacementShader) {
+            return D3D11Hooks::OriginalCreateVertexShader(device, shaderBytecode, bytecodeLength, classLinkage, vertexShader);
+        }
+
         const HRESULT hr = D3D11Hooks::OriginalCreateVertexShader(device, shaderBytecode, bytecodeLength, classLinkage, vertexShader);
         D3D11OnCreateVertexShader_Internal(hr, shaderBytecode, bytecodeLength, vertexShader);
         return hr;

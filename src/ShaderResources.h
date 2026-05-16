@@ -34,6 +34,10 @@ namespace ShaderResources
         REX::W32::ID3D11DeviceContext* context,
         ShaderDefinition* def,
         bool pixelStage);
+    void BindReplacementSRVResources(
+        REX::W32::ID3D11DeviceContext* context,
+        ShaderDefinition* def,
+        bool pixelStage);
 
     REX::W32::ID3D11ShaderResourceView* GetDepthBufferSRV_Internal();
     UINT FindDepthTargetIndexForDSV(REX::W32::ID3D11DepthStencilView* dsv);

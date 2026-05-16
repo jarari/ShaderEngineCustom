@@ -57,7 +57,8 @@ struct ResourceSpec {
     uint32_t                                absWidth = 0;       // Absolute
     uint32_t                                absHeight = 0;      // Absolute
     uint32_t                                mipLevels = 1;
-    int                                     srvSlot = -1;       // -1 disables global bind
+    int                                     srvSlot = -1;       // Preferred/requested SRV slot for INI consumers.
+    bool                                    globalBind = false; // true publishes srvSlot without an explicit request.
     bool                                    needRtv = true;
     bool                                    needUav = false;
     bool                                    clearOnPresent = false;
@@ -121,6 +122,7 @@ enum class InputKind : uint8_t {
     None,
     Depth,                // g_depthSRV (main scene depth)
     CurrentRTV,           // snapshot SRV of OMGetRenderTargets()[0] at fire time
+    CurrentPSRV,          // snapshot SRV of PS tN at fire time
     Resource,             // a customResource (by name)
     GBufferRT,            // g_rendererData->renderTargets[N].srView (explicit index)
     GBufferNormal,        // renderTargets[NORMAL_BUFFER_INDEX].srView   (kGbufferNormal=20)
@@ -135,6 +137,7 @@ struct InputBinding {
     InputKind                               kind = InputKind::None;
     std::string                             resourceName;        // for Resource
     int                                     gbufferIndex = -1;   // for GBufferRT
+    int                                     sourceSlot = -1;     // for CurrentPSRV
 };
 
 enum class OutputKind : uint8_t {
@@ -321,6 +324,7 @@ public:
     // SRVs bound on their declared slots after engine state changes.
     void BindGlobalResourceSRVs(REX::W32::ID3D11DeviceContext* context, bool pixelStage);
     bool HasGlobalResourceBindings() const noexcept;
+    REX::W32::ID3D11ShaderResourceView* GetResourceSRV(const std::string& name);
 
     // Resolve a hook id (existing [shaderId] section) to its first ShaderUID,
     // used by triggerHookId. Called once after Shader.ini load completes.
@@ -357,7 +361,7 @@ private:
     // the caller has already captured `saved`; reads it for currentRTV
     // snapshot resolution and viewport fallback. Does NOT restore — the
     // caller owns lifecycle.
-    void                                FirePassWithSaved(REX::W32::ID3D11DeviceContext* context,
+    bool                                FirePassWithSaved(REX::W32::ID3D11DeviceContext* context,
                                                           Pass& pass,
                                                           SavedState& saved);
     void                                ApplyPingpong();
