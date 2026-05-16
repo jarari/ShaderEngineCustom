@@ -137,6 +137,12 @@ namespace
     thread_local std::unordered_map<REX::W32::ID3D11Resource*, ActiveReplayMapInfo> tl_activeReplayMaps;
     thread_local std::unordered_set<std::uint64_t> tl_loggedReplayPayloadSamples;
     thread_local std::chrono::steady_clock::time_point tl_replayMapStatsStart = std::chrono::steady_clock::now();
+
+    void ResetReplayStateCache()
+    {
+        tl_replaySRVCallCache = {};
+        tl_replayIACache = {};
+    }
 }
 
 std::uint64_t GetD3DDrawCallsLastFrame_Internal()
@@ -2107,6 +2113,7 @@ namespace
         REX::W32::ID3D11ClassInstance* const* classInstances,
         UINT numClassInstances)
     {
+        ResetReplayStateCache();
         auto result = D3D11OnPSSetShaderBefore_Internal(context, pixelShader);
         D3D11Hooks::OriginalPSSetShader(context, result.shader, classInstances, numClassInstances);
         D3D11OnPSSetShaderAfter_Internal(context, result);
@@ -2222,8 +2229,7 @@ namespace D3D11Hooks
 {
     void ResetCommandBufferReplayState()
     {
-        tl_replaySRVCallCache = {};
-        tl_replayIACache = {};
+        ResetReplayStateCache();
     }
 
     void EnsureDrawHooksPresent()
