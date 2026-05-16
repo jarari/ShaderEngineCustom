@@ -16,9 +16,11 @@ add_defines("COMMONLIB_RUNTIMECOUNT=3")
 
 local enable_phase_telemetry = false
 local enable_shadow_telemetry = false
+local enable_shadow_cache = true
 
 add_defines("SHADERENGINE_ENABLE_PHASE_TELEMETRY=" .. (enable_phase_telemetry and "1" or "0"))
 add_defines("SHADERENGINE_ENABLE_SHADOW_TELEMETRY=" .. (enable_shadow_telemetry and "1" or "0"))
+add_defines("SHADERENGINE_ENABLE_SHADOW_CACHE=" .. (enable_shadow_cache and "1" or "0"))
 
 add_requires("imgui", { configs = { dx11 = true, win32 = true } })
 
@@ -39,7 +41,7 @@ target("ShaderEngineCL")
     if not enable_phase_telemetry then
         remove_files("src/PhaseTelemetry.cpp")
     end
-    if not enable_shadow_telemetry then
+    if not enable_shadow_telemetry and not enable_shadow_cache then
         remove_files("src/ShadowTelemetry.cpp")
     end
     add_headerfiles("src/**.h")

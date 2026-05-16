@@ -23,7 +23,7 @@ enum class Mode : std::uint8_t {
 extern std::atomic<Mode> g_mode;
 inline constexpr bool kDetailedShadowCacheLogging = false;
 
-#if SHADERENGINE_ENABLE_SHADOW_TELEMETRY
+#if SHADERENGINE_ENABLE_SHADOW_TELEMETRY || SHADERENGINE_ENABLE_SHADOW_CACHE
 
 bool Initialize();
 

@@ -1,7 +1,7 @@
 #include <PCH.h>
 #include "ShadowTelemetry.h"
 
-#if SHADERENGINE_ENABLE_SHADOW_TELEMETRY
+#if SHADERENGINE_ENABLE_SHADOW_TELEMETRY || SHADERENGINE_ENABLE_SHADOW_CACHE
 
 #include "PhaseTelemetry.h"
 #include "Global.h"
