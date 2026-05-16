@@ -82,8 +82,6 @@ std::filesystem::path g_shaderFolderPath;
 bool DEBUGGING = false;
 // Custom buffer update flag
 bool CUSTOMBUFFER_ON = true;
-// Pass-level cached occlusion flag
-bool PASS_LEVEL_OCCLUSION_ON = false;
 // Experimental directional shadow-map static-depth cache benchmark
 bool SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON = false;
 // Custom resource view slot in shader
@@ -305,27 +303,47 @@ bool SaveShaderEngineConfig(std::string* errorMessage)
             }
         }
 
-        bool foundPassOcclusion = false;
+        bool foundPhaseTelemetry = false;
+        bool foundShadowTelemetry = false;
         bool foundShadowCache = false;
         for (auto& line : lines) {
             auto [key, value] = GetKeyValueFromLine(line);
             const auto lowerKey = ToLower(key);
-            if (lowerKey == "pass_level_occlusion_on") {
-                line = std::string("PASS_LEVEL_OCCLUSION_ON=") + (PASS_LEVEL_OCCLUSION_ON ? "true" : "false");
-                foundPassOcclusion = true;
+            if (lowerKey == "phase_telemetry_mode") {
+                const bool enabled =
+                    PhaseTelemetry::g_mode.load(std::memory_order_relaxed) == PhaseTelemetry::Mode::On;
+                line = std::string("PHASE_TELEMETRY_MODE=") + (enabled ? "on" : "off");
+                foundPhaseTelemetry = true;
+            } else if (lowerKey == "shadow_telemetry_mode") {
+                const bool enabled =
+                    ShadowTelemetry::g_mode.load(std::memory_order_relaxed) == ShadowTelemetry::Mode::On;
+                line = std::string("SHADOW_TELEMETRY_MODE=") + (enabled ? "on" : "off");
+                foundShadowTelemetry = true;
             } else if (lowerKey == "shadow_cache_directional_mapslot1_on") {
                 line = std::string("SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON=") + (SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON ? "true" : "false");
                 foundShadowCache = true;
             }
         }
 
-        if (!foundPassOcclusion) {
+        if (!foundPhaseTelemetry) {
             if (!lines.empty() && !lines.back().empty()) {
                 lines.emplace_back();
             }
-            lines.emplace_back("; --- PASS-LEVEL CACHED OCCLUSION ---");
-            lines.emplace_back("; Enable/disable render-pass occlusion query caching and draw skipping.");
-            lines.emplace_back(std::string("PASS_LEVEL_OCCLUSION_ON=") + (PASS_LEVEL_OCCLUSION_ON ? "true" : "false"));
+            lines.emplace_back("; --- PHASE TELEMETRY ---");
+            lines.emplace_back("; Enable/disable per-phase timing and draw-count logging.");
+            const bool enabled =
+                PhaseTelemetry::g_mode.load(std::memory_order_relaxed) == PhaseTelemetry::Mode::On;
+            lines.emplace_back(std::string("PHASE_TELEMETRY_MODE=") + (enabled ? "on" : "off"));
+        }
+        if (!foundShadowTelemetry) {
+            if (!lines.empty() && !lines.back().empty()) {
+                lines.emplace_back();
+            }
+            lines.emplace_back("; --- SHADOW TELEMETRY ---");
+            lines.emplace_back("; Enable/disable shadow-map timing and counter logging.");
+            const bool enabled =
+                ShadowTelemetry::g_mode.load(std::memory_order_relaxed) == ShadowTelemetry::Mode::On;
+            lines.emplace_back(std::string("SHADOW_TELEMETRY_MODE=") + (enabled ? "on" : "off"));
         }
         if (!foundShadowCache) {
             if (!lines.empty() && !lines.back().empty()) {
@@ -1046,12 +1064,6 @@ void LoadConfig(HMODULE hModule) {
             REX::INFO("LoadConfig: CUSTOMBUFFER_ON set to {}", CUSTOMBUFFER_ON);
             continue;
         }
-        else if (lowerKey == "pass_level_occlusion_on") {
-            const std::string v = ToLower(value);
-            PASS_LEVEL_OCCLUSION_ON = (v == "true" || v == "1" || v == "on");
-            REX::INFO("LoadConfig: PASS_LEVEL_OCCLUSION_ON set to {}", PASS_LEVEL_OCCLUSION_ON);
-            continue;
-        }
         else if (lowerKey == "shadow_cache_directional_mapslot1_on") {
             const std::string v = ToLower(value);
             SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON = (v == "true" || v == "1" || v == "on");
@@ -1521,13 +1533,9 @@ F4SE_PLUGIN_LOAD(const F4SE::LoadInterface* a_f4se)
     // Install the shader creation hooks very early.
     InstallShaderCreationHooks_Internal();
     InstallDrawTaggingHooks_Internal();
-    // Phase telemetry ? installs per-DrawWorld:: hooks to attribute wall time
+    // Phase telemetry installs per-DrawWorld:: hooks to attribute wall time
     // + draw count per sub-phase under DrawWorld::Render_PreUI. Default off
-    // = no logging. Render-pass occlusion requests those hooks only when its
-    // A/B path is actually enabled.
-    if (PASS_LEVEL_OCCLUSION_ON) {
-        PhaseTelemetry::RequireHooks();
-    }
+    // = no logging.
     PhaseTelemetry::Initialize();
     ShadowTelemetry::Initialize();
     // LightSorter ? stable-partitions the point-light array by stencil flag
@@ -1594,8 +1602,6 @@ extern "C"
             g_precompileWorker->Stop();
             g_precompileWorker.reset();
         }
-        // Release pass-level occlusion query objects before D3D teardown.
-        ShutdownPassOcclusionCache_Internal();
         // Release the light-tracker staging buffer before D3D teardown.
         LightTracker::Shutdown();
         // Disarm the cull-policy hook gate so any in-flight cull running

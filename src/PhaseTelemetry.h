@@ -59,6 +59,16 @@ bool IsInMainAccum();
 bool IsInDeferredPrePass();
 bool IsInDeferredLightsImpl();
 
+enum class DeferredPrePassDetailKind : std::uint8_t {
+    RenderBatches,
+    RenderGeometryGroup,
+};
+
+// Optional fine-grain profiling inside DrawWorld::DeferredPrePass. These are
+// inclusive scopes; RenderGeometryGroup can contain nested RenderBatches time.
+void BeginDeferredPrePassDetail(DeferredPrePassDetailKind kind, std::uint32_t group);
+void EndDeferredPrePassDetail(DeferredPrePassDetailKind kind, std::uint32_t group);
+
 // Called from Plugin.cpp's HookedBSBatchRendererDraw. Cheap when mode==Off
 // (single relaxed atomic load + branch). Attributes a draw to the currently
 // active sub-phase bucket (or to the Frame total if just inside Render_PreUI

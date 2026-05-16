@@ -938,7 +938,6 @@ bool DoesEntryMatchDefinition_Internal(ShaderDBEntry const& entry, ShaderDefinit
 void DumpOriginalShader_Internal(ShaderDBEntry const& entry, ShaderDefinition* def);
 void ClearActorDrawTaggedGeometry_Internal();
 void ReleaseDrawTagBuffers_Internal();
-void ShutdownPassOcclusionCache_Internal();
 bool InstallGFXHooks_Internal();
 bool InstallShaderCreationHooks_Internal();
 bool InstallDrawTaggingHooks_Internal();
@@ -958,7 +957,6 @@ void UIUnlockShaderList_Internal();
 std::uint64_t GetD3DDrawCallsLastFrame_Internal();
 void ArmCustomPassDrawBatch(REX::W32::ID3D11PixelShader* originalPS);
 bool FireArmedCustomPassDrawBatch(REX::W32::ID3D11DeviceContext* context, const char* source);
-void PassOcclusionOnFramePresent_Internal();
 bool IsPrecombineShadowGeometry_Internal(RE::BSGeometry* geometry);
 bool IsActorDrawTaggedGeometry_Internal(RE::BSGeometry* geometry);
 bool IsRenderBatchesActive_Internal();

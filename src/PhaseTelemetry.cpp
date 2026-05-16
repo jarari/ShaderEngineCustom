@@ -177,12 +177,48 @@ struct Bucket {
 Bucket s_frame;
 Bucket s_subBuckets[static_cast<std::size_t>(SubPhase::Count)];
 
+constexpr std::size_t kDeferredDetailGroups = 32;
+constexpr std::size_t kDeferredDetailKinds = 2;
+
+const char* DeferredDetailKindName(DeferredPrePassDetailKind kind) noexcept
+{
+    switch (kind) {
+    case DeferredPrePassDetailKind::RenderBatches:       return "RenderBatches";
+    case DeferredPrePassDetailKind::RenderGeometryGroup: return "RenderGeometryGroup";
+    default:                                             return "?";
+    }
+}
+
+struct DeferredDetailBucket {
+    Bucket bucket;
+    std::atomic<std::uint64_t> active{ 0 };
+
+    void Reset() noexcept
+    {
+        bucket.Reset();
+        active.store(0, std::memory_order_relaxed);
+    }
+};
+
+DeferredDetailBucket s_deferredDetails[kDeferredDetailKinds][kDeferredDetailGroups];
+
 // thread_local ??render thread runs Render_PreUI and all its children
 // sequentially. If a worker path ever entered, the bool defaults to false
 // so child hooks fall through to passthrough.
 thread_local bool     tl_inFrame   = false;
 thread_local SubPhase tl_subphase  = SubPhase::None;
+thread_local int      tl_deferredDetailIndex = -1;
 std::atomic<bool> s_mainAccumActive{ false };
+
+struct DeferredDetailScopeEntry {
+    int previousIndex = -1;
+    int index = -1;
+    std::chrono::steady_clock::time_point start;
+    bool active = false;
+};
+
+thread_local DeferredDetailScopeEntry tl_deferredDetailStack[8];
+thread_local int tl_deferredDetailDepth = 0;
 
 inline void UpdateMax(std::atomic<std::uint64_t>& slot, std::uint64_t v) noexcept
 {
@@ -196,6 +232,39 @@ inline void RecordBucket(Bucket& b, std::uint64_t ns) noexcept
     b.calls.fetch_add(1, std::memory_order_relaxed);
     b.totalNs.fetch_add(ns, std::memory_order_relaxed);
     UpdateMax(b.maxNs, ns);
+}
+
+inline void IncrementDeferredDetailBSDraws() noexcept
+{
+    for (int i = 0; i < tl_deferredDetailDepth; ++i) {
+        const auto& scope = tl_deferredDetailStack[i];
+        if (!scope.active || scope.index < 0) continue;
+        s_deferredDetails[scope.index / static_cast<int>(kDeferredDetailGroups)]
+                         [scope.index % static_cast<int>(kDeferredDetailGroups)]
+            .bucket.draws.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+inline void IncrementDeferredDetailD3DDraws() noexcept
+{
+    for (int i = 0; i < tl_deferredDetailDepth; ++i) {
+        const auto& scope = tl_deferredDetailStack[i];
+        if (!scope.active || scope.index < 0) continue;
+        s_deferredDetails[scope.index / static_cast<int>(kDeferredDetailGroups)]
+                         [scope.index % static_cast<int>(kDeferredDetailGroups)]
+            .bucket.d3dDraws.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+inline void IncrementDeferredDetailCommandBufferDraws() noexcept
+{
+    for (int i = 0; i < tl_deferredDetailDepth; ++i) {
+        const auto& scope = tl_deferredDetailStack[i];
+        if (!scope.active || scope.index < 0) continue;
+        s_deferredDetails[scope.index / static_cast<int>(kDeferredDetailGroups)]
+                         [scope.index % static_cast<int>(kDeferredDetailGroups)]
+            .bucket.cmdBufDraws.fetch_add(1, std::memory_order_relaxed);
+    }
 }
 
 // --- Periodic logging ------------------------------------------------------
@@ -260,8 +329,43 @@ void MaybeLog()
             100.0 * static_cast<double>(ns) / static_cast<double>(frameTotalNs));
     }
 
+    for (std::size_t kind = 0; kind < kDeferredDetailKinds; ++kind) {
+        for (std::size_t group = 0; group < kDeferredDetailGroups; ++group) {
+            const auto& detail = s_deferredDetails[kind][group];
+            if (detail.active.load(std::memory_order_relaxed) == 0) {
+                continue;
+            }
+
+            const auto& b = detail.bucket;
+            const auto c = b.calls.load(std::memory_order_relaxed);
+            if (c == 0) continue;
+            const auto d  = b.draws.load(std::memory_order_relaxed);
+            const auto dd = b.d3dDraws.load(std::memory_order_relaxed);
+            const auto cd = b.cmdBufDraws.load(std::memory_order_relaxed);
+            const auto ns = b.totalNs.load(std::memory_order_relaxed);
+            const auto mx = b.maxNs.load(std::memory_order_relaxed);
+            REX::INFO(
+                "    DeferredPrePass[{}:{}]: calls={} bsDraws={} cmdBuf={} d3dDraws={} totMs/s={:.2f} avgUs={:.1f} maxUs={:.1f} (%deferred={:.1f})",
+                DeferredDetailKindName(static_cast<DeferredPrePassDetailKind>(kind)),
+                group,
+                c, d, cd, dd,
+                (ns / 1'000'000.0) / secs,
+                (ns / 1000.0) / static_cast<double>(c),
+                mx / 1000.0,
+                100.0 * static_cast<double>(ns) /
+                    std::max<double>(
+                        1.0,
+                        static_cast<double>(
+                            s_subBuckets[static_cast<std::size_t>(SubPhase::DeferredPrePass)].totalNs.load(
+                                std::memory_order_relaxed))));
+        }
+    }
+
     s_frame.Reset();
     for (auto& b : s_subBuckets) b.Reset();
+    for (auto& kind : s_deferredDetails) {
+        for (auto& detail : kind) detail.Reset();
+    }
 }
 
 // --- Hook bodies ----------------------------------------------------------
@@ -425,6 +529,7 @@ void OnDraw()
         s_subBuckets[static_cast<std::size_t>(tl_subphase)]
             .draws.fetch_add(1, std::memory_order_relaxed);
     }
+    IncrementDeferredDetailBSDraws();
 }
 
 void OnD3DDraw()
@@ -436,6 +541,7 @@ void OnD3DDraw()
         s_subBuckets[static_cast<std::size_t>(tl_subphase)]
             .d3dDraws.fetch_add(1, std::memory_order_relaxed);
     }
+    IncrementDeferredDetailD3DDraws();
 }
 
 void OnCommandBufferDraw()
@@ -447,6 +553,7 @@ void OnCommandBufferDraw()
         s_subBuckets[static_cast<std::size_t>(tl_subphase)]
             .cmdBufDraws.fetch_add(1, std::memory_order_relaxed);
     }
+    IncrementDeferredDetailCommandBufferDraws();
 }
 
 void RequireHooks()
@@ -473,6 +580,66 @@ bool IsInDeferredPrePass()
 bool IsInDeferredLightsImpl()
 {
     return tl_inFrame && tl_subphase == SubPhase::DeferredLightsImpl;
+}
+
+namespace {
+int DeferredDetailIndex(DeferredPrePassDetailKind kind, std::uint32_t group)
+{
+    if (group >= kDeferredDetailGroups) {
+        return -1;
+    }
+    return static_cast<int>(kind) * static_cast<int>(kDeferredDetailGroups) + static_cast<int>(group);
+}
+}
+
+void BeginDeferredPrePassDetail(DeferredPrePassDetailKind kind, std::uint32_t group)
+{
+    if (tl_deferredDetailDepth >= static_cast<int>(std::size(tl_deferredDetailStack))) {
+        return;
+    }
+
+    auto& scope = tl_deferredDetailStack[tl_deferredDetailDepth++];
+    scope.previousIndex = tl_deferredDetailIndex;
+    scope.index = -1;
+    scope.active = false;
+    scope.start = {};
+
+    if (g_mode.load(std::memory_order_relaxed) != Mode::On || !IsInDeferredPrePass()) {
+        return;
+    }
+
+    const int index = DeferredDetailIndex(kind, group);
+    if (index < 0) {
+        return;
+    }
+
+    auto& detail = s_deferredDetails[index / static_cast<int>(kDeferredDetailGroups)]
+                                    [index % static_cast<int>(kDeferredDetailGroups)];
+    detail.active.store(1, std::memory_order_relaxed);
+    scope.index = index;
+    scope.start = std::chrono::steady_clock::now();
+    scope.active = true;
+    tl_deferredDetailIndex = index;
+}
+
+void EndDeferredPrePassDetail(DeferredPrePassDetailKind kind, std::uint32_t group)
+{
+    if (tl_deferredDetailDepth <= 0) {
+        return;
+    }
+
+    auto& scope = tl_deferredDetailStack[--tl_deferredDetailDepth];
+    const int index = DeferredDetailIndex(kind, group);
+    const auto t1 = std::chrono::steady_clock::now();
+    if (scope.active && index >= 0 && index == scope.index) {
+        auto& detail = s_deferredDetails[index / static_cast<int>(kDeferredDetailGroups)]
+                                        [index % static_cast<int>(kDeferredDetailGroups)];
+        const auto ns = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - scope.start).count());
+        RecordBucket(detail.bucket, ns);
+    }
+
+    tl_deferredDetailIndex = scope.previousIndex;
 }
 
 bool Initialize()

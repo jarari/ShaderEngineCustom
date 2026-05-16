@@ -9,8 +9,6 @@ DEBUGGING=false
 ; This setting applies to all replaced shaders
 ; Shaders with #include "common.inc" have access to ingame data like FPS, Camera position and shader settings
 CUSTOMBUFFER_ON=true
-; Enable/disable pass-level cached occlusion for render-pass A/B testing
-PASS_LEVEL_OCCLUSION_ON=false
 ; --- SHADOW STATIC CACHE (behavioral, experimental) ---
 ; Directional sun splits up to the live iDirShadowSplits count. Builds
 ; precombine-only static depth caches, restores depth on cache hits, then

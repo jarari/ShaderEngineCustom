@@ -187,30 +187,46 @@ std::uint64_t ShadowCameraSignature(void* camera, std::uint32_t mapSlot) noexcep
         return 0;
     }
 
-    // RE::NiCamera: worldToCam @ 0x120, viewFrustum/min/far/port through 0x193.
+    // RE::NiCamera: worldToCam @ 0x120, viewFrustum/min/far @ 0x160..0x183,
+    // port @ 0x184..0x193. IDA shows directional UpdateCamerasI rewrites both
+    // the per-split frustum and port before culling/rendering.
     // Keep this conservative: if the directional shadow camera moves or rotates
     // enough for the static depth projection to visibly shift, rebuild instead
     // of reusing stale depth. Tiny quantization absorbs float noise only.
     constexpr std::size_t kWorldToCamOffset = 0x120;
     constexpr std::size_t kFrustumOffset = 0x160;
     constexpr std::size_t kFrustumFloatCount = 9;  // NiFrustum + minNear + maxFarNearRatio
-    constexpr float kRotationStep = 0.1000f;
-    constexpr float kNearTranslationStep = 0.10f;
+    constexpr std::size_t kPortOffset = 0x184;
+    constexpr std::size_t kPortFloatCount = 4;
+    constexpr float kNearRotationStep = 0.0001f;
+    constexpr float kFarRotationStep = 0.1000f;
+    constexpr float kNearTranslationStep = 0.005f;
     constexpr float kFarTranslationStep = 12.0f;
-    constexpr float kFrustumStep = 4.0f;
+    constexpr float kNearFrustumStep = 0.0001f;
+    constexpr float kFarFrustumStep = 4.0f;
+    constexpr float kNearPortStep = 0.0001f;
+    constexpr float kFarPortStep = 0.005f;
+    const float rotationStep = mapSlot == 0 ? kNearRotationStep : kFarRotationStep;
     const float translationStep = mapSlot == 0 ? kNearTranslationStep : kFarTranslationStep;
+    const float frustumStep = mapSlot == 0 ? kNearFrustumStep : kFarFrustumStep;
+    const float portStep = mapSlot == 0 ? kNearPortStep : kFarPortStep;
 
-    std::array<std::int32_t, 16 + kFrustumFloatCount> quantized{};
+    std::array<std::int32_t, 16 + kFrustumFloatCount + kPortFloatCount> quantized{};
     const auto* matrix = reinterpret_cast<const float*>(static_cast<const std::byte*>(camera) + kWorldToCamOffset);
     for (std::size_t i = 0; i < 16; ++i) {
         const float v = matrix[i];
-        const float step = std::abs(v) <= 4.0f ? kRotationStep : translationStep;
+        const float step = std::abs(v) <= 4.0f ? rotationStep : translationStep;
         quantized[i] = QuantizeFloat(v, step);
     }
 
     const auto* frustum = reinterpret_cast<const float*>(static_cast<const std::byte*>(camera) + kFrustumOffset);
     for (std::size_t i = 0; i < kFrustumFloatCount; ++i) {
-        quantized[16 + i] = QuantizeFloat(frustum[i], kFrustumStep);
+        quantized[16 + i] = QuantizeFloat(frustum[i], frustumStep);
+    }
+
+    const auto* port = reinterpret_cast<const float*>(static_cast<const std::byte*>(camera) + kPortOffset);
+    for (std::size_t i = 0; i < kPortFloatCount; ++i) {
+        quantized[16 + kFrustumFloatCount + i] = QuantizeFloat(port[i], portStep);
     }
 
     return HashBytes(quantized.data(), quantized.size() * sizeof(quantized[0]));
@@ -227,7 +243,7 @@ std::uint64_t GameplayCameraTranslationSignature() noexcept
     return HashBytes(quantized.data(), quantized.size() * sizeof(quantized[0]));
 }
 
-std::uint64_t ShadowLightDirectionSignature(void* light) noexcept
+std::uint64_t ShadowLightDirectionSignature(void* light, std::uint32_t mapSlot) noexcept
 {
     if (!light) {
         return 0;
@@ -241,14 +257,18 @@ std::uint64_t ShadowLightDirectionSignature(void* light) noexcept
         return 0;
     }
 
-    constexpr float kSunDirectionStep = 0.001f;
-    constexpr float kSunBlendStep = 0.001f;
+    constexpr float kNearSunDirectionStep = 0.00001f;
+    constexpr float kFarSunDirectionStep = 0.001f;
+    constexpr float kNearSunBlendStep = 0.00001f;
+    constexpr float kFarSunBlendStep = 0.001f;
+    const float sunDirectionStep = mapSlot == 0 ? kNearSunDirectionStep : kFarSunDirectionStep;
+    const float sunBlendStep = mapSlot == 0 ? kNearSunBlendStep : kFarSunBlendStep;
     const float invLen = 1.0f / std::sqrt(lenSq);
     const std::array<std::int32_t, 4> quantized{
-        QuantizeFloat(x * invLen, kSunDirectionStep),
-        QuantizeFloat(y * invLen, kSunDirectionStep),
-        QuantizeFloat(z * invLen, kSunDirectionStep),
-        QuantizeFloat(ReadField<float>(light, 0x220), kSunBlendStep),
+        QuantizeFloat(x * invLen, sunDirectionStep),
+        QuantizeFloat(y * invLen, sunDirectionStep),
+        QuantizeFloat(z * invLen, sunDirectionStep),
+        QuantizeFloat(ReadField<float>(light, 0x220), sunBlendStep),
     };
     return HashBytes(quantized.data(), quantized.size() * sizeof(quantized[0]));
 }
@@ -1386,7 +1406,7 @@ Scope MakeScope(void* light, void* shadowMapData, LightKind kind) noexcept
     scope.key.mapSlot = ReadField<std::uint32_t>(shadowMapData, kShadowMapMapSlotOffset);
     scope.key.cameraSig = ShadowCameraSignature(scope.camera, scope.key.mapSlot) ^
         (GameplayCameraTranslationSignature() + 0x9e3779b97f4a7c15ull);
-    scope.key.dominantLightSig = ShadowLightDirectionSignature(light);
+    scope.key.dominantLightSig = ShadowLightDirectionSignature(light, scope.key.mapSlot);
     scope.key.activeDepthStencilView = ActiveShadowDSV(scope.key);
     scope.key.activeDepthTexture = ActiveShadowTextureIdentity(
         static_cast<REX::W32::ID3D11DepthStencilView*>(scope.key.activeDepthStencilView));

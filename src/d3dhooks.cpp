@@ -665,7 +665,6 @@ void D3D11OnPresent_Internal()
     if (CUSTOMBUFFER_ON) {
         UpdateCustomBuffer_Internal();
     }
-    PassOcclusionOnFramePresent_Internal();
     // Custom-pass per-frame work: allocate resources, run any AtPresent passes,
     // ping-pong, advance frame counter. Done after the booster CB update so
     // GFXInjected[0] is fresh for any AtPresent pass.

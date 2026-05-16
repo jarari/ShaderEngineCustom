@@ -28,9 +28,6 @@ extern std::filesystem::path g_pluginPath;
 extern bool DEBUGGING;
 // Custom buffer update flag
 extern bool CUSTOMBUFFER_ON;
-// Pass-level cached occlusion toggle. Disabling it bypasses the render-pass
-// occlusion query/skip path added for A/B testing.
-extern bool PASS_LEVEL_OCCLUSION_ON;
 // Experimental directional shadow-map static-depth cache. Off by default.
 // When enabled, it caches precombine-only depth per live directional split
 // and overlays dynamic/unknown records until the split cache key changes.

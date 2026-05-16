@@ -19,20 +19,39 @@ static bool g_shaderSettingsSaveModalRequested = false;
 static bool g_shaderSettingsSaveSucceeded = false;
 static std::string g_shaderSettingsSaveMessage;
 
-static void ApplyPassLevelOcclusionSetting(bool enabled)
+static void ApplyPhaseTelemetrySetting(bool enabled)
 {
-    if (PASS_LEVEL_OCCLUSION_ON == enabled) {
+    const auto mode = PhaseTelemetry::g_mode.load(std::memory_order_relaxed);
+    const bool wasEnabled = mode == PhaseTelemetry::Mode::On;
+    if (wasEnabled == enabled) {
         return;
     }
 
-    PASS_LEVEL_OCCLUSION_ON = enabled;
-    if (PASS_LEVEL_OCCLUSION_ON) {
+    PhaseTelemetry::g_mode.store(
+        enabled ? PhaseTelemetry::Mode::On : PhaseTelemetry::Mode::Off,
+        std::memory_order_relaxed);
+    if (enabled) {
         PhaseTelemetry::RequireHooks();
         PhaseTelemetry::Initialize();
-    } else {
-        ShutdownPassOcclusionCache_Internal();
     }
-    REX::INFO("ShaderEngine Settings: PASS_LEVEL_OCCLUSION_ON set to {}", PASS_LEVEL_OCCLUSION_ON);
+    REX::INFO("ShaderEngine Settings: PHASE_TELEMETRY_MODE set to {}", enabled ? "on" : "off");
+}
+
+static void ApplyShadowTelemetrySetting(bool enabled)
+{
+    const auto mode = ShadowTelemetry::g_mode.load(std::memory_order_relaxed);
+    const bool wasEnabled = mode == ShadowTelemetry::Mode::On;
+    if (wasEnabled == enabled) {
+        return;
+    }
+
+    ShadowTelemetry::g_mode.store(
+        enabled ? ShadowTelemetry::Mode::On : ShadowTelemetry::Mode::Off,
+        std::memory_order_relaxed);
+    if (enabled) {
+        ShadowTelemetry::Initialize();
+    }
+    REX::INFO("ShaderEngine Settings: SHADOW_TELEMETRY_MODE set to {}", enabled ? "on" : "off");
 }
 
 static void ApplyShadowCacheDirectionalMapSlot1Setting(bool enabled)
@@ -236,9 +255,15 @@ void UIDrawShaderSettingsOverlay() {
     }
     ImGui::Separator();
 
-    bool passLevelOcclusionOn = PASS_LEVEL_OCCLUSION_ON;
-    if (ImGui::Checkbox("Pass-level cached occlusion", &passLevelOcclusionOn)) {
-        ApplyPassLevelOcclusionSetting(passLevelOcclusionOn);
+    bool phaseTelemetryOn =
+        PhaseTelemetry::g_mode.load(std::memory_order_relaxed) == PhaseTelemetry::Mode::On;
+    if (ImGui::Checkbox("Phase telemetry", &phaseTelemetryOn)) {
+        ApplyPhaseTelemetrySetting(phaseTelemetryOn);
+    }
+    bool shadowTelemetryOn =
+        ShadowTelemetry::g_mode.load(std::memory_order_relaxed) == ShadowTelemetry::Mode::On;
+    if (ImGui::Checkbox("Shadow telemetry", &shadowTelemetryOn)) {
+        ApplyShadowTelemetrySetting(shadowTelemetryOn);
     }
     bool shadowCacheDirectionalMapSlot1On = SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON;
     if (ImGui::Checkbox("Cache directional shadow splits", &shadowCacheDirectionalMapSlot1On)) {

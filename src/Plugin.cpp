@@ -4,7 +4,6 @@
 #include "d3dhooks.h"
 #include <hooks.h>
 #include <PhaseTelemetry.h>
-#include <PassOcclusion.h>
 #include <ShadowTelemetry.h>
 #include <LightCullPolicy.h>
 #include <ShaderPipeline.h>
@@ -1687,6 +1686,7 @@ namespace
     RenderBatches_t OriginalFinishShadowRenderBatches = nullptr;
 
     using RenderGeometryGroup_t = void (*)(void* accumulator, unsigned int group, bool allowAlpha);
+    RenderGeometryGroup_t OriginalRenderGeometryGroup = nullptr;
     RenderGeometryGroup_t OriginalFinishShadowRenderGeometryGroup = nullptr;
     constexpr bool kInstallFinishShadowRenderSplitHooks = false;
 
@@ -2473,6 +2473,9 @@ namespace
 
     void HookedRenderBatches(void* this_, unsigned int passGroupIdx, bool allowAlpha, unsigned int filter)
     {
+        PhaseTelemetry::BeginDeferredPrePassDetail(
+            PhaseTelemetry::DeferredPrePassDetailKind::RenderBatches,
+            passGroupIdx);
         const unsigned int prevGroup = g_renderBatchesGroup;
         ++g_renderBatchesDepth;
         g_renderBatchesGroup = passGroupIdx;
@@ -2489,6 +2492,20 @@ namespace
         }
         g_renderBatchesGroup = prevGroup;
         --g_renderBatchesDepth;
+        PhaseTelemetry::EndDeferredPrePassDetail(
+            PhaseTelemetry::DeferredPrePassDetailKind::RenderBatches,
+            passGroupIdx);
+    }
+
+    void HookedRenderGeometryGroup(void* accumulator, unsigned int group, bool allowAlpha)
+    {
+        PhaseTelemetry::BeginDeferredPrePassDetail(
+            PhaseTelemetry::DeferredPrePassDetailKind::RenderGeometryGroup,
+            group);
+        OriginalRenderGeometryGroup(accumulator, group, allowAlpha);
+        PhaseTelemetry::EndDeferredPrePassDetail(
+            PhaseTelemetry::DeferredPrePassDetailKind::RenderGeometryGroup,
+            group);
     }
 
     void HookedProcessCommandBuffer(void* renderer, void* cbData)
@@ -2522,17 +2539,6 @@ namespace
         }
 
         auto* head = GetRenderBatchNodeHead(this_, passGroupIdx, subIdx);
-        auto decision = PassOcclusion::BeginDecision(
-            g_rendererData ? g_rendererData->context : nullptr,
-            this_,
-            head,
-            passGroupIdx >= 0 ? static_cast<unsigned int>(passGroupIdx) : g_renderBatchesGroup,
-            allowAlpha,
-            true);
-        if (decision.skip) {
-            InvalidateCommandBufferFrame(cbData);
-            return;
-        }
 
         {
             const auto node = GetRenderBatchNodeAddress(this_, passGroupIdx, subIdx);
@@ -2559,7 +2565,6 @@ namespace
                     if (phase == ShadowSplitPhase::DynamicOverlay) {
                         InvalidateCommandBufferFrame(cbData);
                     }
-                    PassOcclusion::EndDecision(g_rendererData ? g_rendererData->context : nullptr, decision);
                     return;
                 }
 
@@ -2573,7 +2578,6 @@ namespace
                     if (phase == ShadowSplitPhase::DynamicOverlay) {
                         InvalidateCommandBufferFrame(cbData);
                     }
-                    PassOcclusion::EndDecision(g_rendererData ? g_rendererData->context : nullptr, decision);
                     return;
                 }
             }
@@ -2582,7 +2586,6 @@ namespace
             if (shadowSplitFilter.Active()) {
                 if (!shadowSplitFilter.Head()) {
                     InvalidateCommandBufferFrame(cbData);
-                    PassOcclusion::EndDecision(g_rendererData ? g_rendererData->context : nullptr, decision);
                     return;
                 }
 
@@ -2593,7 +2596,6 @@ namespace
                         shadowSplitFilter.TechniqueID(),
                         allowAlpha);
                     InvalidateCommandBufferFrame(cbData);
-                    PassOcclusion::EndDecision(g_rendererData ? g_rendererData->context : nullptr, decision);
                     return;
                 }
             }
@@ -2632,7 +2634,6 @@ namespace
                 InvalidateCommandBufferFrame(cbData);
             }
         }
-        PassOcclusion::EndDecision(g_rendererData ? g_rendererData->context : nullptr, decision);
     }
 
     void HookedRenderPersistentPassListImpl(void* persistentPassList, bool allowAlpha)
@@ -2662,10 +2663,6 @@ namespace
 
     bool HookedRegisterObjectStandard(void* accumulator, RE::BSGeometry* geometry, void* shaderProperty)
     {
-        if (PassOcclusion::ShouldEarlyCullRegisterObjectStandard(geometry)) {
-            return true;
-        }
-
         return OriginalRegisterObjectStandard(accumulator, geometry, shaderProperty);
     }
 
@@ -2678,11 +2675,7 @@ namespace
             return nullptr;
         }
 
-        std::vector<PassOcclusion::ArenaGatePatch> patches;
-        PassOcclusion::PatchArenaGates(arena, patches);
-        void* result = original(arena, accumulator);
-        PassOcclusion::RestoreArenaGates(patches);
-        return result;
+        return original(arena, accumulator);
     }
 
     void* HookedAccumulatePassesFromCullerArena(void* arena, void* accumulator)
@@ -2729,17 +2722,6 @@ namespace
     void HookedRenderPassImpl(void* this_, BSRenderPassLayout* head, std::uint32_t techniqueID, bool allowAlpha)
     {
         const unsigned int group = g_renderBatchesGroup;
-        auto decision = PassOcclusion::BeginDecision(
-            g_rendererData ? g_rendererData->context : nullptr,
-            this_,
-            head,
-            group,
-            allowAlpha,
-            false);
-        if (decision.skip) {
-            return;
-        }
-
         {
             std::optional<ScopedShadowWork> shadowWork;
             if (IsShadowWorkTelemetryActive()) {
@@ -2758,7 +2740,6 @@ namespace
                 OriginalRenderPassImpl(this_, filteredHead, techniqueID, allowAlpha);
             }
         }
-        PassOcclusion::EndDecision(g_rendererData ? g_rendererData->context : nullptr, decision);
     }
 
     REX::W32::ID3D11ShaderResourceView* GetOrCreateStaticDrawTagSRV(const DrawTagClassification& classification)
@@ -3032,11 +3013,6 @@ namespace
 }
 
 
-void PassOcclusionOnFramePresent_Internal()
-{
-    PassOcclusion::OnFramePresent();
-}
-
 bool IsPrecombineShadowGeometry_Internal(RE::BSGeometry* geometry)
 {
     return IsPrecombineShadowGeometry(geometry);
@@ -3068,11 +3044,6 @@ void ClearActorDrawTaggedGeometry_Internal()
     g_actorRaceGroupMaskByGeometry.clear();
     g_actorRaceFlagsByGeometry.clear();
     ResetCommandBufferDrawTagWrappers();
-}
-
-void ShutdownPassOcclusionCache_Internal()
-{
-    PassOcclusion::ShutdownCache();
 }
 
 void ReleaseDrawTagBuffers_Internal()
@@ -3402,6 +3373,7 @@ bool InstallDrawTaggingHooks_Internal()
         OriginalUpdate3DModel &&
         OriginalReset3D &&
         OriginalRenderBatches &&
+        OriginalRenderGeometryGroup &&
         (!kInstallFinishShadowRenderSplitHooks ||
             REX::FModule::GetRuntimeIndex() != REX::FModule::Runtime::kOG ||
             (OriginalFinishShadowRenderBatches && OriginalFinishShadowRenderGeometryGroup)) &&
@@ -3503,6 +3475,24 @@ bool InstallDrawTaggingHooks_Internal()
         }
 
         REX::INFO("InstallDrawTaggingHooks_Internal: BSBatchRenderer::RenderBatches hook installed");
+    }
+
+    if (!OriginalRenderGeometryGroup) {
+        // OG ID 1379976, 0x14282F110. IDA-verified clean boundary:
+        // mov [rsp+10],rbp (5) + mov [rsp+18],rsi (5) + push rdi (1) +
+        // sub rsp,20h (4) = 15 bytes. 14 splits the sub instruction.
+        constexpr std::size_t kRenderGeometryGroupPrologueSize = 15;
+        OriginalRenderGeometryGroup = Hooks::CreateBranchGateway5<RenderGeometryGroup_t>(
+            Hooks::Addresses::RenderGeometryGroup,
+            kRenderGeometryGroupPrologueSize,
+            reinterpret_cast<void*>(&HookedRenderGeometryGroup));
+
+        if (!OriginalRenderGeometryGroup) {
+            REX::WARN("InstallDrawTaggingHooks_Internal: Failed to install BSShaderAccumulator::RenderGeometryGroup hook");
+            return false;
+        }
+
+        REX::INFO("InstallDrawTaggingHooks_Internal: BSShaderAccumulator::RenderGeometryGroup hook installed");
     }
 
     auto verifyRel32Call = [](const char* label,
