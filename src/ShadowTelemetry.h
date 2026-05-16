@@ -1,5 +1,7 @@
 #pragma once
 
+#include <FeatureGates.h>
+
 #include <atomic>
 #include <cstdint>
 
@@ -20,6 +22,8 @@ enum class Mode : std::uint8_t {
 
 extern std::atomic<Mode> g_mode;
 inline constexpr bool kDetailedShadowCacheLogging = false;
+
+#if SHADERENGINE_ENABLE_SHADOW_TELEMETRY
 
 bool Initialize();
 
@@ -84,5 +88,67 @@ bool HandleShadowCacheClearDepthStencilView(
     std::uint32_t clearFlags,
     float depth,
     std::uint8_t stencil);
+
+#else
+
+inline std::atomic<Mode> g_mode{ Mode::Off };
+
+enum class WorkKind : std::uint8_t {
+    CommandBufferReplay,
+    ImmediatePass,
+    BuildCommandBuffer,
+};
+
+struct WorkTarget {
+    void* owner = nullptr;
+    void* head = nullptr;
+    void* cbData = nullptr;
+    void* commandBuffer = nullptr;
+    void* geometry = nullptr;
+    void* shader = nullptr;
+    void* shaderProperty = nullptr;
+    std::uint32_t techniqueID = 0;
+    std::int32_t passGroupIdx = -1;
+    std::uint32_t subIdx = 0;
+    std::uint32_t chainLen = 0;
+    std::uint32_t srvCount = 0;
+    std::uint32_t cbRecordCount = 0;
+    std::uint32_t cbDrawCount = 0;
+    std::uint32_t cbNonZeroDrawCount = 0;
+    std::uint32_t cbMaxDrawCount = 0;
+    std::uint32_t cbSrvRecordCount = 0;
+    std::uint32_t cbMaxSrvRecordCount = 0;
+    bool allowAlpha = false;
+};
+
+inline bool Initialize() { return true; }
+inline void OnBSDraw() {}
+inline void OnD3DDraw() {}
+inline void OnCommandBufferDraw() {}
+inline bool BeginShadowWork(WorkKind, const WorkTarget&) { return false; }
+inline void EndShadowWork(WorkKind) {}
+inline bool IsInShadowMap() { return false; }
+inline bool IsDirectionalSplitShadow() { return false; }
+inline bool IsShadowCacheActiveForCurrentShadow() { return false; }
+inline bool IsShadowCacheStaticBuildPass() { return false; }
+inline bool IsShadowCacheDynamicOverlayPass() { return false; }
+inline bool IsShadowCacheRegistrationFilterActive(void*, void*) { return false; }
+inline bool RouteShadowCacheRegistration(void*, bool, void**) { return false; }
+inline void NoteShadowCacheShadowMapOrMaskHook(bool) {}
+inline void NoteShadowCacheShadowMapOrMaskHookDetail(bool, void*) {}
+inline void NoteShadowCacheRenderPassSplit(bool, bool) {}
+inline void NoteShadowCachePassRouted(bool) {}
+inline void ResetShadowCacheState() {}
+inline bool HandleShadowCacheClearDepthStencilView(
+    REX::W32::ID3D11DeviceContext*,
+    REX::W32::ID3D11DepthStencilView*,
+    std::uint32_t,
+    float,
+    std::uint8_t)
+{
+    return false;
+}
+
+#endif
 
 }  // namespace ShadowTelemetry

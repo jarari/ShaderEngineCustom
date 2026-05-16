@@ -1068,6 +1068,19 @@ namespace
         return records;
     }
 
+    void* GetPassCommandBufferRecord(BSRenderPassLayout* pass) noexcept
+    {
+        if (!pass) {
+            return nullptr;
+        }
+
+        auto* commandBufferRecord = reinterpret_cast<void*>(pass->next);
+        if (!commandBufferRecord) {
+            commandBufferRecord = pass->commandBuffer;
+        }
+        return commandBufferRecord;
+    }
+
     void* PrepareShadowCommandBufferSidecar(
         void* cbData,
         const ActiveCommandBufferSelection& selection,
@@ -1515,6 +1528,201 @@ namespace
         std::vector<Link> originalLinks_;
     };
 
+    constexpr bool kDeferredPrePassStaticCommandBufferFilterEnabled = false;
+
+    class ScopedDeferredPrePassStaticCommandBufferFilter
+    {
+    public:
+        ScopedDeferredPrePassStaticCommandBufferFilter(void* batchRenderer, int group, void* cbData, unsigned int subIdx) :
+            cbData_(cbData),
+            records_(static_cast<void**>(cbData)),
+            node_(GetRenderBatchNodeAddress(batchRenderer, group, subIdx))
+        {
+            if (!kDeferredPrePassStaticCommandBufferFilterEnabled ||
+                !PhaseTelemetry::IsInDeferredPrePass() ||
+                group != 4 ||
+                !cbData_ ||
+                !records_ ||
+                !node_) {
+                return;
+            }
+
+            originalNodeHead_ = GetRenderBatchNodeHeadRaw(node_);
+            if (!originalNodeHead_) {
+                return;
+            }
+
+            writeCursorSlot_ = reinterpret_cast<void***>(
+                static_cast<std::byte*>(cbData_) + kCommandBufferWriteCursorOffset);
+            originalWriteCursor_ = *writeCursorSlot_;
+
+            const std::size_t recordCount = GetOriginalRecordCount();
+            originalRecords_.assign(records_, records_ + recordCount);
+            if (recordCount < kMaxCommandBufferRecords) {
+                terminatorSlot_ = records_ + recordCount;
+                originalTerminator_ = *terminatorSlot_;
+            }
+
+            BSRenderPassLayout* filteredHead = nullptr;
+            BSRenderPassLayout* filteredTail = nullptr;
+            std::vector<void*> keptCommandBuffers;
+            std::size_t staticPasses = 0;
+            std::size_t dynamicPasses = 0;
+
+            for (auto* pass = originalNodeHead_; pass && originalLinks_.size() < 65536; pass = pass->passGroupNext) {
+                originalLinks_.push_back({ pass, pass->passGroupNext });
+                if (IsPrecombineShadowGeometry(pass->geometry)) {
+                    ++staticPasses;
+                    continue;
+                }
+
+                ++dynamicPasses;
+                if (!filteredHead) {
+                    filteredHead = pass;
+                }
+                if (filteredTail) {
+                    filteredTail->passGroupNext = pass;
+                }
+                filteredTail = pass;
+
+                if (auto* record = GetPassCommandBufferRecord(pass)) {
+                    keptCommandBuffers.push_back(record);
+                }
+            }
+
+            if (staticPasses == 0) {
+                RestorePassLinks();
+                return;
+            }
+
+            active_ = true;
+            staticPasses_ = staticPasses;
+            dynamicPasses_ = dynamicPasses;
+            techniqueID_ = GetRenderBatchNodeTechniqueRaw(node_);
+
+            if (filteredTail) {
+                filteredTail->passGroupNext = nullptr;
+            }
+            filteredHead_ = filteredHead;
+            SetRenderBatchNodeHeadRaw(node_, filteredHead_);
+
+            for (void* record : originalRecords_) {
+                if (Contains(keptCommandBuffers, record)) {
+                    records_[keptRecordCount_++] = record;
+                }
+            }
+            *writeCursorSlot_ = records_ + keptRecordCount_;
+            if (keptRecordCount_ < kMaxCommandBufferRecords) {
+                records_[keptRecordCount_] = nullptr;
+            }
+
+            for (void* record : keptCommandBuffers) {
+                if (!Contains(originalRecords_, record)) {
+                    needsImmediateFallback_ = true;
+                    break;
+                }
+            }
+
+            static std::atomic_bool logged{ false };
+            if (!logged.exchange(true, std::memory_order_relaxed)) {
+                REX::WARN(
+                    "DeferredPrePass experiment: filtering group 4 static command-buffer records "
+                    "(first node staticPasses={} dynamicPasses={} records={} kept={})",
+                    staticPasses_,
+                    dynamicPasses_,
+                    originalRecords_.size(),
+                    keptRecordCount_);
+            }
+        }
+
+        ~ScopedDeferredPrePassStaticCommandBufferFilter()
+        {
+            if (!active_) {
+                return;
+            }
+
+            RestorePassLinks();
+            SetRenderBatchNodeHeadRaw(node_, originalNodeHead_);
+
+            for (std::size_t i = 0; i < originalRecords_.size(); ++i) {
+                records_[i] = originalRecords_[i];
+            }
+            if (terminatorSlot_) {
+                *terminatorSlot_ = originalTerminator_;
+            }
+            if (writeCursorSlot_) {
+                *writeCursorSlot_ = originalWriteCursor_;
+            }
+        }
+
+        bool Active() const noexcept { return active_; }
+        BSRenderPassLayout* Head() const noexcept { return filteredHead_; }
+        std::uint32_t TechniqueID() const noexcept { return techniqueID_; }
+        bool NeedsImmediateFallback() const noexcept
+        {
+            return active_ && filteredHead_ && (keptRecordCount_ == 0 || needsImmediateFallback_);
+        }
+
+        ScopedDeferredPrePassStaticCommandBufferFilter(const ScopedDeferredPrePassStaticCommandBufferFilter&) = delete;
+        ScopedDeferredPrePassStaticCommandBufferFilter& operator=(const ScopedDeferredPrePassStaticCommandBufferFilter&) = delete;
+
+    private:
+        struct Link
+        {
+            BSRenderPassLayout* pass = nullptr;
+            BSRenderPassLayout* next = nullptr;
+        };
+
+        static bool Contains(const std::vector<void*>& records, void* needle)
+        {
+            return std::find(records.begin(), records.end(), needle) != records.end();
+        }
+
+        std::size_t GetOriginalRecordCount() const
+        {
+            const auto recordsAddr = reinterpret_cast<std::uintptr_t>(records_);
+            const auto cursorAddr = reinterpret_cast<std::uintptr_t>(originalWriteCursor_);
+            const auto maxCursorAddr = recordsAddr + kMaxCommandBufferRecords * sizeof(void*);
+            if (cursorAddr >= recordsAddr && cursorAddr <= maxCursorAddr &&
+                ((cursorAddr - recordsAddr) % sizeof(void*)) == 0) {
+                return static_cast<std::size_t>((cursorAddr - recordsAddr) / sizeof(void*));
+            }
+
+            std::size_t count = 0;
+            while (count < kMaxCommandBufferRecords && records_[count]) {
+                ++count;
+            }
+            return count;
+        }
+
+        void RestorePassLinks()
+        {
+            for (const auto& link : originalLinks_) {
+                if (link.pass) {
+                    link.pass->passGroupNext = link.next;
+                }
+            }
+        }
+
+        void* cbData_ = nullptr;
+        void** records_ = nullptr;
+        void*** writeCursorSlot_ = nullptr;
+        void** originalWriteCursor_ = nullptr;
+        void** terminatorSlot_ = nullptr;
+        void* originalTerminator_ = nullptr;
+        std::uintptr_t node_ = 0;
+        BSRenderPassLayout* originalNodeHead_ = nullptr;
+        BSRenderPassLayout* filteredHead_ = nullptr;
+        std::uint32_t techniqueID_ = 0;
+        std::size_t keptRecordCount_ = 0;
+        std::size_t staticPasses_ = 0;
+        std::size_t dynamicPasses_ = 0;
+        bool active_ = false;
+        bool needsImmediateFallback_ = false;
+        std::vector<void*> originalRecords_;
+        std::vector<Link> originalLinks_;
+    };
+
     class ScopedPersistentShadowPassListFilter
     {
     public:
@@ -1813,6 +2021,35 @@ namespace
     std::shared_mutex g_actorDrawTaggedGeometryLock;
     thread_local unsigned int g_renderBatchesGroup = UINT_MAX;
     thread_local std::uint32_t g_renderBatchesDepth = 0;
+
+    std::uint32_t MakeDeferredCommandBufferDetailKey(int passGroupIdx, unsigned int subIdx)
+    {
+        const auto group = passGroupIdx >= 0 ? static_cast<std::uint32_t>(passGroupIdx) : g_renderBatchesGroup;
+        return (group << 5) | std::min<std::uint32_t>(subIdx, 31u);
+    }
+
+    class ScopedDeferredPrePassDetail
+    {
+    public:
+        ScopedDeferredPrePassDetail(PhaseTelemetry::DeferredPrePassDetailKind kind, std::uint32_t key) :
+            kind_(kind),
+            key_(key)
+        {
+            PhaseTelemetry::BeginDeferredPrePassDetail(kind_, key_);
+        }
+
+        ~ScopedDeferredPrePassDetail()
+        {
+            PhaseTelemetry::EndDeferredPrePassDetail(kind_, key_);
+        }
+
+        ScopedDeferredPrePassDetail(const ScopedDeferredPrePassDetail&) = delete;
+        ScopedDeferredPrePassDetail& operator=(const ScopedDeferredPrePassDetail&) = delete;
+
+    private:
+        PhaseTelemetry::DeferredPrePassDetailKind kind_;
+        std::uint32_t key_;
+    };
 
     void SetCommandBufferDrawTagWrapper(RE::BSGeometry* geometry, const DrawTagClassification& classification);
     void ResetCommandBufferDrawTagWrappers();
@@ -2473,7 +2710,7 @@ namespace
 
     void HookedRenderBatches(void* this_, unsigned int passGroupIdx, bool allowAlpha, unsigned int filter)
     {
-        PhaseTelemetry::BeginDeferredPrePassDetail(
+        ScopedDeferredPrePassDetail detail(
             PhaseTelemetry::DeferredPrePassDetailKind::RenderBatches,
             passGroupIdx);
         const unsigned int prevGroup = g_renderBatchesGroup;
@@ -2492,20 +2729,14 @@ namespace
         }
         g_renderBatchesGroup = prevGroup;
         --g_renderBatchesDepth;
-        PhaseTelemetry::EndDeferredPrePassDetail(
-            PhaseTelemetry::DeferredPrePassDetailKind::RenderBatches,
-            passGroupIdx);
     }
 
     void HookedRenderGeometryGroup(void* accumulator, unsigned int group, bool allowAlpha)
     {
-        PhaseTelemetry::BeginDeferredPrePassDetail(
+        ScopedDeferredPrePassDetail detail(
             PhaseTelemetry::DeferredPrePassDetailKind::RenderGeometryGroup,
             group);
         OriginalRenderGeometryGroup(accumulator, group, allowAlpha);
-        PhaseTelemetry::EndDeferredPrePassDetail(
-            PhaseTelemetry::DeferredPrePassDetailKind::RenderGeometryGroup,
-            group);
     }
 
     void HookedProcessCommandBuffer(void* renderer, void* cbData)
@@ -2529,6 +2760,10 @@ namespace
 
     void HookedRenderCommandBufferPassesImpl(void* this_, int passGroupIdx, void* cbData, unsigned int subIdx, bool allowAlpha)
     {
+        const auto detailKey = MakeDeferredCommandBufferDetailKey(passGroupIdx, subIdx);
+        ScopedDeferredPrePassDetail detail(
+            PhaseTelemetry::DeferredPrePassDetailKind::RenderCommandBufferPasses,
+            detailKey);
         D3D11Hooks::EnsureDrawHooksPresent();
 
         if (PhaseTelemetry::g_mode.load(std::memory_order_relaxed) == PhaseTelemetry::Mode::On) {
@@ -2539,9 +2774,17 @@ namespace
         }
 
         auto* head = GetRenderBatchNodeHead(this_, passGroupIdx, subIdx);
+        const auto node = GetRenderBatchNodeAddress(this_, passGroupIdx, subIdx);
+        PhaseTelemetry::NoteDeferredPrePassCommandBuffer(
+            detailKey,
+            head,
+            head ? static_cast<void*>(head->geometry) : nullptr,
+            head ? static_cast<void*>(head->shader) : nullptr,
+            node ? GetRenderBatchNodeTechniqueRaw(node) : (head ? head->techniqueID : 0),
+            CountPassChain(head),
+            (head && head->geometry) ? head->geometry->name.c_str() : "");
 
         {
-            const auto node = GetRenderBatchNodeAddress(this_, passGroupIdx, subIdx);
             ActiveCommandBufferSelection fallbackSelection{};
             auto* shadowSelection =
                 IsFinishLevelShadowSplitActive() ? FindActiveCommandBufferSelection(node) : nullptr;
@@ -2600,6 +2843,28 @@ namespace
                 }
             }
 
+            ScopedDeferredPrePassStaticCommandBufferFilter deferredStaticFilter(
+                this_,
+                passGroupIdx,
+                replayCbData,
+                subIdx);
+            if (deferredStaticFilter.Active()) {
+                if (!deferredStaticFilter.Head()) {
+                    InvalidateCommandBufferFrame(replayCbData);
+                    return;
+                }
+
+                if (deferredStaticFilter.NeedsImmediateFallback()) {
+                    OriginalRenderPassImpl(
+                        this_,
+                        deferredStaticFilter.Head(),
+                        deferredStaticFilter.TechniqueID(),
+                        allowAlpha);
+                    InvalidateCommandBufferFrame(replayCbData);
+                    return;
+                }
+            }
+
             std::optional<ScopedProcessCommandBufferTarget> processTarget;
             if (IsShadowWorkTelemetryActive()) {
                 processTarget.emplace(MakeShadowPassWorkTarget(
@@ -2617,8 +2882,18 @@ namespace
             // SRV with the stale immediate-path g_currentDrawTag value.
             struct ReplayScope
             {
-                ReplayScope() { ShaderResources::EnterCommandBufferReplay(); }
-                ~ReplayScope() { ShaderResources::LeaveCommandBufferReplay(); }
+                ReplayScope()
+                {
+                    D3D11Hooks::ResetCommandBufferReplayState();
+                    ShaderResources::EnterCommandBufferReplay();
+                    PhaseTelemetry::EnterCommandBufferReplay();
+                }
+                ~ReplayScope()
+                {
+                    PhaseTelemetry::LeaveCommandBufferReplay();
+                    ShaderResources::LeaveCommandBufferReplay();
+                    D3D11Hooks::ResetCommandBufferReplayState();
+                }
             } replayScope;
 
             // If an old command buffer lacks our injected record, make it fall
@@ -2722,6 +2997,9 @@ namespace
     void HookedRenderPassImpl(void* this_, BSRenderPassLayout* head, std::uint32_t techniqueID, bool allowAlpha)
     {
         const unsigned int group = g_renderBatchesGroup;
+        ScopedDeferredPrePassDetail detail(
+            PhaseTelemetry::DeferredPrePassDetailKind::RenderPassImpl,
+            group);
         {
             std::optional<ScopedShadowWork> shadowWork;
             if (IsShadowWorkTelemetryActive()) {

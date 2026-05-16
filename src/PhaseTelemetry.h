@@ -1,5 +1,7 @@
 #pragma once
 
+#include <FeatureGates.h>
+
 #include <atomic>
 #include <cstdint>
 
@@ -62,12 +64,43 @@ bool IsInDeferredLightsImpl();
 enum class DeferredPrePassDetailKind : std::uint8_t {
     RenderBatches,
     RenderGeometryGroup,
+    RenderCommandBufferPasses,
+    RenderPassImpl,
 };
+
+enum class CommandBufferD3DCallKind : std::uint8_t {
+    Map,
+    Unmap,
+    ConstantBuffer,
+    ShaderResource,
+    ShaderResourceSkip,
+    Sampler,
+    InputAssembly,
+    InputAssemblySkip,
+    State,
+    Draw,
+    ResourceWait,
+    ResourceFlush,
+    ResourceEscalate,
+    Count,
+};
+
+#if SHADERENGINE_ENABLE_PHASE_TELEMETRY
 
 // Optional fine-grain profiling inside DrawWorld::DeferredPrePass. These are
 // inclusive scopes; RenderGeometryGroup can contain nested RenderBatches time.
-void BeginDeferredPrePassDetail(DeferredPrePassDetailKind kind, std::uint32_t group);
-void EndDeferredPrePassDetail(DeferredPrePassDetailKind kind, std::uint32_t group);
+// RenderCommandBufferPasses uses key = (group << 5) | min(subIdx, 31).
+void BeginDeferredPrePassDetail(DeferredPrePassDetailKind kind, std::uint32_t key);
+void EndDeferredPrePassDetail(DeferredPrePassDetailKind kind, std::uint32_t key);
+bool GetCurrentDeferredPrePassDetail(DeferredPrePassDetailKind& kind, std::uint32_t& key);
+void NoteDeferredPrePassCommandBuffer(
+    std::uint32_t key,
+    void* head,
+    void* geometry,
+    void* shader,
+    std::uint32_t techniqueID,
+    std::uint32_t chainLen,
+    const char* geometryName);
 
 // Called from Plugin.cpp's HookedBSBatchRendererDraw. Cheap when mode==Off
 // (single relaxed atomic load + branch). Attributes a draw to the currently
@@ -83,11 +116,52 @@ void OnD3DDraw();
 // Bethesda's pre-recorded command-buffer draw path, which bypasses
 // BSBatchRenderer::Draw and may also bypass our immediate-context hooks.
 void OnCommandBufferDraw();
+void EnterCommandBufferReplay();
+void LeaveCommandBufferReplay();
+bool IsInCommandBufferReplay();
+void OnCommandBufferD3DCall(CommandBufferD3DCallKind kind, std::uint64_t ns);
 
 // Install the DrawWorld:: hooks. Hooks are installed if PHASE_TELEMETRY_MODE is
 // `on` OR if any piggy-back consumer (LightSorter) is enabled — see
 // PhaseTelemetry.cpp::Initialize. Safe to call multiple times. Returns false
 // if any individual hook install fails; partial-install state is logged.
 bool Initialize();
+
+#else
+
+inline std::atomic<Mode> g_mode{ Mode::Off };
+inline thread_local std::uint32_t g_commandBufferReplayDepth = 0;
+
+inline void RequireHooks() {}
+inline bool IsInRenderPreUI() { return false; }
+inline bool IsInMainAccum() { return false; }
+inline bool IsInDeferredPrePass() { return false; }
+inline bool IsInDeferredLightsImpl() { return false; }
+inline void BeginDeferredPrePassDetail(DeferredPrePassDetailKind, std::uint32_t) {}
+inline void EndDeferredPrePassDetail(DeferredPrePassDetailKind, std::uint32_t) {}
+inline bool GetCurrentDeferredPrePassDetail(DeferredPrePassDetailKind&, std::uint32_t&) { return false; }
+inline void NoteDeferredPrePassCommandBuffer(
+    std::uint32_t,
+    void*,
+    void*,
+    void*,
+    std::uint32_t,
+    std::uint32_t,
+    const char*) {}
+inline void OnDraw() {}
+inline void OnD3DDraw() {}
+inline void OnCommandBufferDraw() {}
+inline void EnterCommandBufferReplay() { ++g_commandBufferReplayDepth; }
+inline void LeaveCommandBufferReplay()
+{
+    if (g_commandBufferReplayDepth > 0) {
+        --g_commandBufferReplayDepth;
+    }
+}
+inline bool IsInCommandBufferReplay() { return g_commandBufferReplayDepth > 0; }
+inline void OnCommandBufferD3DCall(CommandBufferD3DCallKind, std::uint64_t) {}
+inline bool Initialize() { return true; }
+
+#endif
 
 }  // namespace PhaseTelemetry

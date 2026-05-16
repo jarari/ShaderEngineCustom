@@ -84,6 +84,7 @@ bool DEBUGGING = false;
 bool CUSTOMBUFFER_ON = true;
 // Experimental directional shadow-map static-depth cache benchmark
 bool SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON = false;
+bool COMMAND_BUFFER_REPLAY_DEDUPE_SRV = false;
 // Custom resource view slot in shader
 UINT CUSTOMBUFFER_SLOT = 31;
 UINT DRAWTAG_SLOT = 26;
@@ -303,28 +304,43 @@ bool SaveShaderEngineConfig(std::string* errorMessage)
             }
         }
 
+#if SHADERENGINE_ENABLE_PHASE_TELEMETRY
         bool foundPhaseTelemetry = false;
+#endif
+#if SHADERENGINE_ENABLE_SHADOW_TELEMETRY
         bool foundShadowTelemetry = false;
+#endif
         bool foundShadowCache = false;
+        bool foundCommandBufferReplayDedupeSrv = false;
         for (auto& line : lines) {
             auto [key, value] = GetKeyValueFromLine(line);
             const auto lowerKey = ToLower(key);
+#if SHADERENGINE_ENABLE_PHASE_TELEMETRY
             if (lowerKey == "phase_telemetry_mode") {
                 const bool enabled =
                     PhaseTelemetry::g_mode.load(std::memory_order_relaxed) == PhaseTelemetry::Mode::On;
                 line = std::string("PHASE_TELEMETRY_MODE=") + (enabled ? "on" : "off");
                 foundPhaseTelemetry = true;
-            } else if (lowerKey == "shadow_telemetry_mode") {
+            } else
+#endif
+#if SHADERENGINE_ENABLE_SHADOW_TELEMETRY
+            if (lowerKey == "shadow_telemetry_mode") {
                 const bool enabled =
                     ShadowTelemetry::g_mode.load(std::memory_order_relaxed) == ShadowTelemetry::Mode::On;
                 line = std::string("SHADOW_TELEMETRY_MODE=") + (enabled ? "on" : "off");
                 foundShadowTelemetry = true;
-            } else if (lowerKey == "shadow_cache_directional_mapslot1_on") {
+            } else
+#endif
+            if (lowerKey == "shadow_cache_directional_mapslot1_on") {
                 line = std::string("SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON=") + (SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON ? "true" : "false");
                 foundShadowCache = true;
+            } else if (lowerKey == "command_buffer_replay_dedupe_srv") {
+                line = std::string("COMMAND_BUFFER_REPLAY_DEDUPE_SRV=") + (COMMAND_BUFFER_REPLAY_DEDUPE_SRV ? "true" : "false");
+                foundCommandBufferReplayDedupeSrv = true;
             }
         }
 
+#if SHADERENGINE_ENABLE_PHASE_TELEMETRY
         if (!foundPhaseTelemetry) {
             if (!lines.empty() && !lines.back().empty()) {
                 lines.emplace_back();
@@ -335,6 +351,8 @@ bool SaveShaderEngineConfig(std::string* errorMessage)
                 PhaseTelemetry::g_mode.load(std::memory_order_relaxed) == PhaseTelemetry::Mode::On;
             lines.emplace_back(std::string("PHASE_TELEMETRY_MODE=") + (enabled ? "on" : "off"));
         }
+#endif
+#if SHADERENGINE_ENABLE_SHADOW_TELEMETRY
         if (!foundShadowTelemetry) {
             if (!lines.empty() && !lines.back().empty()) {
                 lines.emplace_back();
@@ -345,6 +363,7 @@ bool SaveShaderEngineConfig(std::string* errorMessage)
                 ShadowTelemetry::g_mode.load(std::memory_order_relaxed) == ShadowTelemetry::Mode::On;
             lines.emplace_back(std::string("SHADOW_TELEMETRY_MODE=") + (enabled ? "on" : "off"));
         }
+#endif
         if (!foundShadowCache) {
             if (!lines.empty() && !lines.back().empty()) {
                 lines.emplace_back();
@@ -352,6 +371,14 @@ bool SaveShaderEngineConfig(std::string* errorMessage)
             lines.emplace_back("; --- SHADOW STATIC CACHE ---");
             lines.emplace_back("; Directional sun split static-depth cache A/B toggle.");
             lines.emplace_back(std::string("SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON=") + (SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON ? "true" : "false"));
+        }
+        if (!foundCommandBufferReplayDedupeSrv) {
+            if (!lines.empty() && !lines.back().empty()) {
+                lines.emplace_back();
+            }
+            lines.emplace_back("; --- COMMAND BUFFER REPLAY ---");
+            lines.emplace_back("; Suppress redundant pixel-shader SRV binds during command-buffer replay.");
+            lines.emplace_back(std::string("COMMAND_BUFFER_REPLAY_DEDUPE_SRV=") + (COMMAND_BUFFER_REPLAY_DEDUPE_SRV ? "true" : "false"));
         }
 
         std::filesystem::path tmpPath = configPath;
@@ -1070,6 +1097,12 @@ void LoadConfig(HMODULE hModule) {
             REX::INFO("LoadConfig: SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON set to {}", SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON);
             continue;
         }
+        else if (lowerKey == "command_buffer_replay_dedupe_srv") {
+            const std::string v = ToLower(value);
+            COMMAND_BUFFER_REPLAY_DEDUPE_SRV = (v == "true" || v == "1" || v == "on");
+            REX::INFO("LoadConfig: COMMAND_BUFFER_REPLAY_DEDUPE_SRV set to {}", COMMAND_BUFFER_REPLAY_DEDUPE_SRV);
+            continue;
+        }
         else if (lowerKey == "shadow_cache_directional_mapslot1_max_skip") {
             REX::WARN("LoadConfig: SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_MAX_SKIP is deprecated and ignored");
             continue;
@@ -1245,6 +1278,7 @@ void LoadConfig(HMODULE hModule) {
             }
             continue;
         }
+#if SHADERENGINE_ENABLE_PHASE_TELEMETRY
         else if (lowerKey == "phase_telemetry_mode") {
             const std::string v = ToLower(value);
             if (v == "on" || v == "true" || v == "1") {
@@ -1256,6 +1290,8 @@ void LoadConfig(HMODULE hModule) {
             }
             continue;
         }
+#endif
+#if SHADERENGINE_ENABLE_SHADOW_TELEMETRY
         else if (lowerKey == "shadow_telemetry_mode") {
             const std::string v = ToLower(value);
             if (v == "on" || v == "true" || v == "1") {
@@ -1267,6 +1303,7 @@ void LoadConfig(HMODULE hModule) {
             }
             continue;
         }
+#endif
     }
     file.close();
     {
@@ -1536,8 +1573,12 @@ F4SE_PLUGIN_LOAD(const F4SE::LoadInterface* a_f4se)
     // Phase telemetry installs per-DrawWorld:: hooks to attribute wall time
     // + draw count per sub-phase under DrawWorld::Render_PreUI. Default off
     // = no logging.
+#if SHADERENGINE_ENABLE_PHASE_TELEMETRY
     PhaseTelemetry::Initialize();
+#endif
+#if SHADERENGINE_ENABLE_SHADOW_TELEMETRY
     ShadowTelemetry::Initialize();
+#endif
     // LightSorter ? stable-partitions the point-light array by stencil flag
     // before DrawWorld::DeferredLightsImpl, then restores. No own hook;
     // PhaseTelemetry's HookedDeferredLightsImpl calls OnEnter/OnExit.

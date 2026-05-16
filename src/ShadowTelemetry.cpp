@@ -1,5 +1,8 @@
 #include <PCH.h>
 #include "ShadowTelemetry.h"
+
+#if SHADERENGINE_ENABLE_SHADOW_TELEMETRY
+
 #include "PhaseTelemetry.h"
 #include "Global.h"
 #include "hooks.h"
@@ -3022,3 +3025,5 @@ bool Initialize()
 }
 
 }  // namespace ShadowTelemetry
+
+#endif

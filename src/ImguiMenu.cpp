@@ -19,6 +19,7 @@ static bool g_shaderSettingsSaveModalRequested = false;
 static bool g_shaderSettingsSaveSucceeded = false;
 static std::string g_shaderSettingsSaveMessage;
 
+#if SHADERENGINE_ENABLE_PHASE_TELEMETRY
 static void ApplyPhaseTelemetrySetting(bool enabled)
 {
     const auto mode = PhaseTelemetry::g_mode.load(std::memory_order_relaxed);
@@ -36,7 +37,9 @@ static void ApplyPhaseTelemetrySetting(bool enabled)
     }
     REX::INFO("ShaderEngine Settings: PHASE_TELEMETRY_MODE set to {}", enabled ? "on" : "off");
 }
+#endif
 
+#if SHADERENGINE_ENABLE_SHADOW_TELEMETRY
 static void ApplyShadowTelemetrySetting(bool enabled)
 {
     const auto mode = ShadowTelemetry::g_mode.load(std::memory_order_relaxed);
@@ -53,6 +56,7 @@ static void ApplyShadowTelemetrySetting(bool enabled)
     }
     REX::INFO("ShaderEngine Settings: SHADOW_TELEMETRY_MODE set to {}", enabled ? "on" : "off");
 }
+#endif
 
 static void ApplyShadowCacheDirectionalMapSlot1Setting(bool enabled)
 {
@@ -67,6 +71,16 @@ static void ApplyShadowCacheDirectionalMapSlot1Setting(bool enabled)
         ShadowTelemetry::Initialize();
     }
     REX::INFO("ShaderEngine Settings: SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON set to {}", SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON);
+}
+
+static void ApplyCommandBufferReplayDedupeSetting(bool enabled)
+{
+    if (COMMAND_BUFFER_REPLAY_DEDUPE_SRV == enabled) {
+        return;
+    }
+
+    COMMAND_BUFFER_REPLAY_DEDUPE_SRV = enabled;
+    REX::INFO("ShaderEngine Settings: COMMAND_BUFFER_REPLAY_DEDUPE_SRV set to {}", COMMAND_BUFFER_REPLAY_DEDUPE_SRV);
 }
 
 static void SaveShaderSettingsWithFeedback()
@@ -255,19 +269,27 @@ void UIDrawShaderSettingsOverlay() {
     }
     ImGui::Separator();
 
+#if SHADERENGINE_ENABLE_PHASE_TELEMETRY
     bool phaseTelemetryOn =
         PhaseTelemetry::g_mode.load(std::memory_order_relaxed) == PhaseTelemetry::Mode::On;
     if (ImGui::Checkbox("Phase telemetry", &phaseTelemetryOn)) {
         ApplyPhaseTelemetrySetting(phaseTelemetryOn);
     }
+#endif
+#if SHADERENGINE_ENABLE_SHADOW_TELEMETRY
     bool shadowTelemetryOn =
         ShadowTelemetry::g_mode.load(std::memory_order_relaxed) == ShadowTelemetry::Mode::On;
     if (ImGui::Checkbox("Shadow telemetry", &shadowTelemetryOn)) {
         ApplyShadowTelemetrySetting(shadowTelemetryOn);
     }
+#endif
     bool shadowCacheDirectionalMapSlot1On = SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON;
     if (ImGui::Checkbox("Cache directional shadow splits", &shadowCacheDirectionalMapSlot1On)) {
         ApplyShadowCacheDirectionalMapSlot1Setting(shadowCacheDirectionalMapSlot1On);
+    }
+    bool commandBufferReplayDedupe = COMMAND_BUFFER_REPLAY_DEDUPE_SRV;
+    if (ImGui::Checkbox("Dedupe command-buffer replay", &commandBufferReplayDedupe)) {
+        ApplyCommandBufferReplayDedupeSetting(commandBufferReplayDedupe);
     }
     ImGui::Separator();
 

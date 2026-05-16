@@ -14,6 +14,12 @@ add_rules("plugin.vsxmake.autoupdate")
 
 add_defines("COMMONLIB_RUNTIMECOUNT=3")
 
+local enable_phase_telemetry = false
+local enable_shadow_telemetry = false
+
+add_defines("SHADERENGINE_ENABLE_PHASE_TELEMETRY=" .. (enable_phase_telemetry and "1" or "0"))
+add_defines("SHADERENGINE_ENABLE_SHADOW_TELEMETRY=" .. (enable_shadow_telemetry and "1" or "0"))
+
 add_requires("imgui", { configs = { dx11 = true, win32 = true } })
 
 -- define targets
@@ -30,6 +36,12 @@ target("ShaderEngineCL")
 
     -- add src files
     add_files("src/**.cpp")
+    if not enable_phase_telemetry then
+        remove_files("src/PhaseTelemetry.cpp")
+    end
+    if not enable_shadow_telemetry then
+        remove_files("src/ShadowTelemetry.cpp")
+    end
     add_headerfiles("src/**.h")
     add_includedirs("src")
     add_packages("imgui")

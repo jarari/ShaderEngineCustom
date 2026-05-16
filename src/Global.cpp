@@ -15,6 +15,10 @@ CUSTOMBUFFER_ON=true
 ; replays dynamic/unknown casters.
 ; Requires slot-safe DSV access; otherwise it falls back to vanilla rendering.
 SHADOW_CACHE_DIRECTIONAL_MAPSLOT1_ON=false
+; --- COMMAND BUFFER REPLAY ---
+; Experimental CPU optimization: during command-buffer replay, suppress redundant
+; SRV and input-assembly binds by tracking state and forwarding only changes.
+COMMAND_BUFFER_REPLAY_DEDUPE_SRV=false
 ; Custom resource view slot in shader (beyond what the game uses, default t31)
 CUSTOMBUFFER_SLOT=31
 ; Per-draw classification tag resource view slot
@@ -59,9 +63,6 @@ DEVGUI_HEIGHT=300
 ; Development GUI opacity (0.0 - 1.0)
 DEVGUI_OPACITY=0.75
 
-; Performance counters. Off by default.
-PHASE_TELEMETRY_MODE=off
-SHADOW_TELEMETRY_MODE=off
 LIGHT_SORTER_MODE=off
 
 ; Folder structure

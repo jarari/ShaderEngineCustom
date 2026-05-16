@@ -28,6 +28,17 @@ namespace D3D11Hooks
     Draw_t OriginalDraw = nullptr;
     DrawIndexedInstanced_t OriginalDrawIndexedInstanced = nullptr;
     DrawInstanced_t OriginalDrawInstanced = nullptr;
+    Map_t OriginalMap = nullptr;
+    Unmap_t OriginalUnmap = nullptr;
+    SetConstantBuffers_t OriginalVSSetConstantBuffers = nullptr;
+    SetConstantBuffers_t OriginalPSSetConstantBuffers = nullptr;
+    SetSamplers_t OriginalPSSetSamplers = nullptr;
+    IASetInputLayout_t OriginalIASetInputLayout = nullptr;
+    IASetVertexBuffers_t OriginalIASetVertexBuffers = nullptr;
+    IASetIndexBuffer_t OriginalIASetIndexBuffer = nullptr;
+    OMSetBlendState_t OriginalOMSetBlendState = nullptr;
+    OMSetDepthStencilState_t OriginalOMSetDepthStencilState = nullptr;
+    SetState1_t OriginalRSSetState = nullptr;
     PSSetShader_t OriginalPSSetShader = nullptr;
     VSSetShader_t OriginalVSSetShader = nullptr;
     CreatePixelShader_t OriginalCreatePixelShader = nullptr;
@@ -40,6 +51,93 @@ RE::Sky* g_sky = nullptr;
 
 static std::atomic<std::uint64_t> g_d3dDrawCallsThisFrame{ 0 };
 static std::atomic<std::uint64_t> g_d3dDrawCallsLastFrame{ 0 };
+
+namespace
+{
+    constexpr UINT kReplaySRVCacheSlots = 128;
+    constexpr UINT kReplayVertexBufferSlots = 32;
+    constexpr std::chrono::seconds kReplayMapTelemetryInterval{ 2 };
+
+    struct ReplaySRVCallCache
+    {
+        std::array<bool, kReplaySRVCacheSlots> valid{};
+        std::array<REX::W32::ID3D11ShaderResourceView*, kReplaySRVCacheSlots> views{};
+    };
+
+    struct ReplayVertexBufferState
+    {
+        REX::W32::ID3D11Buffer* buffer = nullptr;
+        UINT stride = 0;
+        UINT offset = 0;
+    };
+
+    struct ReplayIACache
+    {
+        bool inputLayoutValid = false;
+        REX::W32::ID3D11InputLayout* inputLayout = nullptr;
+
+        bool indexBufferValid = false;
+        REX::W32::ID3D11Buffer* indexBuffer = nullptr;
+        REX::W32::DXGI_FORMAT indexFormat{};
+        UINT indexOffset = 0;
+
+        std::array<bool, kReplayVertexBufferSlots> vertexBufferValid{};
+        std::array<ReplayVertexBufferState, kReplayVertexBufferSlots> vertexBuffers{};
+    };
+
+    struct ReplayMapResourceStats
+    {
+        struct KeyStats
+        {
+            std::uint64_t calls = 0;
+            std::uint64_t ns = 0;
+            std::uint64_t payloadWrites = 0;
+            std::uint64_t payloadDuplicateWrites = 0;
+        };
+
+        REX::W32::D3D11_RESOURCE_DIMENSION dimension = REX::W32::D3D11_RESOURCE_DIMENSION_UNKNOWN;
+        REX::W32::D3D11_MAP mapType = REX::W32::D3D11_MAP_READ;
+        UINT mapFlags = 0;
+        UINT subresource = 0;
+        std::uint32_t byteWidth = 0;
+        std::uint32_t width = 0;
+        std::uint32_t height = 0;
+        std::uint32_t depth = 0;
+        std::uint32_t bindFlags = 0;
+        std::uint32_t usage = 0;
+        std::uint32_t cpuAccessFlags = 0;
+        std::uint32_t format = 0;
+        std::uint64_t mapCalls = 0;
+        std::uint64_t unmapCalls = 0;
+        std::uint64_t mapNs = 0;
+        std::uint64_t unmapNs = 0;
+        std::uint64_t maxMapNs = 0;
+        std::uint64_t maxUnmapNs = 0;
+        std::uint64_t payloadWrites = 0;
+        std::uint64_t payloadDuplicateWrites = 0;
+        std::uint64_t lastPayloadHash = 0;
+        bool lastPayloadHashValid = false;
+        std::unordered_map<std::uint32_t, KeyStats> keyStats;
+        bool described = false;
+    };
+
+    struct ActiveReplayMapInfo
+    {
+        void* data = nullptr;
+        std::uint32_t byteWidth = 0;
+        std::uint32_t bindFlags = 0;
+        REX::W32::D3D11_RESOURCE_DIMENSION dimension = REX::W32::D3D11_RESOURCE_DIMENSION_UNKNOWN;
+        REX::W32::D3D11_MAP mapType = REX::W32::D3D11_MAP_READ;
+        std::uint32_t key = UINT_MAX;
+    };
+
+    thread_local ReplaySRVCallCache tl_replaySRVCallCache;
+    thread_local ReplayIACache tl_replayIACache;
+    thread_local std::unordered_map<REX::W32::ID3D11Resource*, ReplayMapResourceStats> tl_replayMapStats;
+    thread_local std::unordered_map<REX::W32::ID3D11Resource*, ActiveReplayMapInfo> tl_activeReplayMaps;
+    thread_local std::unordered_set<std::uint64_t> tl_loggedReplayPayloadSamples;
+    thread_local std::chrono::steady_clock::time_point tl_replayMapStatsStart = std::chrono::steady_clock::now();
+}
 
 std::uint64_t GetD3DDrawCallsLastFrame_Internal()
 {
@@ -729,6 +827,629 @@ void D3D11OnDraw_Internal(REX::W32::ID3D11DeviceContext* context, const char* so
     }
 }
 
+template <class Fn>
+auto ProfileCommandBufferD3DCall(PhaseTelemetry::CommandBufferD3DCallKind kind, Fn&& fn)
+{
+#if !SHADERENGINE_ENABLE_PHASE_TELEMETRY
+    (void)kind;
+    return fn();
+#else
+    if (!PhaseTelemetry::IsInCommandBufferReplay()) {
+        return fn();
+    }
+
+    const auto t0 = std::chrono::steady_clock::now();
+    if constexpr (std::is_void_v<std::invoke_result_t<Fn>>) {
+        fn();
+        const auto t1 = std::chrono::steady_clock::now();
+        PhaseTelemetry::OnCommandBufferD3DCall(
+            kind,
+            static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count()));
+    } else {
+        auto result = fn();
+        const auto t1 = std::chrono::steady_clock::now();
+        PhaseTelemetry::OnCommandBufferD3DCall(
+            kind,
+            static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count()));
+        return result;
+    }
+#endif
+}
+
+const char* D3D11ResourceDimensionName(REX::W32::D3D11_RESOURCE_DIMENSION dimension) noexcept
+{
+    switch (dimension) {
+    case REX::W32::D3D11_RESOURCE_DIMENSION_BUFFER:    return "Buffer";
+    case REX::W32::D3D11_RESOURCE_DIMENSION_TEXTURE1D: return "Texture1D";
+    case REX::W32::D3D11_RESOURCE_DIMENSION_TEXTURE2D: return "Texture2D";
+    case REX::W32::D3D11_RESOURCE_DIMENSION_TEXTURE3D: return "Texture3D";
+    default:                                          return "Unknown";
+    }
+}
+
+const char* D3D11MapTypeName(REX::W32::D3D11_MAP mapType) noexcept
+{
+    switch (mapType) {
+    case REX::W32::D3D11_MAP_READ:             return "READ";
+    case REX::W32::D3D11_MAP_WRITE:            return "WRITE";
+    case REX::W32::D3D11_MAP_READ_WRITE:       return "READ_WRITE";
+    case REX::W32::D3D11_MAP_WRITE_DISCARD:    return "WRITE_DISCARD";
+    case REX::W32::D3D11_MAP_WRITE_NO_OVERWRITE: return "WRITE_NO_OVERWRITE";
+    default:                                   return "?";
+    }
+}
+
+void DescribeReplayMapResource(REX::W32::ID3D11Resource* resource, ReplayMapResourceStats& stats)
+{
+    if (!resource || stats.described) {
+        return;
+    }
+
+    resource->GetType(std::addressof(stats.dimension));
+    switch (stats.dimension) {
+    case REX::W32::D3D11_RESOURCE_DIMENSION_BUFFER: {
+        REX::W32::D3D11_BUFFER_DESC desc{};
+        static_cast<REX::W32::ID3D11Buffer*>(resource)->GetDesc(std::addressof(desc));
+        stats.byteWidth = desc.byteWidth;
+        stats.bindFlags = desc.bindFlags;
+        stats.usage = static_cast<std::uint32_t>(desc.usage);
+        stats.cpuAccessFlags = desc.cpuAccessFlags;
+        break;
+    }
+    case REX::W32::D3D11_RESOURCE_DIMENSION_TEXTURE1D: {
+        REX::W32::D3D11_TEXTURE1D_DESC desc{};
+        static_cast<REX::W32::ID3D11Texture1D*>(resource)->GetDesc(std::addressof(desc));
+        stats.width = desc.width;
+        stats.format = static_cast<std::uint32_t>(desc.format);
+        stats.bindFlags = desc.bindFlags;
+        stats.usage = static_cast<std::uint32_t>(desc.usage);
+        stats.cpuAccessFlags = desc.cpuAccessFlags;
+        break;
+    }
+    case REX::W32::D3D11_RESOURCE_DIMENSION_TEXTURE2D: {
+        REX::W32::D3D11_TEXTURE2D_DESC desc{};
+        static_cast<REX::W32::ID3D11Texture2D*>(resource)->GetDesc(std::addressof(desc));
+        stats.width = desc.width;
+        stats.height = desc.height;
+        stats.format = static_cast<std::uint32_t>(desc.format);
+        stats.bindFlags = desc.bindFlags;
+        stats.usage = static_cast<std::uint32_t>(desc.usage);
+        stats.cpuAccessFlags = desc.cpuAccessFlags;
+        break;
+    }
+    case REX::W32::D3D11_RESOURCE_DIMENSION_TEXTURE3D: {
+        REX::W32::D3D11_TEXTURE3D_DESC desc{};
+        static_cast<REX::W32::ID3D11Texture3D*>(resource)->GetDesc(std::addressof(desc));
+        stats.width = desc.width;
+        stats.height = desc.height;
+        stats.depth = desc.depth;
+        stats.format = static_cast<std::uint32_t>(desc.format);
+        stats.bindFlags = desc.bindFlags;
+        stats.usage = static_cast<std::uint32_t>(desc.usage);
+        stats.cpuAccessFlags = desc.cpuAccessFlags;
+        break;
+    }
+    default:
+        break;
+    }
+    stats.described = true;
+}
+
+std::string ReplayMapResourceShape(const ReplayMapResourceStats& stats)
+{
+    switch (stats.dimension) {
+    case REX::W32::D3D11_RESOURCE_DIMENSION_BUFFER:
+        return std::format(
+            "bytes={} bind=0x{:X} usage={} cpu=0x{:X}",
+            stats.byteWidth,
+            stats.bindFlags,
+            stats.usage,
+            stats.cpuAccessFlags);
+    case REX::W32::D3D11_RESOURCE_DIMENSION_TEXTURE1D:
+        return std::format(
+            "{} fmt={} bind=0x{:X} usage={} cpu=0x{:X}",
+            stats.width,
+            stats.format,
+            stats.bindFlags,
+            stats.usage,
+            stats.cpuAccessFlags);
+    case REX::W32::D3D11_RESOURCE_DIMENSION_TEXTURE2D:
+        return std::format(
+            "{}x{} fmt={} bind=0x{:X} usage={} cpu=0x{:X}",
+            stats.width,
+            stats.height,
+            stats.format,
+            stats.bindFlags,
+            stats.usage,
+            stats.cpuAccessFlags);
+    case REX::W32::D3D11_RESOURCE_DIMENSION_TEXTURE3D:
+        return std::format(
+            "{}x{}x{} fmt={} bind=0x{:X} usage={} cpu=0x{:X}",
+            stats.width,
+            stats.height,
+            stats.depth,
+            stats.format,
+            stats.bindFlags,
+            stats.usage,
+            stats.cpuAccessFlags);
+    default:
+        return "unknown";
+    }
+}
+
+std::uint32_t CurrentReplayMapDeferredKey()
+{
+    PhaseTelemetry::DeferredPrePassDetailKind kind{};
+    std::uint32_t key = 0;
+    if (!PhaseTelemetry::GetCurrentDeferredPrePassDetail(kind, key) ||
+        kind != PhaseTelemetry::DeferredPrePassDetailKind::RenderCommandBufferPasses) {
+        return UINT_MAX;
+    }
+    return key;
+}
+
+std::string DeferredCommandBufferKeyName(std::uint32_t key)
+{
+    if (key == UINT_MAX) {
+        return "?";
+    }
+
+    const auto group = key >> 5;
+    const auto subIdx = key & 0x1F;
+    return std::format("{}.{}", group, subIdx);
+}
+
+std::string ReplayMapResourceKeySummary(const ReplayMapResourceStats& stats)
+{
+    if (stats.keyStats.empty()) {
+        return "";
+    }
+
+    std::vector<std::pair<std::uint32_t, ReplayMapResourceStats::KeyStats>> rows;
+    rows.reserve(stats.keyStats.size());
+    for (const auto& entry : stats.keyStats) {
+        rows.emplace_back(entry.first, entry.second);
+    }
+    std::sort(rows.begin(), rows.end(), [](const auto& lhs, const auto& rhs) {
+        return lhs.second.ns > rhs.second.ns;
+    });
+
+    std::string out = "keys=";
+    const std::size_t limit = (std::min<std::size_t>)(rows.size(), 4);
+    for (std::size_t i = 0; i < limit; ++i) {
+        if (i != 0) {
+            out += ",";
+        }
+        out += std::format(
+            "{}:{}/{}us dup={}/{}",
+            DeferredCommandBufferKeyName(rows[i].first),
+            rows[i].second.calls,
+            rows[i].second.ns / 1000,
+            rows[i].second.payloadDuplicateWrites,
+            rows[i].second.payloadWrites);
+    }
+    return out;
+}
+
+std::uint64_t HashReplayPayload(const void* data, std::uint32_t size)
+{
+    constexpr std::uint64_t kFnvOffset = 14695981039346656037ull;
+    constexpr std::uint64_t kFnvPrime = 1099511628211ull;
+
+    auto* bytes = static_cast<const std::uint8_t*>(data);
+    std::uint64_t hash = kFnvOffset;
+    for (std::uint32_t i = 0; i < size; ++i) {
+        hash ^= bytes[i];
+        hash *= kFnvPrime;
+    }
+    return hash;
+}
+
+bool IsTrackedReplayCBPayload(const ReplayMapResourceStats& stats, REX::W32::D3D11_MAP mapType)
+{
+    constexpr std::uint32_t kD3D11BindConstantBuffer = 0x4;
+    return stats.dimension == REX::W32::D3D11_RESOURCE_DIMENSION_BUFFER &&
+        stats.byteWidth == 128 &&
+        (stats.bindFlags & kD3D11BindConstantBuffer) != 0 &&
+        mapType == REX::W32::D3D11_MAP_WRITE_DISCARD;
+}
+
+bool ShouldLogReplayPayloadSample(std::uint32_t key, std::uint64_t hash)
+{
+    constexpr std::uint32_t kKey42 = (4u << 5) | 2u;
+    constexpr std::uint32_t kKey43 = (4u << 5) | 3u;
+    if (key != kKey42 && key != kKey43) {
+        return false;
+    }
+
+    if (tl_loggedReplayPayloadSamples.size() >= 12) {
+        return false;
+    }
+
+    const std::uint64_t sampleKey = (static_cast<std::uint64_t>(key) << 32) ^ hash;
+    return tl_loggedReplayPayloadSamples.insert(sampleKey).second;
+}
+
+void LogReplayPayloadSample(const void* data, std::uint32_t key, std::uint64_t hash)
+{
+    std::array<float, 32> f{};
+    std::memcpy(f.data(), data, sizeof(f));
+
+    REX::INFO(
+        "    CommandBufferD3D[CBPayload128]: key={} hash=0x{:016X} "
+        "r0=({:.5g},{:.5g},{:.5g},{:.5g}) r1=({:.5g},{:.5g},{:.5g},{:.5g}) "
+        "r2=({:.5g},{:.5g},{:.5g},{:.5g}) r3=({:.5g},{:.5g},{:.5g},{:.5g}) "
+        "r4=({:.5g},{:.5g},{:.5g},{:.5g}) r5=({:.5g},{:.5g},{:.5g},{:.5g}) "
+        "r6=({:.5g},{:.5g},{:.5g},{:.5g}) r7=({:.5g},{:.5g},{:.5g},{:.5g})",
+        DeferredCommandBufferKeyName(key),
+        hash,
+        f[0], f[1], f[2], f[3],
+        f[4], f[5], f[6], f[7],
+        f[8], f[9], f[10], f[11],
+        f[12], f[13], f[14], f[15],
+        f[16], f[17], f[18], f[19],
+        f[20], f[21], f[22], f[23],
+        f[24], f[25], f[26], f[27],
+        f[28], f[29], f[30], f[31]);
+}
+
+void MaybeLogReplayMapStats()
+{
+    const auto now = std::chrono::steady_clock::now();
+    const auto elapsed = now - tl_replayMapStatsStart;
+    if (elapsed < kReplayMapTelemetryInterval) {
+        return;
+    }
+
+    const double secs = (std::max)(
+        0.001,
+        std::chrono::duration<double>(elapsed).count());
+    std::vector<std::pair<REX::W32::ID3D11Resource*, ReplayMapResourceStats>> rows;
+    rows.reserve(tl_replayMapStats.size());
+    for (const auto& entry : tl_replayMapStats) {
+        if (entry.second.mapCalls != 0 || entry.second.unmapCalls != 0) {
+            rows.emplace_back(entry.first, entry.second);
+        }
+    }
+    std::sort(rows.begin(), rows.end(), [](const auto& lhs, const auto& rhs) {
+        return (lhs.second.mapNs + lhs.second.unmapNs) > (rhs.second.mapNs + rhs.second.unmapNs);
+    });
+
+    const std::size_t limit = std::min<std::size_t>(rows.size(), 10);
+    for (std::size_t i = 0; i < limit; ++i) {
+        const auto* resource = rows[i].first;
+        const auto& stats = rows[i].second;
+        const auto totalNs = stats.mapNs + stats.unmapNs;
+        const auto totalCalls = stats.mapCalls + stats.unmapCalls;
+        REX::INFO(
+            "    CommandBufferD3D[MapResource:{}]: res={} type={} mapType={} flags=0x{:X} sub={} maps={} unmaps={} calls/s={:.1f} ms/s={:.2f} avgUs={:.2f} maxMapUs={:.1f} maxUnmapUs={:.1f} payloadDup={}/{} {} {}",
+            i,
+            static_cast<const void*>(resource),
+            D3D11ResourceDimensionName(stats.dimension),
+            D3D11MapTypeName(stats.mapType),
+            stats.mapFlags,
+            stats.subresource,
+            stats.mapCalls,
+            stats.unmapCalls,
+            totalCalls / secs,
+            (totalNs / 1'000'000.0) / secs,
+            totalCalls ? (totalNs / 1000.0) / static_cast<double>(totalCalls) : 0.0,
+            stats.maxMapNs / 1000.0,
+            stats.maxUnmapNs / 1000.0,
+            stats.payloadDuplicateWrites,
+            stats.payloadWrites,
+            ReplayMapResourceShape(stats),
+            ReplayMapResourceKeySummary(stats));
+    }
+
+    tl_replayMapStats.clear();
+    tl_loggedReplayPayloadSamples.clear();
+    tl_replayMapStatsStart = now;
+}
+
+void NoteReplayMapResource(
+    REX::W32::ID3D11Resource* resource,
+    UINT subresource,
+    REX::W32::D3D11_MAP mapType,
+    UINT mapFlags,
+    std::uint64_t ns)
+{
+    if (!PhaseTelemetry::IsInCommandBufferReplay() ||
+        PhaseTelemetry::g_mode.load(std::memory_order_relaxed) != PhaseTelemetry::Mode::On ||
+        !resource) {
+        return;
+    }
+
+    auto& stats = tl_replayMapStats[resource];
+    DescribeReplayMapResource(resource, stats);
+    stats.mapType = mapType;
+    stats.mapFlags = mapFlags;
+    stats.subresource = subresource;
+    ++stats.mapCalls;
+    stats.mapNs += ns;
+    stats.maxMapNs = (std::max)(stats.maxMapNs, ns);
+    auto& keyStats = stats.keyStats[CurrentReplayMapDeferredKey()];
+    ++keyStats.calls;
+    keyStats.ns += ns;
+    MaybeLogReplayMapStats();
+}
+
+void NoteReplayMappedPointer(
+    REX::W32::ID3D11Resource* resource,
+    REX::W32::D3D11_MAP mapType,
+    REX::W32::D3D11_MAPPED_SUBRESOURCE* mappedResource)
+{
+    if (!PhaseTelemetry::IsInCommandBufferReplay() ||
+        PhaseTelemetry::g_mode.load(std::memory_order_relaxed) != PhaseTelemetry::Mode::On ||
+        !resource ||
+        !mappedResource ||
+        !mappedResource->data) {
+        return;
+    }
+
+    auto statsIt = tl_replayMapStats.find(resource);
+    if (statsIt == tl_replayMapStats.end() || !IsTrackedReplayCBPayload(statsIt->second, mapType)) {
+        tl_activeReplayMaps.erase(resource);
+        return;
+    }
+
+    tl_activeReplayMaps[resource] = ActiveReplayMapInfo{
+        mappedResource->data,
+        statsIt->second.byteWidth,
+        statsIt->second.bindFlags,
+        statsIt->second.dimension,
+        mapType,
+        CurrentReplayMapDeferredKey()
+    };
+}
+
+void NoteReplayPayloadBeforeUnmap(REX::W32::ID3D11Resource* resource)
+{
+    if (!PhaseTelemetry::IsInCommandBufferReplay() ||
+        PhaseTelemetry::g_mode.load(std::memory_order_relaxed) != PhaseTelemetry::Mode::On ||
+        !resource) {
+        return;
+    }
+
+    auto activeIt = tl_activeReplayMaps.find(resource);
+    if (activeIt == tl_activeReplayMaps.end()) {
+        return;
+    }
+
+    const auto active = activeIt->second;
+    tl_activeReplayMaps.erase(activeIt);
+    if (!active.data || active.byteWidth != 128) {
+        return;
+    }
+
+    auto statsIt = tl_replayMapStats.find(resource);
+    if (statsIt == tl_replayMapStats.end()) {
+        return;
+    }
+
+    auto& stats = statsIt->second;
+    const auto hash = HashReplayPayload(active.data, active.byteWidth);
+    if (ShouldLogReplayPayloadSample(active.key, hash)) {
+        LogReplayPayloadSample(active.data, active.key, hash);
+    }
+    const bool duplicate = stats.lastPayloadHashValid && stats.lastPayloadHash == hash;
+    stats.lastPayloadHash = hash;
+    stats.lastPayloadHashValid = true;
+    ++stats.payloadWrites;
+    if (duplicate) {
+        ++stats.payloadDuplicateWrites;
+    }
+
+    auto& keyStats = stats.keyStats[active.key];
+    ++keyStats.payloadWrites;
+    if (duplicate) {
+        ++keyStats.payloadDuplicateWrites;
+    }
+}
+
+void NoteReplayUnmapResource(REX::W32::ID3D11Resource* resource, UINT subresource, std::uint64_t ns)
+{
+    if (!PhaseTelemetry::IsInCommandBufferReplay() ||
+        PhaseTelemetry::g_mode.load(std::memory_order_relaxed) != PhaseTelemetry::Mode::On ||
+        !resource) {
+        return;
+    }
+
+    auto& stats = tl_replayMapStats[resource];
+    DescribeReplayMapResource(resource, stats);
+    stats.subresource = subresource;
+    ++stats.unmapCalls;
+    stats.unmapNs += ns;
+    stats.maxUnmapNs = (std::max)(stats.maxUnmapNs, ns);
+    auto& keyStats = stats.keyStats[CurrentReplayMapDeferredKey()];
+    ++keyStats.calls;
+    keyStats.ns += ns;
+    MaybeLogReplayMapStats();
+}
+
+bool D3D11FilterReplayPSSetShaderResources(
+    REX::W32::ID3D11DeviceContext* context,
+    UINT startSlot,
+    UINT numViews,
+    REX::W32::ID3D11ShaderResourceView* const* shaderResourceViews)
+{
+    if (!PhaseTelemetry::IsInCommandBufferReplay() ||
+        !COMMAND_BUFFER_REPLAY_DEDUPE_SRV ||
+        startSlot >= kReplaySRVCacheSlots ||
+        numViews > kReplaySRVCacheSlots ||
+        startSlot + numViews > kReplaySRVCacheSlots ||
+        (numViews != 0 && !shaderResourceViews)) {
+        tl_replaySRVCallCache = {};
+        return false;
+    }
+
+    UINT runStart = 0;
+    UINT runCount = 0;
+
+    auto flushRun = [&]() {
+        if (runCount == 0) {
+            return;
+        }
+        const UINT sourceOffset = runStart - startSlot;
+        ProfileCommandBufferD3DCall(
+            PhaseTelemetry::CommandBufferD3DCallKind::ShaderResource,
+            [&]() {
+                D3D11Hooks::OriginalPSSetShaderResources(
+                    context,
+                    runStart,
+                    runCount,
+                    shaderResourceViews + sourceOffset);
+            });
+        runCount = 0;
+    };
+
+    for (UINT i = 0; i < numViews; ++i) {
+        const UINT slot = startSlot + i;
+        auto* view = shaderResourceViews[i];
+        const bool changed =
+            !tl_replaySRVCallCache.valid[slot] ||
+            tl_replaySRVCallCache.views[slot] != view;
+
+        tl_replaySRVCallCache.valid[slot] = true;
+        tl_replaySRVCallCache.views[slot] = view;
+
+        if (!changed) {
+            PhaseTelemetry::OnCommandBufferD3DCall(
+                PhaseTelemetry::CommandBufferD3DCallKind::ShaderResourceSkip,
+                0);
+            flushRun();
+            continue;
+        }
+
+        if (runCount == 0) {
+            runStart = slot;
+            runCount = 1;
+        } else if (runStart + runCount == slot) {
+            ++runCount;
+        } else {
+            flushRun();
+            runStart = slot;
+            runCount = 1;
+        }
+    }
+    flushRun();
+    return true;
+}
+
+bool D3D11ShouldSkipReplayIASetInputLayout(REX::W32::ID3D11InputLayout* inputLayout)
+{
+    if (!COMMAND_BUFFER_REPLAY_DEDUPE_SRV || !PhaseTelemetry::IsInCommandBufferReplay()) {
+        tl_replayIACache.inputLayoutValid = false;
+        return false;
+    }
+
+    const bool duplicate =
+        tl_replayIACache.inputLayoutValid &&
+        tl_replayIACache.inputLayout == inputLayout;
+    tl_replayIACache.inputLayoutValid = true;
+    tl_replayIACache.inputLayout = inputLayout;
+    return duplicate;
+}
+
+bool D3D11FilterReplayIASetVertexBuffers(
+    REX::W32::ID3D11DeviceContext* context,
+    UINT startSlot,
+    UINT numBuffers,
+    REX::W32::ID3D11Buffer* const* vertexBuffers,
+    const UINT* strides,
+    const UINT* offsets)
+{
+    if (!COMMAND_BUFFER_REPLAY_DEDUPE_SRV ||
+        !PhaseTelemetry::IsInCommandBufferReplay() ||
+        startSlot >= kReplayVertexBufferSlots ||
+        numBuffers > kReplayVertexBufferSlots ||
+        startSlot + numBuffers > kReplayVertexBufferSlots ||
+        (numBuffers != 0 && (!vertexBuffers || !strides || !offsets))) {
+        tl_replayIACache.vertexBufferValid = {};
+        return false;
+    }
+
+    UINT runStart = 0;
+    UINT runCount = 0;
+
+    auto flushRun = [&]() {
+        if (runCount == 0) {
+            return;
+        }
+        const UINT sourceOffset = runStart - startSlot;
+        ProfileCommandBufferD3DCall(
+            PhaseTelemetry::CommandBufferD3DCallKind::InputAssembly,
+            [&]() {
+                D3D11Hooks::OriginalIASetVertexBuffers(
+                    context,
+                    runStart,
+                    runCount,
+                    vertexBuffers + sourceOffset,
+                    strides + sourceOffset,
+                    offsets + sourceOffset);
+            });
+        runCount = 0;
+    };
+
+    for (UINT i = 0; i < numBuffers; ++i) {
+        const UINT slot = startSlot + i;
+        const ReplayVertexBufferState state{ vertexBuffers[i], strides[i], offsets[i] };
+        const bool changed =
+            !tl_replayIACache.vertexBufferValid[slot] ||
+            tl_replayIACache.vertexBuffers[slot].buffer != state.buffer ||
+            tl_replayIACache.vertexBuffers[slot].stride != state.stride ||
+            tl_replayIACache.vertexBuffers[slot].offset != state.offset;
+
+        tl_replayIACache.vertexBufferValid[slot] = true;
+        tl_replayIACache.vertexBuffers[slot] = state;
+
+        if (!changed) {
+            PhaseTelemetry::OnCommandBufferD3DCall(
+                PhaseTelemetry::CommandBufferD3DCallKind::InputAssemblySkip,
+                0);
+            flushRun();
+            continue;
+        }
+
+        if (runCount == 0) {
+            runStart = slot;
+            runCount = 1;
+        } else if (runStart + runCount == slot) {
+            ++runCount;
+        } else {
+            flushRun();
+            runStart = slot;
+            runCount = 1;
+        }
+    }
+    flushRun();
+    return true;
+}
+
+bool D3D11ShouldSkipReplayIASetIndexBuffer(
+    REX::W32::ID3D11Buffer* indexBuffer,
+    REX::W32::DXGI_FORMAT format,
+    UINT offset)
+{
+    if (!COMMAND_BUFFER_REPLAY_DEDUPE_SRV || !PhaseTelemetry::IsInCommandBufferReplay()) {
+        tl_replayIACache.indexBufferValid = false;
+        return false;
+    }
+
+    const bool duplicate =
+        tl_replayIACache.indexBufferValid &&
+        tl_replayIACache.indexBuffer == indexBuffer &&
+        tl_replayIACache.indexFormat == format &&
+        tl_replayIACache.indexOffset == offset;
+    tl_replayIACache.indexBufferValid = true;
+    tl_replayIACache.indexBuffer = indexBuffer;
+    tl_replayIACache.indexFormat = format;
+    tl_replayIACache.indexOffset = offset;
+    return duplicate;
+}
+
 D3D11PSSetShaderResult D3D11OnPSSetShaderBefore_Internal(
     REX::W32::ID3D11DeviceContext* context,
     REX::W32::ID3D11PixelShader* pixelShader)
@@ -904,6 +1625,175 @@ void D3D11OnCreateVertexShader_Internal(
 }
 namespace
 {
+    using BSD3DResourceCreatorFlush_t = void (*)(void* resourceCreator, REX::W32::ID3D11DeviceContext* context);
+    using BSD3DResourceCreatorEscalatePriorityForResource_t = void (*)(void* resourceCreator, const void* resource, std::uint32_t escalationResourceId);
+    using WaitForSingleObjectEx_t = DWORD(WINAPI*)(HANDLE handle, DWORD milliseconds, BOOL alertable);
+
+    REL::Relocation<std::uintptr_t> ptr_BSD3DResourceCreatorFlush{ REL::ID{ 1210092, 2277436 } };
+    REL::Relocation<std::uintptr_t> ptr_BSD3DResourceCreatorEscalatePriorityForResource{ REL::ID{ 1136324, 2277416 } };
+
+    BSD3DResourceCreatorFlush_t OriginalBSD3DResourceCreatorFlush = nullptr;
+    BSD3DResourceCreatorEscalatePriorityForResource_t OriginalBSD3DResourceCreatorEscalatePriorityForResource = nullptr;
+    WaitForSingleObjectEx_t OriginalProcessCommandBufferWaitForSingleObjectEx = nullptr;
+
+    void HookedBSD3DResourceCreatorFlush(void* resourceCreator, REX::W32::ID3D11DeviceContext* context)
+    {
+        ProfileCommandBufferD3DCall(
+            PhaseTelemetry::CommandBufferD3DCallKind::ResourceFlush,
+            [&]() {
+                OriginalBSD3DResourceCreatorFlush(resourceCreator, context);
+            });
+    }
+
+    void HookedBSD3DResourceCreatorEscalatePriorityForResource(
+        void* resourceCreator,
+        const void* resource,
+        std::uint32_t escalationResourceId)
+    {
+        ProfileCommandBufferD3DCall(
+            PhaseTelemetry::CommandBufferD3DCallKind::ResourceEscalate,
+            [&]() {
+                OriginalBSD3DResourceCreatorEscalatePriorityForResource(
+                    resourceCreator,
+                    resource,
+                    escalationResourceId);
+            });
+    }
+
+    DWORD WINAPI HookedProcessCommandBufferWaitForSingleObjectEx(
+        HANDLE handle,
+        DWORD milliseconds,
+        BOOL alertable)
+    {
+        return ProfileCommandBufferD3DCall(
+            PhaseTelemetry::CommandBufferD3DCallKind::ResourceWait,
+            [&]() {
+                return OriginalProcessCommandBufferWaitForSingleObjectEx(handle, milliseconds, alertable);
+            });
+    }
+
+    bool PatchMainModuleImport(const char* dllName, const char* importName, void* hook, void** original)
+    {
+        auto* module = reinterpret_cast<std::uint8_t*>(::GetModuleHandleW(nullptr));
+        if (!module) {
+            return false;
+        }
+
+        auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(module);
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
+            return false;
+        }
+
+        auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(module + dos->e_lfanew);
+        if (nt->Signature != IMAGE_NT_SIGNATURE) {
+            return false;
+        }
+
+        const auto& importDir =
+            nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+        if (!importDir.VirtualAddress || !importDir.Size) {
+            return false;
+        }
+
+        auto* desc = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(module + importDir.VirtualAddress);
+        for (; desc->Name; ++desc) {
+            const char* currentDll = reinterpret_cast<const char*>(module + desc->Name);
+            if (_stricmp(currentDll, dllName) != 0) {
+                continue;
+            }
+
+            auto* thunk = reinterpret_cast<IMAGE_THUNK_DATA*>(module + desc->FirstThunk);
+            auto* nameThunk = reinterpret_cast<IMAGE_THUNK_DATA*>(
+                module + (desc->OriginalFirstThunk ? desc->OriginalFirstThunk : desc->FirstThunk));
+            for (; nameThunk->u1.AddressOfData; ++nameThunk, ++thunk) {
+                if (IMAGE_SNAP_BY_ORDINAL(nameThunk->u1.Ordinal)) {
+                    continue;
+                }
+
+                auto* importByName = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(module + nameThunk->u1.AddressOfData);
+                if (std::strcmp(reinterpret_cast<const char*>(importByName->Name), importName) != 0) {
+                    continue;
+                }
+
+                auto** slot = reinterpret_cast<void**>(&thunk->u1.Function);
+                if (*slot == hook) {
+                    return true;
+                }
+
+                DWORD oldProtect = 0;
+                if (!::VirtualProtect(slot, sizeof(void*), PAGE_EXECUTE_READWRITE, &oldProtect)) {
+                    return false;
+                }
+
+                if (original && !*original) {
+                    *original = *slot;
+                }
+                *slot = hook;
+
+                DWORD ignored = 0;
+                ::VirtualProtect(slot, sizeof(void*), oldProtect, &ignored);
+                ::FlushInstructionCache(::GetCurrentProcess(), slot, sizeof(void*));
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    void InstallCommandBufferResourceTelemetryHooks()
+    {
+        static bool attempted = false;
+        if (attempted) {
+            return;
+        }
+        attempted = true;
+
+        if (!OriginalBSD3DResourceCreatorFlush) {
+            constexpr std::size_t kFlushPrologueSize = 10;
+            OriginalBSD3DResourceCreatorFlush =
+                Hooks::CreateBranchGateway5<BSD3DResourceCreatorFlush_t>(
+                    ptr_BSD3DResourceCreatorFlush,
+                    kFlushPrologueSize,
+                    reinterpret_cast<void*>(&HookedBSD3DResourceCreatorFlush));
+            if (!OriginalBSD3DResourceCreatorFlush) {
+                REX::WARN("InstallCommandBufferResourceTelemetryHooks: failed to install BSD3DResourceCreator::Flush hook");
+            } else {
+                REX::INFO("InstallCommandBufferResourceTelemetryHooks: BSD3DResourceCreator::Flush hook installed");
+            }
+        }
+
+        if (!OriginalBSD3DResourceCreatorEscalatePriorityForResource) {
+            constexpr std::size_t kEscalatePrologueSize = 15;
+            OriginalBSD3DResourceCreatorEscalatePriorityForResource =
+                Hooks::CreateBranchGateway5<BSD3DResourceCreatorEscalatePriorityForResource_t>(
+                    ptr_BSD3DResourceCreatorEscalatePriorityForResource,
+                    kEscalatePrologueSize,
+                    reinterpret_cast<void*>(&HookedBSD3DResourceCreatorEscalatePriorityForResource));
+            if (!OriginalBSD3DResourceCreatorEscalatePriorityForResource) {
+                REX::WARN("InstallCommandBufferResourceTelemetryHooks: failed to install BSD3DResourceCreator::EscalatePriorityForResource hook");
+            } else {
+                REX::INFO("InstallCommandBufferResourceTelemetryHooks: BSD3DResourceCreator::EscalatePriorityForResource hook installed");
+            }
+        }
+
+        if (OriginalProcessCommandBufferWaitForSingleObjectEx) {
+            return;
+        }
+
+        void* originalWait = nullptr;
+        if (PatchMainModuleImport(
+                "KERNEL32.dll",
+                "WaitForSingleObjectEx",
+                reinterpret_cast<void*>(&HookedProcessCommandBufferWaitForSingleObjectEx),
+                &originalWait)) {
+            OriginalProcessCommandBufferWaitForSingleObjectEx =
+                reinterpret_cast<WaitForSingleObjectEx_t>(originalWait);
+            REX::INFO("InstallCommandBufferResourceTelemetryHooks: WaitForSingleObjectEx import hook installed");
+        } else {
+            REX::WARN("InstallCommandBufferResourceTelemetryHooks: failed to install WaitForSingleObjectEx import hook");
+        }
+    }
+
     HRESULT STDMETHODCALLTYPE MyPresent(
         REX::W32::IDXGISwapChain* swapChain,
         UINT syncInterval,
@@ -920,7 +1810,15 @@ namespace
         UINT numViews,
         REX::W32::ID3D11ShaderResourceView* const* shaderResourceViews)
     {
-        D3D11Hooks::OriginalPSSetShaderResources(context, startSlot, numViews, shaderResourceViews);
+        if (D3D11FilterReplayPSSetShaderResources(context, startSlot, numViews, shaderResourceViews)) {
+            return;
+        }
+
+        ProfileCommandBufferD3DCall(
+            PhaseTelemetry::CommandBufferD3DCallKind::ShaderResource,
+            [&]() {
+                D3D11Hooks::OriginalPSSetShaderResources(context, startSlot, numViews, shaderResourceViews);
+            });
         D3D11OnPSSetShaderResources_Internal(context);
     }
 
@@ -955,7 +1853,11 @@ namespace
         INT baseVertexLocation)
     {
         D3D11OnDraw_Internal(context, "d3d11-DrawIndexed");
-        D3D11Hooks::OriginalDrawIndexed(context, indexCount, startIndexLocation, baseVertexLocation);
+        ProfileCommandBufferD3DCall(
+            PhaseTelemetry::CommandBufferD3DCallKind::Draw,
+            [&]() {
+                D3D11Hooks::OriginalDrawIndexed(context, indexCount, startIndexLocation, baseVertexLocation);
+            });
     }
 
     void STDMETHODCALLTYPE MyDraw(
@@ -964,7 +1866,11 @@ namespace
         UINT startVertexLocation)
     {
         D3D11OnDraw_Internal(context, "d3d11-Draw");
-        D3D11Hooks::OriginalDraw(context, vertexCount, startVertexLocation);
+        ProfileCommandBufferD3DCall(
+            PhaseTelemetry::CommandBufferD3DCallKind::Draw,
+            [&]() {
+                D3D11Hooks::OriginalDraw(context, vertexCount, startVertexLocation);
+            });
     }
 
     void STDMETHODCALLTYPE MyDrawIndexedInstanced(
@@ -976,13 +1882,17 @@ namespace
         UINT startInstanceLocation)
     {
         D3D11OnDraw_Internal(context, "d3d11-DrawIndexedInstanced");
-        D3D11Hooks::OriginalDrawIndexedInstanced(
-            context,
-            indexCountPerInstance,
-            instanceCount,
-            startIndexLocation,
-            baseVertexLocation,
-            startInstanceLocation);
+        ProfileCommandBufferD3DCall(
+            PhaseTelemetry::CommandBufferD3DCallKind::Draw,
+            [&]() {
+                D3D11Hooks::OriginalDrawIndexedInstanced(
+                    context,
+                    indexCountPerInstance,
+                    instanceCount,
+                    startIndexLocation,
+                    baseVertexLocation,
+                    startInstanceLocation);
+            });
     }
 
     void STDMETHODCALLTYPE MyDrawInstanced(
@@ -993,12 +1903,202 @@ namespace
         UINT startInstanceLocation)
     {
         D3D11OnDraw_Internal(context, "d3d11-DrawInstanced");
-        D3D11Hooks::OriginalDrawInstanced(
-            context,
-            vertexCountPerInstance,
-            instanceCount,
-            startVertexLocation,
-            startInstanceLocation);
+        ProfileCommandBufferD3DCall(
+            PhaseTelemetry::CommandBufferD3DCallKind::Draw,
+            [&]() {
+                D3D11Hooks::OriginalDrawInstanced(
+                    context,
+                    vertexCountPerInstance,
+                    instanceCount,
+                    startVertexLocation,
+                    startInstanceLocation);
+            });
+    }
+
+    HRESULT STDMETHODCALLTYPE MyMap(
+        REX::W32::ID3D11DeviceContext* context,
+        REX::W32::ID3D11Resource* resource,
+        UINT subresource,
+        REX::W32::D3D11_MAP mapType,
+        UINT mapFlags,
+        REX::W32::D3D11_MAPPED_SUBRESOURCE* mappedResource)
+    {
+#if !SHADERENGINE_ENABLE_PHASE_TELEMETRY
+        return D3D11Hooks::OriginalMap(context, resource, subresource, mapType, mapFlags, mappedResource);
+#else
+        if (!PhaseTelemetry::IsInCommandBufferReplay()) {
+            return D3D11Hooks::OriginalMap(context, resource, subresource, mapType, mapFlags, mappedResource);
+        }
+
+        const auto t0 = std::chrono::steady_clock::now();
+        const HRESULT result =
+            D3D11Hooks::OriginalMap(context, resource, subresource, mapType, mapFlags, mappedResource);
+        const auto t1 = std::chrono::steady_clock::now();
+        const auto ns = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
+        PhaseTelemetry::OnCommandBufferD3DCall(PhaseTelemetry::CommandBufferD3DCallKind::Map, ns);
+        NoteReplayMapResource(resource, subresource, mapType, mapFlags, ns);
+        if (REX::W32::SUCCESS(result)) {
+            NoteReplayMappedPointer(resource, mapType, mappedResource);
+        }
+        return result;
+#endif
+    }
+
+    void STDMETHODCALLTYPE MyUnmap(
+        REX::W32::ID3D11DeviceContext* context,
+        REX::W32::ID3D11Resource* resource,
+        UINT subresource)
+    {
+#if !SHADERENGINE_ENABLE_PHASE_TELEMETRY
+        D3D11Hooks::OriginalUnmap(context, resource, subresource);
+#else
+        if (!PhaseTelemetry::IsInCommandBufferReplay()) {
+            D3D11Hooks::OriginalUnmap(context, resource, subresource);
+            return;
+        }
+
+        NoteReplayPayloadBeforeUnmap(resource);
+        const auto t0 = std::chrono::steady_clock::now();
+        D3D11Hooks::OriginalUnmap(context, resource, subresource);
+        const auto t1 = std::chrono::steady_clock::now();
+        const auto ns = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
+        PhaseTelemetry::OnCommandBufferD3DCall(PhaseTelemetry::CommandBufferD3DCallKind::Unmap, ns);
+        NoteReplayUnmapResource(resource, subresource, ns);
+#endif
+    }
+
+    void STDMETHODCALLTYPE MyVSSetConstantBuffers(
+        REX::W32::ID3D11DeviceContext* context,
+        UINT startSlot,
+        UINT numBuffers,
+        REX::W32::ID3D11Buffer* const* constantBuffers)
+    {
+        ProfileCommandBufferD3DCall(
+            PhaseTelemetry::CommandBufferD3DCallKind::ConstantBuffer,
+            [&]() {
+                D3D11Hooks::OriginalVSSetConstantBuffers(context, startSlot, numBuffers, constantBuffers);
+            });
+    }
+
+    void STDMETHODCALLTYPE MyPSSetConstantBuffers(
+        REX::W32::ID3D11DeviceContext* context,
+        UINT startSlot,
+        UINT numBuffers,
+        REX::W32::ID3D11Buffer* const* constantBuffers)
+    {
+        ProfileCommandBufferD3DCall(
+            PhaseTelemetry::CommandBufferD3DCallKind::ConstantBuffer,
+            [&]() {
+                D3D11Hooks::OriginalPSSetConstantBuffers(context, startSlot, numBuffers, constantBuffers);
+            });
+    }
+
+    void STDMETHODCALLTYPE MyPSSetSamplers(
+        REX::W32::ID3D11DeviceContext* context,
+        UINT startSlot,
+        UINT numSamplers,
+        REX::W32::ID3D11SamplerState* const* samplers)
+    {
+        ProfileCommandBufferD3DCall(
+            PhaseTelemetry::CommandBufferD3DCallKind::Sampler,
+            [&]() {
+                D3D11Hooks::OriginalPSSetSamplers(context, startSlot, numSamplers, samplers);
+            });
+    }
+
+    void STDMETHODCALLTYPE MyIASetInputLayout(
+        REX::W32::ID3D11DeviceContext* context,
+        REX::W32::ID3D11InputLayout* inputLayout)
+    {
+        if (D3D11ShouldSkipReplayIASetInputLayout(inputLayout)) {
+            PhaseTelemetry::OnCommandBufferD3DCall(
+                PhaseTelemetry::CommandBufferD3DCallKind::InputAssemblySkip,
+                0);
+            return;
+        }
+
+        ProfileCommandBufferD3DCall(
+            PhaseTelemetry::CommandBufferD3DCallKind::InputAssembly,
+            [&]() {
+                D3D11Hooks::OriginalIASetInputLayout(context, inputLayout);
+            });
+    }
+
+    void STDMETHODCALLTYPE MyIASetVertexBuffers(
+        REX::W32::ID3D11DeviceContext* context,
+        UINT startSlot,
+        UINT numBuffers,
+        REX::W32::ID3D11Buffer* const* vertexBuffers,
+        const UINT* strides,
+        const UINT* offsets)
+    {
+        if (D3D11FilterReplayIASetVertexBuffers(context, startSlot, numBuffers, vertexBuffers, strides, offsets)) {
+            return;
+        }
+
+        ProfileCommandBufferD3DCall(
+            PhaseTelemetry::CommandBufferD3DCallKind::InputAssembly,
+            [&]() {
+                D3D11Hooks::OriginalIASetVertexBuffers(context, startSlot, numBuffers, vertexBuffers, strides, offsets);
+            });
+    }
+
+    void STDMETHODCALLTYPE MyIASetIndexBuffer(
+        REX::W32::ID3D11DeviceContext* context,
+        REX::W32::ID3D11Buffer* indexBuffer,
+        REX::W32::DXGI_FORMAT format,
+        UINT offset)
+    {
+        if (D3D11ShouldSkipReplayIASetIndexBuffer(indexBuffer, format, offset)) {
+            PhaseTelemetry::OnCommandBufferD3DCall(
+                PhaseTelemetry::CommandBufferD3DCallKind::InputAssemblySkip,
+                0);
+            return;
+        }
+
+        ProfileCommandBufferD3DCall(
+            PhaseTelemetry::CommandBufferD3DCallKind::InputAssembly,
+            [&]() {
+                D3D11Hooks::OriginalIASetIndexBuffer(context, indexBuffer, format, offset);
+            });
+    }
+
+    void STDMETHODCALLTYPE MyOMSetBlendState(
+        REX::W32::ID3D11DeviceContext* context,
+        REX::W32::ID3D11BlendState* blendState,
+        const FLOAT blendFactor[4],
+        UINT sampleMask)
+    {
+        ProfileCommandBufferD3DCall(
+            PhaseTelemetry::CommandBufferD3DCallKind::State,
+            [&]() {
+                D3D11Hooks::OriginalOMSetBlendState(context, blendState, blendFactor, sampleMask);
+            });
+    }
+
+    void STDMETHODCALLTYPE MyOMSetDepthStencilState(
+        REX::W32::ID3D11DeviceContext* context,
+        REX::W32::ID3D11DepthStencilState* depthStencilState,
+        UINT stencilRef)
+    {
+        ProfileCommandBufferD3DCall(
+            PhaseTelemetry::CommandBufferD3DCallKind::State,
+            [&]() {
+                D3D11Hooks::OriginalOMSetDepthStencilState(context, depthStencilState, stencilRef);
+            });
+    }
+
+    void STDMETHODCALLTYPE MyRSSetState(
+        REX::W32::ID3D11DeviceContext* context,
+        void* rasterizerState)
+    {
+        ProfileCommandBufferD3DCall(
+            PhaseTelemetry::CommandBufferD3DCallKind::State,
+            [&]() {
+                D3D11Hooks::OriginalRSSetState(context, rasterizerState);
+            });
     }
 
     void STDMETHODCALLTYPE MyPSSetShader(
@@ -1120,6 +2220,12 @@ namespace
 
 namespace D3D11Hooks
 {
+    void ResetCommandBufferReplayState()
+    {
+        tl_replaySRVCallCache = {};
+        tl_replayIACache = {};
+    }
+
     void EnsureDrawHooksPresent()
     {
         if (!g_rendererData) {
@@ -1136,9 +2242,24 @@ namespace D3D11Hooks
 
         Hooks::EnsureVTableSlot(vtable, 12, reinterpret_cast<void*>(MyDrawIndexed), OriginalDrawIndexed);
         Hooks::EnsureVTableSlot(vtable, 13, reinterpret_cast<void*>(MyDraw), OriginalDraw);
+        Hooks::EnsureVTableSlot(vtable, 14, reinterpret_cast<void*>(MyMap), OriginalMap);
+        Hooks::EnsureVTableSlot(vtable, 15, reinterpret_cast<void*>(MyUnmap), OriginalUnmap);
+        Hooks::EnsureVTableSlot(vtable, 16, reinterpret_cast<void*>(MyPSSetConstantBuffers), OriginalPSSetConstantBuffers);
+        Hooks::EnsureVTableSlot(vtable, 17, reinterpret_cast<void*>(MyIASetInputLayout), OriginalIASetInputLayout);
+        Hooks::EnsureVTableSlot(vtable, 18, reinterpret_cast<void*>(MyIASetVertexBuffers), OriginalIASetVertexBuffers);
+        Hooks::EnsureVTableSlot(vtable, 19, reinterpret_cast<void*>(MyIASetIndexBuffer), OriginalIASetIndexBuffer);
         Hooks::EnsureVTableSlot(vtable, 20, reinterpret_cast<void*>(MyDrawIndexedInstanced), OriginalDrawIndexedInstanced);
         Hooks::EnsureVTableSlot(vtable, 21, reinterpret_cast<void*>(MyDrawInstanced), OriginalDrawInstanced);
         Hooks::EnsureVTableSlot(vtable, 53, reinterpret_cast<void*>(MyClearDepthStencilView), OriginalClearDepthStencilView);
+        Hooks::EnsureVTableSlot(vtable, 7, reinterpret_cast<void*>(MyVSSetConstantBuffers), OriginalVSSetConstantBuffers);
+        Hooks::EnsureVTableSlot(vtable, 8, reinterpret_cast<void*>(MyPSSetShaderResources), OriginalPSSetShaderResources);
+        Hooks::EnsureVTableSlot(vtable, 10, reinterpret_cast<void*>(MyPSSetSamplers), OriginalPSSetSamplers);
+        Hooks::EnsureVTableSlot(vtable, 35, reinterpret_cast<void*>(MyOMSetBlendState), OriginalOMSetBlendState);
+        Hooks::EnsureVTableSlot(vtable, 36, reinterpret_cast<void*>(MyOMSetDepthStencilState), OriginalOMSetDepthStencilState);
+        Hooks::EnsureVTableSlot(vtable, 43, reinterpret_cast<void*>(MyRSSetState), OriginalRSSetState);
+#if SHADERENGINE_ENABLE_PHASE_TELEMETRY
+        InstallCommandBufferResourceTelemetryHooks();
+#endif
     }
 }
 
@@ -1164,10 +2285,21 @@ bool InstallGFXHooks_Internal()
     auto* contextVTable = *reinterpret_cast<void***>(g_rendererData->context);
     if (!installVTableHook(contextVTable, 12, reinterpret_cast<void*>(MyDrawIndexed), D3D11Hooks::OriginalDrawIndexed, "DrawIndexed") ||
         !installVTableHook(contextVTable, 13, reinterpret_cast<void*>(MyDraw), D3D11Hooks::OriginalDraw, "Draw") ||
+        !installVTableHook(contextVTable, 14, reinterpret_cast<void*>(MyMap), D3D11Hooks::OriginalMap, "Map") ||
+        !installVTableHook(contextVTable, 15, reinterpret_cast<void*>(MyUnmap), D3D11Hooks::OriginalUnmap, "Unmap") ||
+        !installVTableHook(contextVTable, 16, reinterpret_cast<void*>(MyPSSetConstantBuffers), D3D11Hooks::OriginalPSSetConstantBuffers, "PSSetConstantBuffers") ||
+        !installVTableHook(contextVTable, 17, reinterpret_cast<void*>(MyIASetInputLayout), D3D11Hooks::OriginalIASetInputLayout, "IASetInputLayout") ||
+        !installVTableHook(contextVTable, 18, reinterpret_cast<void*>(MyIASetVertexBuffers), D3D11Hooks::OriginalIASetVertexBuffers, "IASetVertexBuffers") ||
+        !installVTableHook(contextVTable, 19, reinterpret_cast<void*>(MyIASetIndexBuffer), D3D11Hooks::OriginalIASetIndexBuffer, "IASetIndexBuffer") ||
         !installVTableHook(contextVTable, 20, reinterpret_cast<void*>(MyDrawIndexedInstanced), D3D11Hooks::OriginalDrawIndexedInstanced, "DrawIndexedInstanced") ||
         !installVTableHook(contextVTable, 21, reinterpret_cast<void*>(MyDrawInstanced), D3D11Hooks::OriginalDrawInstanced, "DrawInstanced") ||
+        !installVTableHook(contextVTable, 7, reinterpret_cast<void*>(MyVSSetConstantBuffers), D3D11Hooks::OriginalVSSetConstantBuffers, "VSSetConstantBuffers") ||
         !installVTableHook(contextVTable, 8, reinterpret_cast<void*>(MyPSSetShaderResources), D3D11Hooks::OriginalPSSetShaderResources, "PSSetShaderResources") ||
+        !installVTableHook(contextVTable, 10, reinterpret_cast<void*>(MyPSSetSamplers), D3D11Hooks::OriginalPSSetSamplers, "PSSetSamplers") ||
         !installVTableHook(contextVTable, 33, reinterpret_cast<void*>(MyOMSetRenderTargets), D3D11Hooks::OriginalOMSetRenderTargets, "OMSetRenderTargets") ||
+        !installVTableHook(contextVTable, 35, reinterpret_cast<void*>(MyOMSetBlendState), D3D11Hooks::OriginalOMSetBlendState, "OMSetBlendState") ||
+        !installVTableHook(contextVTable, 36, reinterpret_cast<void*>(MyOMSetDepthStencilState), D3D11Hooks::OriginalOMSetDepthStencilState, "OMSetDepthStencilState") ||
+        !installVTableHook(contextVTable, 43, reinterpret_cast<void*>(MyRSSetState), D3D11Hooks::OriginalRSSetState, "RSSetState") ||
         !installVTableHook(contextVTable, 53, reinterpret_cast<void*>(MyClearDepthStencilView), D3D11Hooks::OriginalClearDepthStencilView, "ClearDepthStencilView") ||
         !installVTableHook(contextVTable, 9, reinterpret_cast<void*>(MyPSSetShader), D3D11Hooks::OriginalPSSetShader, "PSSetShader") ||
         !installVTableHook(contextVTable, 11, reinterpret_cast<void*>(MyVSSetShader), D3D11Hooks::OriginalVSSetShader, "VSSetShader")) {
@@ -1179,6 +2311,10 @@ bool InstallGFXHooks_Internal()
     if (!installVTableHook(swapChainVTable, 8, reinterpret_cast<void*>(MyPresent), D3D11Hooks::OriginalPresent, "Present")) {
         return false;
     }
+
+#if SHADERENGINE_ENABLE_PHASE_TELEMETRY
+    InstallCommandBufferResourceTelemetryHooks();
+#endif
 
     REX::INFO("InstallGFXHooks_Internal: All Hooks installed successfully");
     if (!DEVGUI_ON && !SHADERSETTINGS_ON) {

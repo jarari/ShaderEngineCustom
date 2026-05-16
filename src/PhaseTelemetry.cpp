@@ -1,5 +1,8 @@
 #include <PCH.h>
 #include "PhaseTelemetry.h"
+
+#if SHADERENGINE_ENABLE_PHASE_TELEMETRY
+
 #include "LightSorter.h"
 #include "hooks.h"
 
@@ -179,30 +182,61 @@ struct Bucket {
 Bucket s_frame;
 Bucket s_subBuckets[static_cast<std::size_t>(SubPhase::Count)];
 
-constexpr std::size_t kDeferredDetailGroups = 32;
-constexpr std::size_t kDeferredDetailKinds = 2;
+constexpr std::size_t kDeferredDetailGroups = 1024;
+constexpr std::size_t kDeferredCommandBufferSubIdxBits = 5;
+constexpr std::size_t kDeferredCommandBufferSubIdxMask = (1u << kDeferredCommandBufferSubIdxBits) - 1u;
+constexpr std::size_t kDeferredDetailKinds = 4;
+constexpr std::size_t kCommandBufferD3DCallKinds = static_cast<std::size_t>(CommandBufferD3DCallKind::Count);
 
 const char* DeferredDetailKindName(DeferredPrePassDetailKind kind) noexcept
 {
     switch (kind) {
     case DeferredPrePassDetailKind::RenderBatches:       return "RenderBatches";
     case DeferredPrePassDetailKind::RenderGeometryGroup: return "RenderGeometryGroup";
+    case DeferredPrePassDetailKind::RenderCommandBufferPasses: return "RenderCommandBufferPasses";
+    case DeferredPrePassDetailKind::RenderPassImpl:      return "RenderPassImpl";
     default:                                             return "?";
     }
+}
+
+std::string DeferredDetailKeyName(DeferredPrePassDetailKind kind, std::size_t key)
+{
+    if (kind != DeferredPrePassDetailKind::RenderCommandBufferPasses) {
+        return std::to_string(key);
+    }
+
+    const auto group = key >> kDeferredCommandBufferSubIdxBits;
+    const auto subIdx = key & kDeferredCommandBufferSubIdxMask;
+    return std::to_string(group) + "." + std::to_string(subIdx);
 }
 
 struct DeferredDetailBucket {
     Bucket bucket;
     std::atomic<std::uint64_t> active{ 0 };
+    void* head = nullptr;
+    void* geometry = nullptr;
+    void* shader = nullptr;
+    std::uint32_t techniqueID = 0;
+    std::uint32_t chainLen = 0;
+    std::string geometryName;
+    bool metadataSet = false;
 
     void Reset() noexcept
     {
         bucket.Reset();
         active.store(0, std::memory_order_relaxed);
+        head = nullptr;
+        geometry = nullptr;
+        shader = nullptr;
+        techniqueID = 0;
+        chainLen = 0;
+        geometryName.clear();
+        metadataSet = false;
     }
 };
 
 DeferredDetailBucket s_deferredDetails[kDeferredDetailKinds][kDeferredDetailGroups];
+Bucket s_commandBufferD3DCalls[kCommandBufferD3DCallKinds];
 
 // thread_local ??render thread runs Render_PreUI and all its children
 // sequentially. If a worker path ever entered, the bool defaults to false
@@ -210,7 +244,28 @@ DeferredDetailBucket s_deferredDetails[kDeferredDetailKinds][kDeferredDetailGrou
 thread_local bool     tl_inFrame   = false;
 thread_local SubPhase tl_subphase  = SubPhase::None;
 thread_local int      tl_deferredDetailIndex = -1;
+thread_local std::uint32_t tl_commandBufferReplayDepth = 0;
 std::atomic<bool> s_mainAccumActive{ false };
+
+const char* CommandBufferD3DCallKindName(CommandBufferD3DCallKind kind) noexcept
+{
+    switch (kind) {
+    case CommandBufferD3DCallKind::Map:            return "Map";
+    case CommandBufferD3DCallKind::Unmap:          return "Unmap";
+    case CommandBufferD3DCallKind::ConstantBuffer: return "ConstantBuffer";
+    case CommandBufferD3DCallKind::ShaderResource: return "ShaderResource";
+    case CommandBufferD3DCallKind::ShaderResourceSkip: return "ShaderResourceSkip";
+    case CommandBufferD3DCallKind::Sampler:        return "Sampler";
+    case CommandBufferD3DCallKind::InputAssembly:  return "InputAssembly";
+    case CommandBufferD3DCallKind::InputAssemblySkip: return "InputAssemblySkip";
+    case CommandBufferD3DCallKind::State:          return "State";
+    case CommandBufferD3DCallKind::Draw:           return "Draw";
+    case CommandBufferD3DCallKind::ResourceWait:   return "ResourceWait";
+    case CommandBufferD3DCallKind::ResourceFlush:  return "ResourceFlush";
+    case CommandBufferD3DCallKind::ResourceEscalate: return "ResourceEscalate";
+    default:                                       return "?";
+    }
+}
 
 struct DeferredDetailScopeEntry {
     int previousIndex = -1;
@@ -346,21 +401,63 @@ void MaybeLog()
             const auto cd = b.cmdBufDraws.load(std::memory_order_relaxed);
             const auto ns = b.totalNs.load(std::memory_order_relaxed);
             const auto mx = b.maxNs.load(std::memory_order_relaxed);
-            REX::INFO(
-                "    DeferredPrePass[{}:{}]: calls={} bsDraws={} cmdBuf={} d3dDraws={} totMs/s={:.2f} avgUs={:.1f} maxUs={:.1f} (%deferred={:.1f})",
-                DeferredDetailKindName(static_cast<DeferredPrePassDetailKind>(kind)),
-                group,
-                c, d, cd, dd,
-                (ns / 1'000'000.0) / secs,
-                (ns / 1000.0) / static_cast<double>(c),
-                mx / 1000.0,
+            const auto detailKind = static_cast<DeferredPrePassDetailKind>(kind);
+            const double pctDeferred =
                 100.0 * static_cast<double>(ns) /
-                    std::max<double>(
-                        1.0,
-                        static_cast<double>(
-                            s_subBuckets[static_cast<std::size_t>(SubPhase::DeferredPrePass)].totalNs.load(
-                                std::memory_order_relaxed))));
+                std::max<double>(
+                    1.0,
+                    static_cast<double>(
+                        s_subBuckets[static_cast<std::size_t>(SubPhase::DeferredPrePass)].totalNs.load(
+                            std::memory_order_relaxed)));
+
+            if (detailKind == DeferredPrePassDetailKind::RenderCommandBufferPasses && detail.metadataSet) {
+                REX::INFO(
+                    "    DeferredPrePass[{}:{}]: calls={} bsDraws={} cmdBuf={} d3dDraws={} d3d/call={:.1f} totMs/s={:.2f} avgUs={:.1f} maxUs={:.1f} (%deferred={:.1f}) chain={} head={} geom={} shader={} tech=0x{:08X} name='{}'",
+                    DeferredDetailKindName(detailKind),
+                    DeferredDetailKeyName(detailKind, group),
+                    c, d, cd, dd,
+                    static_cast<double>(dd) / static_cast<double>(c),
+                    (ns / 1'000'000.0) / secs,
+                    (ns / 1000.0) / static_cast<double>(c),
+                    mx / 1000.0,
+                    pctDeferred,
+                    detail.chainLen,
+                    detail.head,
+                    detail.geometry,
+                    detail.shader,
+                    detail.techniqueID,
+                    detail.geometryName);
+            } else {
+                REX::INFO(
+                    "    DeferredPrePass[{}:{}]: calls={} bsDraws={} cmdBuf={} d3dDraws={} totMs/s={:.2f} avgUs={:.1f} maxUs={:.1f} (%deferred={:.1f})",
+                    DeferredDetailKindName(detailKind),
+                    DeferredDetailKeyName(detailKind, group),
+                    c, d, cd, dd,
+                    (ns / 1'000'000.0) / secs,
+                    (ns / 1000.0) / static_cast<double>(c),
+                    mx / 1000.0,
+                    pctDeferred);
+            }
         }
+    }
+
+    for (std::size_t kind = 0; kind < kCommandBufferD3DCallKinds; ++kind) {
+        const auto& b = s_commandBufferD3DCalls[kind];
+        const auto c = b.calls.load(std::memory_order_relaxed);
+        if (c == 0) {
+            continue;
+        }
+
+        const auto ns = b.totalNs.load(std::memory_order_relaxed);
+        const auto mx = b.maxNs.load(std::memory_order_relaxed);
+        REX::INFO(
+            "    CommandBufferD3D[{}]: calls={} calls/frame={:.1f} totMs/s={:.2f} avgUs={:.2f} maxUs={:.1f}",
+            CommandBufferD3DCallKindName(static_cast<CommandBufferD3DCallKind>(kind)),
+            c,
+            static_cast<double>(c) / static_cast<double>(frameCalls),
+            (ns / 1'000'000.0) / secs,
+            (ns / 1000.0) / static_cast<double>(c),
+            mx / 1000.0);
     }
 
     s_frame.Reset();
@@ -368,6 +465,7 @@ void MaybeLog()
     for (auto& kind : s_deferredDetails) {
         for (auto& detail : kind) detail.Reset();
     }
+    for (auto& b : s_commandBufferD3DCalls) b.Reset();
 }
 
 // --- Hook bodies ----------------------------------------------------------
@@ -585,6 +683,34 @@ void OnCommandBufferDraw()
     IncrementDeferredDetailCommandBufferDraws();
 }
 
+void EnterCommandBufferReplay()
+{
+    ++tl_commandBufferReplayDepth;
+}
+
+void LeaveCommandBufferReplay()
+{
+    if (tl_commandBufferReplayDepth > 0) {
+        --tl_commandBufferReplayDepth;
+    }
+}
+
+bool IsInCommandBufferReplay()
+{
+    return tl_commandBufferReplayDepth != 0;
+}
+
+void OnCommandBufferD3DCall(CommandBufferD3DCallKind kind, std::uint64_t ns)
+{
+    if (g_mode.load(std::memory_order_relaxed) != Mode::On ||
+        tl_commandBufferReplayDepth == 0 ||
+        static_cast<std::size_t>(kind) >= kCommandBufferD3DCallKinds) {
+        return;
+    }
+
+    RecordBucket(s_commandBufferD3DCalls[static_cast<std::size_t>(kind)], ns);
+}
+
 void RequireHooks()
 {
     s_forceHooks.store(true, std::memory_order_relaxed);
@@ -612,16 +738,16 @@ bool IsInDeferredLightsImpl()
 }
 
 namespace {
-int DeferredDetailIndex(DeferredPrePassDetailKind kind, std::uint32_t group)
+int DeferredDetailIndex(DeferredPrePassDetailKind kind, std::uint32_t key)
 {
-    if (group >= kDeferredDetailGroups) {
+    if (key >= kDeferredDetailGroups) {
         return -1;
     }
-    return static_cast<int>(kind) * static_cast<int>(kDeferredDetailGroups) + static_cast<int>(group);
+    return static_cast<int>(kind) * static_cast<int>(kDeferredDetailGroups) + static_cast<int>(key);
 }
 }
 
-void BeginDeferredPrePassDetail(DeferredPrePassDetailKind kind, std::uint32_t group)
+void BeginDeferredPrePassDetail(DeferredPrePassDetailKind kind, std::uint32_t key)
 {
     if (tl_deferredDetailDepth >= static_cast<int>(std::size(tl_deferredDetailStack))) {
         return;
@@ -637,7 +763,7 @@ void BeginDeferredPrePassDetail(DeferredPrePassDetailKind kind, std::uint32_t gr
         return;
     }
 
-    const int index = DeferredDetailIndex(kind, group);
+    const int index = DeferredDetailIndex(kind, key);
     if (index < 0) {
         return;
     }
@@ -651,14 +777,14 @@ void BeginDeferredPrePassDetail(DeferredPrePassDetailKind kind, std::uint32_t gr
     tl_deferredDetailIndex = index;
 }
 
-void EndDeferredPrePassDetail(DeferredPrePassDetailKind kind, std::uint32_t group)
+void EndDeferredPrePassDetail(DeferredPrePassDetailKind kind, std::uint32_t key)
 {
     if (tl_deferredDetailDepth <= 0) {
         return;
     }
 
     auto& scope = tl_deferredDetailStack[--tl_deferredDetailDepth];
-    const int index = DeferredDetailIndex(kind, group);
+    const int index = DeferredDetailIndex(kind, key);
     const auto t1 = std::chrono::steady_clock::now();
     if (scope.active && index >= 0 && index == scope.index) {
         auto& detail = s_deferredDetails[index / static_cast<int>(kDeferredDetailGroups)]
@@ -669,6 +795,52 @@ void EndDeferredPrePassDetail(DeferredPrePassDetailKind kind, std::uint32_t grou
     }
 
     tl_deferredDetailIndex = scope.previousIndex;
+}
+
+bool GetCurrentDeferredPrePassDetail(DeferredPrePassDetailKind& kind, std::uint32_t& key)
+{
+    if (tl_deferredDetailIndex < 0) {
+        return false;
+    }
+
+    kind = static_cast<DeferredPrePassDetailKind>(
+        tl_deferredDetailIndex / static_cast<int>(kDeferredDetailGroups));
+    key = static_cast<std::uint32_t>(
+        tl_deferredDetailIndex % static_cast<int>(kDeferredDetailGroups));
+    return true;
+}
+
+void NoteDeferredPrePassCommandBuffer(
+    std::uint32_t key,
+    void* head,
+    void* geometry,
+    void* shader,
+    std::uint32_t techniqueID,
+    std::uint32_t chainLen,
+    const char* geometryName)
+{
+    if (g_mode.load(std::memory_order_relaxed) != Mode::On || !IsInDeferredPrePass()) {
+        return;
+    }
+
+    const int index = DeferredDetailIndex(DeferredPrePassDetailKind::RenderCommandBufferPasses, key);
+    if (index < 0) {
+        return;
+    }
+
+    auto& detail = s_deferredDetails[index / static_cast<int>(kDeferredDetailGroups)]
+                                    [index % static_cast<int>(kDeferredDetailGroups)];
+    if (detail.metadataSet) {
+        return;
+    }
+
+    detail.head = head;
+    detail.geometry = geometry;
+    detail.shader = shader;
+    detail.techniqueID = techniqueID;
+    detail.chainLen = chainLen;
+    detail.geometryName = geometryName ? geometryName : "";
+    detail.metadataSet = true;
 }
 
 bool Initialize()
@@ -777,3 +949,5 @@ bool Initialize()
 }
 
 }  // namespace PhaseTelemetry
+
+#endif
