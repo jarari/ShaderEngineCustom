@@ -2012,17 +2012,20 @@ namespace
     thread_local std::vector<std::uint32_t> g_drawTagRaceGroupMaskStack;
     thread_local std::vector<std::uint32_t> g_drawTagRaceFlagsStack;
     std::unordered_set<RE::BSGeometry*> g_actorDrawTaggedGeometry;
-    // Subset of g_actorDrawTaggedGeometry consisting of geometry reachable from
-    // the actor's BSFaceGenNiNode subtree (head/face/eyes/hair). Used by the
+    // Subset of g_actorDrawTaggedGeometry consisting of non-hair geometry
+    // reachable from the actor's BSFaceGenNiNode subtree. Used by the
     // pixel-shader-side isHead flag so toon face shading and facegen-aware eye
     // logic can run without re-tagging materialTag.
     std::unordered_set<RE::BSGeometry*> g_actorHeadDrawTaggedGeometry;
     std::unordered_map<std::uint32_t, std::unordered_set<RE::BSGeometry*>> g_actorDrawTaggedGeometryByRef;
+    // All BSGeometry reachable from each ref's BSFaceGenNiNode subtree,
+    // including hair. Used only for head-only refresh diffs so swapped hair can
+    // still be added/removed as actor geometry without setting isHead.
+    std::unordered_map<std::uint32_t, std::unordered_set<RE::BSGeometry*>> g_actorFaceDrawTaggedGeometryByRef;
     // Subset of g_actorDrawTaggedGeometryByRef limited to BSGeometry reachable
-    // from each ref's BSFaceGenNiNode subtree, so the OnHeadInitialized path
-    // can diff the head independently of the body without re-walking the full
-    // actor scenegraph. Maintained alongside the full per-ref set during full
-    // refreshes; mutated alone during head-only refreshes.
+    // from each ref's BSFaceGenNiNode subtree after filtering hair headparts.
+    // Maintained alongside the full per-ref set during full refreshes; mutated
+    // alone during head-only refreshes.
     std::unordered_map<std::uint32_t, std::unordered_set<RE::BSGeometry*>> g_actorHeadDrawTaggedGeometryByRef;
     std::unordered_map<RE::BSGeometry*, std::uint32_t> g_actorRaceGroupMaskByGeometry;
     std::unordered_map<RE::BSGeometry*, std::uint32_t> g_actorRaceFlagsByGeometry;
@@ -2101,6 +2104,124 @@ namespace
 
         if (DEBUGGING) {
             REX::INFO("ActorDrawTagScan: skip unknown name='{}' (neither node nor geometry)", root->name.c_str());
+        }
+    }
+
+    std::string MakeLowerAscii(std::string_view text)
+    {
+        std::string out;
+        out.reserve(text.size());
+        for (unsigned char ch : text) {
+            out.push_back(static_cast<char>(std::tolower(ch)));
+        }
+        return out;
+    }
+
+    void AddHeadPartMatchKey(std::string_view text, std::unordered_set<std::string>& keys)
+    {
+        auto key = MakeLowerAscii(text);
+        if (key.empty()) {
+            return;
+        }
+
+        std::ranges::replace(key, '/', '\\');
+        if (const auto slash = key.find_last_of('\\'); slash != std::string::npos) {
+            key.erase(0, slash + 1);
+        }
+        if (const auto dot = key.find_last_of('.'); dot != std::string::npos) {
+            key.erase(dot);
+        }
+        if (key.size() >= 4) {
+            keys.insert(std::move(key));
+        }
+    }
+
+    void AddHairHeadPartMatchKeys(RE::BGSHeadPart* headPart, std::unordered_set<std::string>& keys)
+    {
+        if (!headPart) {
+            return;
+        }
+
+        AddHeadPartMatchKey(headPart->ChargenModel.GetModel(), keys);
+        AddHeadPartMatchKey(headPart->formEditorID.c_str(), keys);
+
+        for (auto* extraPart : headPart->extraParts) {
+            AddHairHeadPartMatchKeys(extraPart, keys);
+        }
+    }
+
+    std::unordered_set<std::string> BuildHairHeadPartMatchKeys(RE::TESObjectREFR* ref)
+    {
+        std::unordered_set<std::string> keys;
+        auto* base = ref ? ref->GetObjectReference() : nullptr;
+        auto* npc = base ? base->As<RE::TESNPC>() : nullptr;
+        if (!npc) {
+            return keys;
+        }
+
+        for (auto* headPart : npc->GetHeadParts(true)) {
+            if (!headPart ||
+                headPart->type.get() != RE::BGSHeadPart::HeadPartType::kHair) {
+                continue;
+            }
+            AddHairHeadPartMatchKeys(headPart, keys);
+        }
+
+        return keys;
+    }
+
+    bool MatchesHairHeadPartNode(RE::NiAVObject* object, const std::unordered_set<std::string>& hairHeadPartKeys)
+    {
+        if (!object || hairHeadPartKeys.empty()) {
+            return false;
+        }
+
+        const auto name = MakeLowerAscii(object->name.c_str());
+        if (name.empty()) {
+            return false;
+        }
+
+        for (const auto& key : hairHeadPartKeys) {
+            if (name.find(key) != std::string::npos) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    void CollectActorHeadDrawTaggedGeometry(
+        RE::NiAVObject* root,
+        const std::unordered_set<std::string>& hairHeadPartKeys,
+        std::unordered_set<RE::BSGeometry*>& geometry)
+    {
+        if (!root) {
+            return;
+        }
+
+        if (MatchesHairHeadPartNode(root, hairHeadPartKeys)) {
+            if (DEBUGGING) {
+                REX::INFO("ActorHeadDrawTagScan: skip hair headpart subtree node='{}'", root->name.c_str());
+            }
+            return;
+        }
+
+        if (netimmerse_cast<RE::NiBillboardNode*>(root)) {
+            if (DEBUGGING) {
+                REX::INFO("ActorHeadDrawTagScan: skip billboard node='{}'", root->name.c_str());
+            }
+            return;
+        }
+
+        if (auto* geom = root->IsGeometry()) {
+            geometry.insert(geom);
+            return;
+        }
+
+        if (auto* node = root->IsNode()) {
+            for (auto& child : node->children) {
+                CollectActorHeadDrawTaggedGeometry(child.get(), hairHeadPartKeys, geometry);
+            }
         }
     }
 
@@ -2221,17 +2342,24 @@ namespace
             CollectActorDrawTaggedGeometry(ref->Get3D(!isFirstPerson), liveGeometry);
         }
 
-        // Snapshot the head subtree separately so a later head-only refresh
-        // has a baseline to diff against.
+        // Snapshot the face subtree separately so a later head-only refresh
+        // has a baseline to diff against. The head subset filters hair out.
+        std::unordered_set<RE::BSGeometry*> liveFaceGeometry;
         std::unordered_set<RE::BSGeometry*> liveHeadGeometry;
         if (auto* faceRaw = ref->GetFaceNodeSkinned()) {
-            CollectActorDrawTaggedGeometry(reinterpret_cast<RE::NiAVObject*>(faceRaw), liveHeadGeometry);
+            CollectActorDrawTaggedGeometry(reinterpret_cast<RE::NiAVObject*>(faceRaw), liveFaceGeometry);
+            CollectActorHeadDrawTaggedGeometry(
+                reinterpret_cast<RE::NiAVObject*>(faceRaw),
+                BuildHairHeadPartMatchKeys(ref),
+                liveHeadGeometry);
         }
 
         const auto [raceGroupMask, raceFlags] = GetRaceTagForRace(race);
 
         std::unique_lock lock(g_actorDrawTaggedGeometryLock);
         auto& currentSet = g_actorDrawTaggedGeometryByRef[handle];
+
+        auto& currentFaceSet = g_actorFaceDrawTaggedGeometryByRef[handle];
 
         auto& currentHeadSet = g_actorHeadDrawTaggedGeometryByRef[handle];
 
@@ -2242,6 +2370,7 @@ namespace
         for (auto it = currentSet.begin(); it != currentSet.end(); ) {
             if (!liveGeometry.contains(*it)) {
                 g_actorDrawTaggedGeometry.erase(*it);
+                currentFaceSet.erase(*it);
                 g_actorHeadDrawTaggedGeometry.erase(*it);
                 g_actorRaceGroupMaskByGeometry.erase(*it);
                 g_actorRaceFlagsByGeometry.erase(*it);
@@ -2252,8 +2381,8 @@ namespace
             }
         }
 
-        // Diff: tag geometry the walk just discovered. Pick kActorHead for
-        // anything reachable from BSFaceGenNiNode, kActor otherwise.
+        // Diff: tag geometry the walk just discovered. Use isHead only for
+        // non-hair geometry reachable from BSFaceGenNiNode.
         for (auto* geometry : liveGeometry) {
             const bool isHead = liveHeadGeometry.contains(geometry);
             g_actorRaceGroupMaskByGeometry[geometry] = raceGroupMask;
@@ -2282,6 +2411,7 @@ namespace
                 MakeActorDrawTagClassification(isHead, raceGroupMask, raceFlags));
         }
 
+        currentFaceSet = std::move(liveFaceGeometry);
         currentHeadSet = std::move(liveHeadGeometry);
     }
 
@@ -2305,44 +2435,59 @@ namespace
             return;
         }
 
+        std::unordered_set<RE::BSGeometry*> liveFaceGeometry;
+        CollectActorDrawTaggedGeometry(reinterpret_cast<RE::NiAVObject*>(faceRaw), liveFaceGeometry);
+
         std::unordered_set<RE::BSGeometry*> liveHeadGeometry;
-        CollectActorDrawTaggedGeometry(reinterpret_cast<RE::NiAVObject*>(faceRaw), liveHeadGeometry);
+        CollectActorHeadDrawTaggedGeometry(
+            reinterpret_cast<RE::NiAVObject*>(faceRaw),
+            BuildHairHeadPartMatchKeys(ref),
+            liveHeadGeometry);
 
         const auto [raceGroupMask, raceFlags] = GetRaceTagForRace(race);
 
         std::unique_lock lock(g_actorDrawTaggedGeometryLock);
         auto& currentFullSet = g_actorDrawTaggedGeometryByRef[handle];
+        auto& currentFaceSet = g_actorFaceDrawTaggedGeometryByRef[handle];
         auto& currentHeadSet = g_actorHeadDrawTaggedGeometryByRef[handle];
 
-        // Diff: remove old head entries that are no longer present under the
-        // face node. We trust that only head geometry was tracked here, so
-        // dropping these from the full set as well is safe.
-        for (auto it = currentHeadSet.begin(); it != currentHeadSet.end(); ) {
-            if (!liveHeadGeometry.contains(*it)) {
+        // Diff: remove old FaceGen entries that are no longer present under the
+        // face node. Hair is included here for actor-tag cleanup, but it is not
+        // included in currentHeadSet or g_actorHeadDrawTaggedGeometry.
+        for (auto it = currentFaceSet.begin(); it != currentFaceSet.end(); ) {
+            if (!liveFaceGeometry.contains(*it)) {
                 g_actorDrawTaggedGeometry.erase(*it);
                 g_actorHeadDrawTaggedGeometry.erase(*it);
                 g_actorRaceGroupMaskByGeometry.erase(*it);
                 g_actorRaceFlagsByGeometry.erase(*it);
                 SetCommandBufferDrawTagWrapper(*it, MakeUnknownDrawTagClassification());
                 currentFullSet.erase(*it);
-                it = currentHeadSet.erase(it);
+                currentHeadSet.erase(*it);
+                it = currentFaceSet.erase(it);
             } else {
                 ++it;
             }
         }
 
-        // Diff: add newly discovered head entries to both sets.
-        for (auto* geometry : liveHeadGeometry) {
-            if (currentHeadSet.insert(geometry).second) {
-                currentFullSet.insert(geometry);
-                g_actorDrawTaggedGeometry.insert(geometry);
+        // Diff: add/update live FaceGen entries. Hair remains actor-tagged but
+        // is not added to the head subset, so shaders see isHead = 0.
+        for (auto* geometry : liveFaceGeometry) {
+            const bool isHead = liveHeadGeometry.contains(geometry);
+            currentFaceSet.insert(geometry);
+            currentFullSet.insert(geometry);
+            g_actorDrawTaggedGeometry.insert(geometry);
+            if (isHead) {
+                currentHeadSet.insert(geometry);
                 g_actorHeadDrawTaggedGeometry.insert(geometry);
+            } else {
+                currentHeadSet.erase(geometry);
+                g_actorHeadDrawTaggedGeometry.erase(geometry);
             }
             g_actorRaceGroupMaskByGeometry[geometry] = raceGroupMask;
             g_actorRaceFlagsByGeometry[geometry] = raceFlags;
             SetCommandBufferDrawTagWrapper(
                 geometry,
-                MakeActorDrawTagClassification(true, raceGroupMask, raceFlags));
+                MakeActorDrawTagClassification(isHead, raceGroupMask, raceFlags));
         }
     }
 
@@ -3326,6 +3471,7 @@ void ClearActorDrawTaggedGeometry_Internal()
     g_actorDrawTaggedGeometry.clear();
     g_actorHeadDrawTaggedGeometry.clear();
     g_actorDrawTaggedGeometryByRef.clear();
+    g_actorFaceDrawTaggedGeometryByRef.clear();
     g_actorHeadDrawTaggedGeometryByRef.clear();
     g_actorRaceGroupMaskByGeometry.clear();
     g_actorRaceFlagsByGeometry.clear();

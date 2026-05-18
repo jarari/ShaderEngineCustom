@@ -155,7 +155,7 @@ struct alignas(16) DrawTagData
 {
     float materialTag;
     // 1.0 if the geometry is reachable from the actor's BSFaceGenNiNode subtree
-    // (head/face/eyes/hair). 0.0 otherwise. Lets pixel shaders that share the
+    // after filtering hair headparts. 0.0 otherwise. Lets pixel shaders that share the
     // actor materialTag with equipment distinguish facegen meshes — e.g. for
     // toon face shading or eye-white tinting on custom races.
     float isHead;
